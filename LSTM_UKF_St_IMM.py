@@ -130,15 +130,15 @@ class VolatilityRegimeSelector(tf.Module):
 
         # Learnable параметры для каждого режима
         # regime_scales[i] = масштаб CI для режима i
-        # ИСПРАВЛЕНО: Целевые значения для режимов волатильности
-        # LOW: 1.2 × (-ln(1-0.85)) = 1.2 × 1.895 = 2.27
-        # MID: 1.8 × 1.895 = 3.41
-        # HIGH: 2.5 × 1.895 = 4.74
+        # ИСПРАВЛЕНО: УВЕЛИЧЕННЫЕ ЦЕЛЕВЫЕ ЗНАЧЕНИЯ для режимов волатильности (увеличено на 30% для компенсации низкого покрытия)
+        # LOW: 1.56 × (-ln(1-0.85)) = 1.56 × 1.895 = 2.96
+        # MID: 2.34 × 1.895 = 4.44
+        # HIGH: 3.25 × 1.895 = 6.16
         self.regime_scales = tf.Variable(
-            tf.constant([2.27, 3.41, 4.74], dtype=tf.float32),  # LOW, MID, HIGH
+            tf.constant([2.96, 4.44, 6.16], dtype=tf.float32),  # LOW, MID, HIGH - увеличены на ~30%
             trainable=True,
             name='regime_scales',
-            constraint=lambda x: tf.clip_by_value(x, 1.0, 6.0)  # Расширенный диапазон для адаптации
+            constraint=lambda x: tf.clip_by_value(x, 1.0, 8.0)  # Расширенный диапазон для адаптации
         )
         # Learnable центроиды для мягкого распределения
         if self.learnable_centers:
@@ -737,8 +737,9 @@ class LSTMIMMUKF(tf.Module):
         # Синхронизированные параметры для целевого покрытия 85%
         target_coverage = 0.85
         confidence_factor = -np.log(1.0 - target_coverage)  # ≈ 1.89712
+        # ИСПРАВЛЕНО: Увеличиваем начальные значения regime_scales для компенсации низкого покрытия
         self.regime_selector.regime_scales.assign(tf.constant(
-            [1.2 * confidence_factor, 1.8 * confidence_factor, 2.5 * confidence_factor],
+            [1.56 * confidence_factor, 2.34 * confidence_factor, 3.25 * confidence_factor],  # Увеличены на ~30%
             dtype=tf.float32
         ))
         # Центроиды режимов адаптированы под реальную статистику волатильности
@@ -883,10 +884,10 @@ class LSTMIMMUKF(tf.Module):
             
             # === ДОБАВЛЕНО: ПАРАМЕТР ДЛЯ МАКСИМАЛЬНОЙ ШИРИНЫ ДОВЕРИТЕЛЬНОГО ИНТЕРВАЛА ===
             self.max_width_factor_logit = tf.Variable(
-                tf.math.log(1.5),  # exp(ln(1.5)) + 1.0 = 2.5
+                tf.math.log(2.5),  # exp(ln(2.5)) + 1.0 = 3.5 - увеличено для компенсации низкого покрытия
                 trainable=True,
                 dtype=tf.float32,
-                constraint=lambda x: tf.clip_by_value(x, tf.math.log(0.5), tf.math.log(3.0)),
+                constraint=lambda x: tf.clip_by_value(x, tf.math.log(1.0), tf.math.log(4.0)),  # Расширенный диапазон
                 name='max_width_factor_logit'
             )
 
@@ -2454,22 +2455,29 @@ class LSTMIMMUKF(tf.Module):
                 # 2. ОСНОВНОЙ ШТРАФ: недостаточное/избыточное покрытие
                 target_coverage = 0.85  # 85% покрытие - хороший баланс
                 coverage_diff = tf.abs(actual_coverage - target_coverage)
-                coverage_penalty = 2.0 * tf.square(coverage_diff)
+                
+                # ИСПРАВЛЕНО: Усиленный штраф для случаев низкого покрытия
+                # Если покрытие ниже целевого, штраф увеличивается агрессивнее
+                undercoverage_penalty = tf.cond(
+                    actual_coverage < target_coverage,
+                    lambda: 5.0 * tf.square(target_coverage - actual_coverage),  # Усиленный штраф за недостаточное покрытие
+                    lambda: 2.0 * tf.square(actual_coverage - target_coverage)   # Стандартный штраф за избыточное покрытие
+                )
+                coverage_penalty = undercoverage_penalty
                 # Если coverage = 0.95: penalty = 2.0 × (0.10)² = 0.02
-                # Если coverage = 0.70: penalty = 2.0 × (0.15)² = 0.045
+                # Если coverage = 0.70: penalty = 5.0 × (0.15)² = 0.1125 (усиленный штраф)
 
                 # 3. ШТРАФ НА ШИРИНУ (адаптивная к std_dev) - БОЛЕЕ СТРОГИЙ
                 target_width_ratio = 1.0  # CI ширина = 1.0 x stddev
                 width_ratio = tf.reduce_mean(ci_width / (avg_stddev + 1e-8))
                 
-                # Целевой штраф: штрафуем как слишком широкие, так и слишком узкие интервалы
-                # Если width_ratio > 1.0: штраф за избыточную ширину
+                # ИСПРАВЛЕНО: Усиленный штраф за слишком узкие интервалы (для компенсации низкого покрытия)
                 # Если width_ratio < 0.7: штраф за чрезмерно узкие интервалы (малое покрытие)
                 width_penalty = 2.0 * tf.square(tf.maximum(width_ratio - target_width_ratio, 0.0))  # Штраф за широкие
-                width_penalty += 1.0 * tf.square(tf.maximum(target_width_ratio * 0.7 - width_ratio, 0.0))  # Штраф за слишком узкие
+                width_penalty += 3.0 * tf.square(tf.maximum(target_width_ratio * 0.7 - width_ratio, 0.0))  # Усиленный штраф за слишком узкие
                 # Если width_ratio = 2.0: penalty = 2.0 × (1.0)² = 2.0 (более строгий)
-                # Если width_ratio = 0.8: penalty = 2.0 × (0.0)² + 1.0 × (0.0)² = 0.0 (в порядке)
-                # Если width_ratio = 0.5: penalty = 0.0 + 1.0 × (0.2)² = 0.04 (штраф за слишком узкие)
+                # Если width_ratio = 0.8: penalty = 2.0 × (0.0)² + 3.0 × (0.0)² = 0.0 (в порядке)
+                # Если width_ratio = 0.5: penalty = 0.0 + 3.0 × (0.2)² = 0.12 (усиленный штраф за слишком узкие)
 
                 # 4. ШТРАФ НА АСИММЕТРИЧНОСТЬ (левая vs правая граница)
                 asymmetry = (ci_max - forecast) / (forecast - ci_min + 1e-8)
@@ -2779,12 +2787,12 @@ class LSTMIMMUKF(tf.Module):
         # Убираем ограничение на минимальную ширину, так как сигнал имеет широкий диапазон
         margin_lower = stddev * tf.clip_by_value(
             tf.abs(z_lower) * tail_weight_neg * regime_scale,
-            0.5,  # Увеличиваем минимум с 0.1 до 0.5
+            1.0,  # Увеличиваем минимум с 0.5 до 1.0 для компенсации низкого покрытия
             max_width_factor
         )
         margin_upper = stddev * tf.clip_by_value(
             tf.abs(z_upper) * tail_weight_pos * regime_scale,
-            0.5,  # Увеличиваем минимум с 0.1 до 0.5
+            1.0,  # Увеличиваем минимум с 0.5 до 1.0 для компенсации низкого покрытия
             max_width_factor
         )
 
@@ -3122,22 +3130,29 @@ class LSTMIMMUKF(tf.Module):
             # target_coverage уже адаптирован под каждый элемент батча
             target_coverage_mean = tf.reduce_mean(target_coverage)  # [B] → скаляр [0, 1]
 
-            # Базовая калибровочная потеря
-            calibration_loss = 2.0 * tf.square(actual_coverage - target_coverage_mean)
+            # Базовая калибровочная потеря с усиленным штрафом за недостаточное покрытие
+            coverage_diff = tf.abs(actual_coverage - target_coverage_mean)
+            
+            # ИСПРАВЛЕНО: Усиленный штраф для случаев низкого покрытия (валидация)
+            undercoverage_penalty = tf.cond(
+                actual_coverage < target_coverage_mean,
+                lambda: 5.0 * tf.square(target_coverage_mean - actual_coverage),  # Усиленный штраф за недостаточное покрытие
+                lambda: 2.0 * tf.square(actual_coverage - target_coverage_mean)   # Стандартный штраф за избыточное покрытие
+            )
+            calibration_loss = undercoverage_penalty
 
             # Дополнительный штраф за ширину интервалов - БОЛЕЕ СТРОГИЙ
             ci_width = ci_max - ci_min
             avg_stddev = tf.reduce_mean(std_dev)
             width_ratio = tf.reduce_mean(ci_width / (avg_stddev + 1e-8))
             
-            # Целевой штраф: штрафуем как слишком широкие, так и слишком узкие интервалы
-            # Если width_ratio > 1.0: штраф за избыточную ширину
+            # ИСПРАВЛЕНО: Усиленный штраф за слишком узкие интервалы (валидация)
             # Если width_ratio < 0.7: штраф за чрезмерно узкие интервалы (малое покрытие)
             width_penalty = 2.0 * tf.square(tf.maximum(width_ratio - 1.0, 0.0))  # Штраф за широкие
-            width_penalty += 1.0 * tf.square(tf.maximum(1.0 * 0.7 - width_ratio, 0.0))  # Штраф за слишком узкие
+            width_penalty += 3.0 * tf.square(tf.maximum(1.0 * 0.7 - width_ratio, 0.0))  # Усиленный штраф за слишком узкие
             # Если width_ratio = 2.0: penalty = 2.0 × (1.0)² = 2.0 (более строгий)
-            # Если width_ratio = 0.8: penalty = 2.0 × (0.0)² + 1.0 × (0.0)² = 0.0 (в порядке)
-            # Если width_ratio = 0.5: penalty = 0.0 + 1.0 × (0.2)² = 0.04 (штраф за слишком узкие)
+            # Если width_ratio = 0.8: penalty = 2.0 × (0.0)² + 3.0 × (0.0)² = 0.0 (в порядке)
+            # Если width_ratio = 0.5: penalty = 0.0 + 3.0 × (0.2)² = 0.12 (усиленный штраф за слишком узкие)
             
             calibration_loss = calibration_loss + width_penalty
 
