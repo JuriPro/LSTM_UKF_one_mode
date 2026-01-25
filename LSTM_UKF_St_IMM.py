@@ -45,7 +45,7 @@ class SpectralCovarianceParam(tf.Module):
         )
         self._min_eigenvalue = 0.01  # Снижаем минимальное значение для гибкости
         self._max_eigenvalue = 8.0   # Увеличиваем максимальное значение в 2 раза для адаптации к волатильности
-    
+
     def get_P_and_sqrt(self):
         """Вычисляет P и sqrt(P) для скалярного случая (state_dim=1)"""
         # Применяем softplus для гарантии положительности
@@ -56,7 +56,7 @@ class SpectralCovarianceParam(tf.Module):
         P = tf.reshape(d_pos, [1, 1])
         P_sqrt = tf.reshape(tf.sqrt(d_pos), [1, 1])
         return P, P_sqrt
-    
+
     def get_spectrum_info(self):
         """Получить информацию о спектре для скалярного случая (state_dim=1)"""
         d_pos = tf.nn.softplus(self.d_raw) + self._min_eigenvalue
@@ -70,38 +70,38 @@ class SpectralCovarianceParam(tf.Module):
 
 class ImplicitKalmanUpdate(tf.Module):
     """Численно стабильное обновление фильтра с Joseph формой"""
-    
+
     def __init__(self, name=None):
         super().__init__(name=name)
-    
+
     @tf.function
     def update(self, x_pred, P_pred, z, R):
         """Численно стабильное обновление Kalman фильтра - оптимизировано для state_dim=1"""
         batch_size = tf.shape(x_pred)[0]
-        
+
         # ========== СКАЛЯРНЫЙ СЛУЧАЙ (state_dim=1, meas_dim=1) ==========
         # Простые арифметические операции вместо матричных
-        
+
         P_pred_scalar = tf.reshape(P_pred[:, 0, 0], [batch_size])
         R_scalar = tf.reshape(R[:, 0, 0], [batch_size])
         z_scalar = tf.reshape(z[:, 0], [batch_size])
         x_pred_scalar = tf.reshape(x_pred[:, 0], [batch_size])
-        
+
         # Коэффициент Kalman
         K_scalar = P_pred_scalar / (P_pred_scalar + R_scalar + 1e-8)
         K = tf.reshape(K_scalar, [batch_size, 1, 1])
-        
+
         # Инновация (остаток)
         innov_scalar = z_scalar - x_pred_scalar  # [batch_size]
         innov = tf.reshape(innov_scalar, [batch_size, 1, 1])
-        
+
         # Обновленное состояние
         x_upd = x_pred + tf.reshape(K_scalar * innov_scalar, [batch_size, 1])
-        
+
         # Joseph форма ковариации (для скаляра очень простая)
         P_upd_scalar = (1 - K_scalar) * P_pred_scalar * (1 - K_scalar) + K_scalar * R_scalar * K_scalar
         P_upd = tf.reshape(P_upd_scalar, [batch_size, 1, 1])
-        
+
         return x_upd, P_upd, innov, K
 
 
@@ -110,8 +110,8 @@ class VolatilityRegimeSelector(tf.Module):
     Мягкое распределение по режимам волатильности (LOW/MID/HIGH).
     Адаптивная калибровка масштабов доверительных интервалов.
     """
-    
-    def __init__(self, 
+
+    def __init__(self,
                  num_regimes: int = 3,
                  history_window: int = 100,
                  learnable_centers: bool = True,
@@ -127,7 +127,7 @@ class VolatilityRegimeSelector(tf.Module):
         self.num_regimes = num_regimes
         self.history_window = history_window
         self.learnable_centers = learnable_centers
-        
+
         # Learnable параметры для каждого режима
         # regime_scales[i] = масштаб CI для режима i
         self.regime_scales = tf.Variable(
@@ -158,37 +158,37 @@ class VolatilityRegimeSelector(tf.Module):
             name='regime_temperature',
             constraint=lambda x: tf.clip_by_value(x, 0.1, 2.0)  # сужаем диапазон до 2.0
         )
-        
+
         # История волатильности для расчета статистики
         self._vol_history = tf.Variable(
             tf.zeros([1, self.history_window], dtype=tf.float32),
             trainable=False,
             name='vol_history'
         )
-    
+
     def update_history(self, vol_current: tf.Tensor) -> None:
         """
         Обновить историю волатильности.
-        
+
         Args:
             vol_current: [B] текущая волатильность
         """
         # vol_current: [B] → усредняем по батчу
         vol_mean = tf.reduce_mean(vol_current)  # скаляр
-        
+
         # Сдвиг истории: убираем первый элемент, добавляем новый в конец
         new_history = tf.concat([
             self._vol_history[:, 1:],  # все кроме первого
             tf.reshape(vol_mean, [1, 1])  # новое значение
         ], axis=1)
-        
+
         self._vol_history.assign(new_history)
-    
+
     def get_centers(self) -> tf.Tensor:
         """Получить центроиды режимов с адаптацией к истории волатильности"""
         if self.learnable_centers:
             base_centers = tf.nn.softplus(self.center_logits)  # [num_regimes]
-            
+
             # Если история содержит достаточно данных для статистики
             history_size = tf.cast(tf.reduce_sum(tf.cast(self._vol_history > 0, tf.float32)), tf.int32)
             if history_size >= 10:  # минимальный размер истории для адаптации
@@ -196,24 +196,24 @@ class VolatilityRegimeSelector(tf.Module):
                 history_values = tf.boolean_mask(self._vol_history, self._vol_history > 0)
                 history_mean = tf.reduce_mean(history_values)
                 history_std = tf.math.reduce_std(history_values) + 1e-8
-                
+
                 # Ручной расчет квантилей (совместимо со всеми версиями TensorFlow)
                 sorted_history = tf.sort(history_values)
                 n = tf.shape(sorted_history)[0]
-                
+
                 # Рассчитываем индексы для 25%, 50%, 75% квантилей
                 quantile_indices = tf.cast([
                     tf.math.floor(0.25 * tf.cast(n - 1, tf.float32)),
                     tf.math.floor(0.5 * tf.cast(n - 1, tf.float32)),
                     tf.math.floor(0.75 * tf.cast(n - 1, tf.float32))
                 ], tf.int32)
-                
+
                 # Гарантируем, что индексы находятся в пределах массива
                 quantile_indices = tf.clip_by_value(quantile_indices, 0, n - 1)
-                
+
                 # Извлекаем значения квантилей
                 history_quantiles = tf.gather(sorted_history, quantile_indices)
-                
+
                 # Адаптируем центры на основе статистик истории
                 # LOW режим: около 25-го процентиля
                 # MID режим: около медианы
@@ -223,25 +223,25 @@ class VolatilityRegimeSelector(tf.Module):
                     history_quantiles[1],        # MID режим
                     history_quantiles[2] * 1.2   # HIGH режим
                 ])
-                
+
                 # Взвешенное комбинирование исходных центров и адаптивных
                 # Чем больше история, тем сильнее адаптация
                 adaptation_weight = tf.minimum(0.9, tf.cast(history_size, tf.float32) / 50.0)
                 centers = (1 - adaptation_weight) * base_centers + adaptation_weight * adaptive_centers
                 return tf.clip_by_value(centers, 0.01, 0.99)
-            
+
             return base_centers
         else:
             return self.centers  # [num_regimes]
-    
+
     @tf.function
     def assign_soft_regimes(self, vol_current: tf.Tensor) -> Dict[str, tf.Tensor]:
         """
         Мягкое распределение текущей волатильности по режимам.
-        
+
         Args:
             vol_current: [B] текущая нормализованная волатильность
-        
+
         Returns:
             Dict с ключами:
                 'soft_weights': [B, num_regimes] - мягкие веса для каждого режима
@@ -250,54 +250,54 @@ class VolatilityRegimeSelector(tf.Module):
         """
         batch_size = tf.shape(vol_current)[0]
         centers = self.get_centers()  # [num_regimes]
-        
+
         # Расстояния от текущей волатильности до центров каждого режима
         # vol_current: [B] → [B, 1]
         vol_expanded = tf.expand_dims(vol_current, axis=1)  # [B, 1]
-        
+
         # Евклидовы расстояния: [B, num_regimes]
         distances = tf.abs(vol_expanded - tf.expand_dims(centers, axis=0))
-        
+
         # Softmax с температурой (управляет мягкостью распределения)
         # Чем выше температура, тем более равномерное распределение
         soft_weights = tf.nn.softmax(-distances / (self.temperature + 1e-6), axis=1)
         # soft_weights: [B, num_regimes]
-        
+
         # Доминирующий режим для каждого элемента батча
         regime_assignment = tf.argmax(soft_weights, axis=1)  # [B]
-        
+
         # Энтропия распределения (для мониторинга)
         entropy = -tf.reduce_sum(
             soft_weights * tf.math.log(soft_weights + 1e-8),
             axis=1
         )  # [B]
-        
+
         return {
             'soft_weights': soft_weights,      # [B, num_regimes]
             'regime_assignment': regime_assignment,  # [B]
             'entropy': entropy                 # [B]
         }
-    
+
     @tf.function
     def get_regime_scales(self, soft_weights: tf.Tensor) -> tf.Tensor:
         """
         Получить адаптивные масштабы CI на основе мягкого распределения.
-        
+
         Args:
             soft_weights: [B, num_regimes] - результат assign_soft_regimes
-        
+
         Returns:
             regime_scale: [B, 1] - масштаб CI для каждого элемента батча
         """
         # Взвешенное усреднение масштабов режимов
         # soft_weights: [B, num_regimes]
         # regime_scales: [num_regimes]
-        
+
         regime_scale = tf.matmul(soft_weights, tf.expand_dims(self.regime_scales, axis=1))
         # результат: [B, 1]
-        
+
         return regime_scale  # [B, 1]
-    
+
     def get_spectrum_info(self) -> Dict[str, tf.Tensor]:
         """Информация о параметрах режимов для мониторинга"""
         return {
@@ -310,12 +310,12 @@ class VolatilityRegimeSelector(tf.Module):
 class EntropyRegularizer(tf.Module):
     """
     Вычисляет энтропийную регуляризацию скрытых состояний LSTM
-    
-    Подход: Нормализуем выходы LSTM на [0, 1] и рассматриваем как 
+
+    Подход: Нормализуем выходы LSTM на [0, 1] и рассматриваем как
     вероятностное распределение, вычисляя его энтропию.
     """
-    
-    def __init__(self, 
+
+    def __init__(self,
                  name: str = 'entropy_regularizer',
                  entropy_type: str = 'distribution',  # 'distribution' или 'spatial'
                  normalize_method: str = 'sigmoid'):  # 'sigmoid' или 'softmax'
@@ -323,18 +323,18 @@ class EntropyRegularizer(tf.Module):
         self.entropy_type = entropy_type
         self.normalize_method = normalize_method
         self._min_entropy_threshold = 0.1  # Не штрафуем уж совсем случайные h
-    
+
     @tf.function
-    def compute_entropy_loss(self, 
+    def compute_entropy_loss(self,
                              lstm_hidden_states: tf.Tensor,
                              attention_output: tf.Tensor = None) -> tf.Tensor:
         """
         Вычисляет энтропийную потерю для скрытых состояний LSTM
-        
+
         Args:
             lstm_hidden_states: [B, T, hidden_dim] - скрытые состояния LSTM
             attention_output: [B, T, hidden_dim] - опционально, выход attention
-        
+
         Returns:
             entropy_loss: скалярная потеря
         """
@@ -342,7 +342,7 @@ class EntropyRegularizer(tf.Module):
         B = tf.shape(lstm_hidden_states)[0]
         T = tf.shape(lstm_hidden_states)[1]
         hidden_dim = tf.shape(lstm_hidden_states)[2]
-        
+
         # Нормализуем h на [0, 1] как "вероятности"
         if self.normalize_method == 'sigmoid':
             # Сигмоид для поэлементной нормализации
@@ -350,19 +350,19 @@ class EntropyRegularizer(tf.Module):
         else:
             # Softmax по скрытому измерению
             h_normalized = tf.nn.softmax(lstm_hidden_states, axis=-1)  # [B, T, hidden_dim]
-        
+
         # Обрезаем для численной стабильности
         h_normalized = tf.clip_by_value(h_normalized, 1e-8, 1.0 - 1e-8)
-        
+
         # Вычисляем энтропию: H = -Σ(p × log(p))
         entropy_per_timestep = -tf.reduce_sum(
             h_normalized * tf.math.log(h_normalized + 1e-8),
             axis=-1  # Суммируем по скрытому измерению
         )  # [B, T]
-        
+
         # Усредняем по времени и батчу
         mean_entropy = tf.reduce_mean(entropy_per_timestep)  # скаляр
-        
+
         # ✅ ИСПРАВЛЕНО: Корректное вычисление максимальной энтропии
         if self.normalize_method == 'sigmoid':
             # Для sigmoid: максимальная энтропия = hidden_dim * ln(2)
@@ -370,26 +370,26 @@ class EntropyRegularizer(tf.Module):
         else:
             # Для softmax: максимальная энтропия = ln(hidden_dim)
             max_entropy = tf.math.log(tf.cast(hidden_dim, tf.float32) + 1e-8)
-        
+
         # ✅ ИСПРАВЛЕНО: Нормализуем энтропию для получения стабильных значений
         normalized_entropy = mean_entropy / (max_entropy + 1e-8)
-        
+
         # ✅ ИСПРАВЛЕНО: Реалистичная целевая энтропия (50% от максимума)
         target_normalized = 0.5
-        
+
         # ✅ ИСПРАВЛЕНО: Квадратичный штраф с адаптивным масштабированием
         entropy_deviation = tf.square(normalized_entropy - target_normalized)
-        
+
         # ✅ ИСПРАВЛЕНО: Фиксированный коэффициент для контроля влияния
         scaling_factor = 0.01
-        
+
         # ✅ ИСПРАВЛЕНО: Гарантированно положительный лосс
         entropy_loss = scaling_factor * entropy_deviation
-        
+
         return entropy_loss
-    
+
     @tf.function
-    def compute_spatial_entropy(self, 
+    def compute_spatial_entropy(self,
                                 lstm_hidden_states: tf.Tensor) -> tf.Tensor:
         """
         Альтернативный подход: энтропия по пространственному распределению h
@@ -398,35 +398,35 @@ class EntropyRegularizer(tf.Module):
         # Нормализуем каждый timestep отдельно (Softmax по скрытому)
         h_softmax = tf.nn.softmax(lstm_hidden_states, axis=-1)  # [B, T, hidden_dim]
         h_softmax = tf.clip_by_value(h_softmax, 1e-8, 1.0)
-        
+
         # Энтропия: H = -Σ(p × log(p)) по скрытому измерению
         entropy = -tf.reduce_sum(
             h_softmax * tf.math.log(h_softmax + 1e-8),
             axis=-1
         )  # [B, T]
-        
+
         # Штрафуем за LOW entropy (концентрация весов)
         max_possible_entropy = tf.math.log(
             tf.cast(tf.shape(lstm_hidden_states)[-1], tf.float32)
         )
-        
+
         normalized_entropy = entropy / (max_possible_entropy + 1e-8)  # [0, 1]
         loss = tf.reduce_mean(
             tf.nn.relu(0.5 - normalized_entropy)  # Штрафуем если < 0.5 от максимума
         )
-        
+
         return loss
-    
+
     def get_entropy_stats(self, lstm_hidden_states: tf.Tensor) -> dict:
         """Получить статистику энтропии для мониторинга"""
         h_normalized = tf.nn.sigmoid(lstm_hidden_states)
         h_normalized = tf.clip_by_value(h_normalized, 1e-8, 1.0 - 1e-8)
-        
+
         entropy = -tf.reduce_sum(
             h_normalized * tf.math.log(h_normalized + 1e-8),
             axis=-1
         )
-        
+
         return {
             'entropy_mean': tf.reduce_mean(entropy),
             'entropy_std': tf.math.reduce_std(entropy),
@@ -441,14 +441,14 @@ class DifferentiableUKF(tf.Module):
         self.alpha = alpha
         self.beta = beta
         self.kappa = kappa
-        
+
         # Компоненты дифференцируемого UKF
         self.spec_param = SpectralCovarianceParam(name='spectral_param')
         self.kalman_update = ImplicitKalmanUpdate(name='kalman_update')
-        
+
         # Для мониторинга
         self.debug_mode = False
-        
+
     def initialize(self, x0, P0_diag=None):
         """Инициализация состояния и ковариации"""
         if P0_diag is None:
@@ -458,7 +458,7 @@ class DifferentiableUKF(tf.Module):
                 P0_diag = [tf.nn.softplus(self.global_model.log_initial_vars[mode_idx]).numpy() + 1e-6]
             else:
                 P0_diag = [0.1] * self.state_dim
-        
+
         # Инициализация спектральных параметров
         if isinstance(P0_diag, (list, tuple, np.ndarray)):
             P0_diag = P0_diag[0]  # Берем первое значение для скалярного случая
@@ -467,7 +467,7 @@ class DifferentiableUKF(tf.Module):
         d_init = tf.math.log(tf.maximum(P0_val, 1e-6))
         self.spec_param.d_raw.assign(d_init)  # скаляр
         return x0
-    
+
     @tf.function
     def predict(self, x, Q, relax_factor, alpha_t, kappa_t):
         """
@@ -481,61 +481,61 @@ class DifferentiableUKF(tf.Module):
         relax_factor = tf.reshape(relax_factor, [batch_size])
         alpha_t = tf.reshape(alpha_t, [batch_size])
         kappa_t = tf.reshape(kappa_t, [batch_size])
-        
+
         # ✅ Прямое извлечение значений без лишних reshape
         x_scalar = tf.squeeze(x, axis=-1)  # [B]
         Q_scalar = tf.squeeze(Q, axis=[-2, -1])  # [B]
-        
+
         # ✅ Параметры UKF для каждого элемента батча (векторизовано)
         n = 1
         lam = alpha_t**2 * (n + kappa_t) - n
         lam = tf.maximum(lam, 1e-3)
-        
+
         # ✅ Вычисление масштаба для сигма-точек
         base_scale = tf.sqrt(n + lam)  # [B]
         scale = base_scale * relax_factor  # [B]
         P_sqrt_val = tf.sqrt(tf.maximum(Q_scalar, 1e-8))  # [B]
         scaled_offset = P_sqrt_val * scale  # [B]
-        
+
         # ✅ Генерация сигма-точек для каждого элемента батча
         sigma_points = tf.stack([
             x_scalar,
             x_scalar + scaled_offset,
             x_scalar - scaled_offset
         ], axis=1)  # [B, 3]
-        
+
         # ✅ ВЕСА ДЛЯ КАЖДОГО ЭЛЕМЕНТА БАТЧА (критически важно!)
         Wm_0 = lam / (n + lam)  # [B]
         Wm_i = 1.0 / (2.0 * (n + lam))  # [B]
-        
+
         # ✅ Формирование весов в правильной размерности [B, 3]
         Wm = tf.stack([Wm_0, Wm_i, Wm_i], axis=1)  # [B, 3]
-        
+
         # ✅ Веса для ковариации (с beta=2.0 по умолчанию)
         Wc_0 = Wm_0 + (1.0 - alpha_t**2 + 2.0)  # [B]
         Wc = tf.stack([Wc_0, Wm_i, Wm_i], axis=1)  # [B, 3]
-        
+
         # ✅ Предсказание состояния (векторизовано)
         x_pred = tf.reduce_sum(Wm * sigma_points, axis=1, keepdims=True)  # [B, 1]
-        
+
         # ✅ Предсказание ковариации (векторизовано)
         diff = sigma_points - tf.squeeze(x_pred, axis=-1)[:, tf.newaxis]  # [B, 3]
         weighted_var = Wc * tf.square(diff)  # [B, 3]
-        
+
         # ✅ ИСПРАВЛЕНО: УДАЛЕНА СТРОКА С ИСПОЛЬЗОВАНИЕМ inflation_factor
         # Q_scalar_inflated = Q_scalar * inflation_factor  # ← УДАЛЕНО, инфляция уже применена
         P_pred_scalar = tf.reduce_sum(weighted_var, axis=1) + Q_scalar  # [B]
-        
+
         # ✅ Добавляем синхронизацию с ограничениями из SpectralCovarianceParam
         min_P = 0.01  # Синхронизировано с _min_eigenvalue
         max_P = 8.0   # Синхронизировано с _max_eigenvalue
-        
+
         # ✅ Финальная форма ковариации
         P_pred = tf.reshape(P_pred_scalar, [batch_size, 1, 1])  # [B, 1, 1]
-        
+
         # ✅ СИНХРОНИЗИРОВАННОЕ ОГРАНИЧЕНИЕ
         P_pred = tf.clip_by_value(P_pred, min_P, max_P)  # ← ПРАВИЛЬНОЕ ОГРАНИЧЕНИЕ
-        
+
         # ✅ Явное указание размерностей для JIT
         x_pred = tf.ensure_shape(x_pred, [None, 1])
         P_pred = tf.ensure_shape(P_pred, [None, 1, 1])
@@ -549,27 +549,27 @@ class DifferentiableUKF(tf.Module):
         P_pred_scalar = P_pred[:, 0, 0]  # [B]
         z_scalar = z[:, 0]  # [B]
         R_scalar = R[:, 0, 0]  # [B]
-    
+
         # Коэффициент Kalman
         K_scalar = P_pred_scalar / (P_pred_scalar + R_scalar + 1e-8)  # [B]
-    
+
         # Инновация (остаток)
         innov_scalar = z_scalar - x_pred_scalar  # [B]
-    
+
         # Обновленное состояние
         x_upd_scalar = x_pred_scalar + K_scalar * innov_scalar  # [B]
         x_upd = tf.reshape(x_upd_scalar, [-1, 1])  # [B, 1]
-    
+
         # Joseph форма ковариации
         P_upd_scalar = (1 - K_scalar) * P_pred_scalar * (1 - K_scalar) + K_scalar * R_scalar * K_scalar
         P_upd = tf.reshape(P_upd_scalar, [-1, 1, 1])  # [B, 1, 1]
-    
+
         # Формируем выходы в правильной форме
         innov = tf.reshape(innov_scalar, [-1, 1, 1])  # [B, 1, 1]
         K = tf.reshape(K_scalar, [-1, 1, 1])  # [B, 1, 1]
-        
+
         return x_upd, P_upd, innov, K
-    
+
     def get_spectrum_info(self):
         """Получить информацию о спектре для мониторинга"""
         return self.spec_param.get_spectrum_info()
@@ -587,54 +587,54 @@ def compute_adaptive_threshold(
     inflation_factors_flat = tf.reshape(inflation_factors, [-1])
     sorted_values = tf.sort(inflation_factors_flat)
     total_count = tf.cast(tf.shape(sorted_values)[0], tf.float32)
-        
+
     # Используем более агрессивный подход к определению аномалий
     target_percentile = 25.0  # Более чувствительный порог
-        
+
     percentile_position = (total_count - 1.0) * (target_percentile / 100.0)
     lower_idx = tf.cast(tf.math.floor(percentile_position), tf.int32)
     upper_idx = tf.cast(tf.math.ceil(percentile_position), tf.int32)
     lower_idx = tf.maximum(lower_idx, 0)
     upper_idx = tf.minimum(upper_idx, tf.cast(total_count, tf.int32) - 1)
-        
+
     lower_val = sorted_values[lower_idx]
     upper_val = sorted_values[upper_idx]
     weight_upper = percentile_position - tf.floor(percentile_position)
     percentile_val = (1.0 - weight_upper) * lower_val + weight_upper * upper_val
-        
+
     # Расширяем диапазон адаптации
     mean_inflation = tf.reduce_mean(inflation_factors_flat)
     std_inflation = tf.math.reduce_std(inflation_factors_flat) + 1e-8
     base_threshold = mean_inflation + std_inflation  # mean + 1*std
     volatility_factor = 0.5 * tf.nn.sigmoid(current_volatility - 0.3)
     vol_adjusted_threshold = base_threshold + tf.reduce_mean(volatility_factor)
-        
+
     # Снижаем вес процентиля для более агрессивной адаптации
     dynamic_threshold = 0.7 * vol_adjusted_threshold + 0.3 * percentile_val
     dynamic_threshold = tf.clip_by_value(dynamic_threshold, mean_inflation, mean_inflation + 5.0 * std_inflation)
-        
+
     all_inflation_anomalies = tf.greater(inflation_factors_flat, dynamic_threshold)
     anomaly_ratio = tf.reduce_mean(tf.cast(all_inflation_anomalies, tf.float32))
-        
+
     def increase_threshold():
         adjustment_factor = 1.0 + 3.0 * tf.maximum(0.0, anomaly_ratio - target_anomaly_ratio)
         adjusted = dynamic_threshold * adjustment_factor
         return tf.clip_by_value(adjusted, mean_inflation, mean_inflation + 7.0 * std_inflation)
-    
+
     def keep_threshold():
         return dynamic_threshold
-    
+
     dynamic_threshold = tf.cond(
         anomaly_ratio > (target_anomaly_ratio * 1.5),  # Более чувствительный порог
         increase_threshold,
         keep_threshold
     )
-        
+
     # EMA сглаживание с более агрессивным коэффициентом
     ema_factor = 0.8
     smoothed_threshold = ema_factor * threshold_ema_var + (1 - ema_factor) * dynamic_threshold
     threshold_ema_var.assign(smoothed_threshold)
-        
+
     return smoothed_threshold, anomaly_ratio
 # =================================================================
 # ГИБРИДНАЯ LSTM-IMM-UKF МОДЕЛЬ С КОРРЕКТНЫМ УПРАВЛЕНИЕМ СОСТОЯНИЕМ
@@ -664,11 +664,11 @@ class LSTMIMMUKF(tf.Module):
         print("=" * 80)
         print("🚀 ИНИЦИАЛИЗАЦИЯ LSTM-UKF МОДЕЛИ С КОНТЕКСТНОЙ ВОЛАТИЛЬНОСТЬЮ")
         print("=" * 80)
-        
+
         # Настройка воспроизводимости
         self._setup_reproducibility(seed=seed)
         print(f"✅ Воспроизводимость настроена с seed={seed}")
-        
+
         # GPU/CPU настройки
         gpus = tf.config.list_physical_devices('GPU')
         if gpus:
@@ -682,13 +682,13 @@ class LSTMIMMUKF(tf.Module):
         else:
             print("⚠️ GPU не обнаружены, используем CPU")
             self._gpu_available = False
-        
+
         self.device = '/GPU:0' if self._gpu_available else '/CPU:0'
         print(f'✅ Устройство для вычислений: {self.device}')
-        
+
         # Дебаг режим
         self.debug_mode = False
-        
+
         # Базовые параметры - ЕДИНСТВЕННЫЙ РЕЖИМ вместо 3
         self.state_dim = 1
         self.num_modes = 1  # КРИТИЧЕСКИЕ ИЗМЕНЕНИЯ: от IMM к единому режиму
@@ -698,7 +698,7 @@ class LSTMIMMUKF(tf.Module):
         self.rolling_window_percentile = rolling_window_percentile
         self.emd_window = emd_window
         self.min_history_for_features = min_history_for_features
-        
+
         # Признаки
         if feature_columns is not None:
             self.feature_columns = feature_columns
@@ -706,11 +706,11 @@ class LSTMIMMUKF(tf.Module):
             self.feature_columns = self._default_feature_columns()
         print(f"✅ Инициализированы {len(self.feature_columns)} признаков:")
         print(f"   {', '.join(self.feature_columns)}")
-        
+
         # Режим UKF
         self.use_diff_ukf = use_diff_ukf
         print(f"🔧 UKF режим: {'DIFFERENTIABLE' if self.use_diff_ukf else 'STANDARD'}")
-        
+
         # Инициализация дифференцируемого UKF (ОДИН вместо трёх)
         if self.use_diff_ukf:
             print("✅ Инициализация дифференцируемого UKF...")
@@ -744,13 +744,13 @@ class LSTMIMMUKF(tf.Module):
         ))
         # Более резкая температура для четкого распределения
         self.regime_selector.temperature.assign(0.4)
-        print("✅ Regime Selector инициализирован (LOW/MID/HIGH режимы)")            
-        
+        print("✅ Regime Selector инициализирован (LOW/MID/HIGH режимы)")
+
         # Модель будет инициализирована позже
         self.model = None
         self.feature_scalers = None
         self.y_scalers = None
-        
+
         # === ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЙ UKF ДЛЯ ЕДИНОГО РЕЖИМА ===
         with tf.device(self.device):
             # Начальное состояние (для одного режима)
@@ -761,7 +761,7 @@ class LSTMIMMUKF(tf.Module):
                 dtype=tf.float32
             )
             print(f"✅ _last_state: shape={self._last_state.shape}")
-            
+
             # Обучаемые параметры для базовых шумов С ОГРАНИЧЕНИЯМИ
             self.base_q_logit = tf.Variable(
                 tf.math.log(0.3),  # СНИЖЕНО для меньшего Q (было 0.869)
@@ -777,7 +777,7 @@ class LSTMIMMUKF(tf.Module):
                 constraint=lambda x: tf.clip_by_value(x, tf.math.log(0.5), tf.math.log(1.5)),  # ← ДОБАВЛЕНО CONSTRAINT
                 name='base_r_logit'
             )
-            
+
             # Вычисление начальной ковариации
             base_q = tf.nn.softplus(self.base_q_logit) + 1e-6
             self._last_P = tf.Variable(
@@ -787,7 +787,7 @@ class LSTMIMMUKF(tf.Module):
                 dtype=tf.float32
             )
             print(f"✅ _last_P: shape={self._last_P.shape}")
-            
+
             # Флаг инициализации состояния
             self._state_initialized = tf.Variable(
                 False,
@@ -796,7 +796,7 @@ class LSTMIMMUKF(tf.Module):
                 dtype=tf.bool
             )
             print("✅ _state_initialized: флаг инициализации")
-            
+
             # Счетчик шагов
             self._step_counter = tf.Variable(
                 0,
@@ -805,7 +805,7 @@ class LSTMIMMUKF(tf.Module):
                 dtype=tf.int64
             )
             print("✅ _step_counter: для отслеживания количества шагов")
-            
+
             # Время последней аномалии (для adaptive inflation)
             self._last_anomaly_time = tf.Variable(
                 -100,
@@ -814,7 +814,7 @@ class LSTMIMMUKF(tf.Module):
                 dtype=tf.int64
             )
             print("✅ _last_anomaly_time: для отслеживания времени последней аномалии")
-            
+
             # Параметры для адаптивной волатильности
             self.volatility_sensitivity = tf.Variable(
                 1.0,
@@ -822,7 +822,7 @@ class LSTMIMMUKF(tf.Module):
                 dtype=tf.float32,
                 name='volatility_sensitivity'
             )
-            
+
             # Параметры для Student-t распределения
             self.student_t_base_dof = tf.Variable(
                 tf.math.log(4.0),  # меньше степеней свободы = толще хвосты
@@ -837,7 +837,7 @@ class LSTMIMMUKF(tf.Module):
                 constraint=lambda x: tf.clip_by_value(x, 0.0, 0.7),
                 name='student_t_vol_sensitivity'
             )
-            
+
             # Параметры для adaptive inflation
             self.inflation_base_factor = tf.Variable(
                 tf.math.log(0.2),  # СНИЖЕНО с 1.572 до 0.5 (базовое значение ~1.6 вместо ~4.8)
@@ -860,7 +860,7 @@ class LSTMIMMUKF(tf.Module):
                 constraint=lambda x: tf.clip_by_value(x, 0.9, 0.99),
                 name='inflation_decay_rate'
             )
-            
+
             # Параметры для калибровки доверительных интервалов
             self.confidence_base = tf.Variable(
                 0.88,  # снижение целевого покрытия
@@ -876,7 +876,7 @@ class LSTMIMMUKF(tf.Module):
                 constraint=lambda x: tf.clip_by_value(x, 0.0, 0.3),
                 name='confidence_vol_sensitivity'
             )
-        
+
         # Инициализация оптимизатора
         print("\n✅ Инициализация оптимизатора с Loss Scale...")
         base_optimizer = tf.keras.optimizers.Adam(learning_rate=5e-4, amsgrad=False)
@@ -887,14 +887,14 @@ class LSTMIMMUKF(tf.Module):
         else:
             self._optimizer = base_optimizer
             print("✅ Стандартный оптимизатор инициализирован (без mixed precision)")
-        
+
         # Ранняя остановка
         self.best_val_loss = float('inf')
         self.best_epoch = 0
         self.best_weights_dict = None
         self.best_scalers = None
         self.patience_counter = 0
-        
+
         # Группы признаков для масштабирования
         self.scale_groups = {
             'robust': ['level', 'velocity', 'acceleration', 'energy', 'st_comp_diff',
@@ -917,7 +917,7 @@ class LSTMIMMUKF(tf.Module):
             entropy_type='distribution',
             normalize_method='sigmoid'
         )
-        
+
         # Гиперпараметр регуляризации (начальное значение)
         self.lambda_entropy = tf.Variable(
             0.02,  # увеличено до 2% от основной loss
@@ -929,7 +929,7 @@ class LSTMIMMUKF(tf.Module):
 
         # Инициализация EMA для адаптивного порога аномалий
         self.threshold_ema = tf.Variable(3.0, trainable=False, dtype=tf.float32)
-        
+
         print("=" * 80)
         print("✅ LSTM-UKF МОДЕЛЬ С КОНТЕКСТНОЙ ВОЛАТИЛЬНОСТЬЮ ПОЛНОСТЬЮ ИНИЦИАЛИЗИРОВАНА")
         print(f"⏰ Завершено: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -944,7 +944,7 @@ class LSTMIMMUKF(tf.Module):
         np.random.seed(seed)
         tf.random.set_seed(seed)
         logger.info(f"✅ Reproducibility seed set to {seed}")
-    
+
     def _default_feature_columns(self):
         """Обновленный список признаков с включением всех используемых компонентов"""
         return [
@@ -953,12 +953,12 @@ class LSTMIMMUKF(tf.Module):
             'extreme_pos_momentum', 'asymmetry_ratio', 'tail_weight_indicator',
             'velocity', 'acceleration', 'rel_vol_short_long', 'vol_accel_rel', 'rel_entropy'
         ]
-    
+
     def _build_model(self, input_shape: Tuple[int, int], training: bool = True) -> tf.keras.Model:
         """Архитектура LSTM с расширенным выходом для декомпозиции параметров"""
         l2_reg = tf.keras.regularizers.l2(5e-4)
         inputs = tf.keras.Input(shape=input_shape)
-        
+
         # Первый LSTM слой
         lstm1 = tf.keras.layers.LSTM(
             256,
@@ -973,7 +973,7 @@ class LSTMIMMUKF(tf.Module):
         h1 = lstm1(inputs, training=training)  # [B, T, 256]
         h1 = tf.keras.layers.LayerNormalization()(h1)
         h1 = tf.keras.layers.Dropout(0.4)(h1, training=training)
-        
+
         # Второй LSTM слой
         lstm2 = tf.keras.layers.LSTM(
             128,
@@ -988,7 +988,7 @@ class LSTMIMMUKF(tf.Module):
         h2 = lstm2(h1, training=training)  # [B, T, 128]
         h2 = tf.keras.layers.LayerNormalization()(h2)
         h2 = tf.keras.layers.Dropout(0.3)(h2, training=training)
-        
+
         # Multi-Head Attention слой
         attention = tf.keras.layers.MultiHeadAttention(
             num_heads=4,
@@ -1003,12 +1003,12 @@ class LSTMIMMUKF(tf.Module):
             value=h2,
             training=training
         )
-        
+
         # Остаточное соединение и нормализация
         h_attn = tf.keras.layers.Add()([h2, attention_output])
         h_attn = tf.keras.layers.LayerNormalization()(h_attn)
         h_attn = tf.keras.layers.Dropout(0.25)(h_attn, training=training)
-        
+
         # Выходной слой для генерации параметров с поддержкой асимметричных границ (42 параметра)
         params = tf.keras.layers.Dense(
             37,
@@ -1019,7 +1019,7 @@ class LSTMIMMUKF(tf.Module):
             kernel_regularizer=l2_reg,
             name='adaptive_params_layer'
         )(h_attn)
-        
+
         # НОВОЕ: модель возвращает ВСЕ скрытые представления
         model = tf.keras.Model(inputs=inputs, outputs={
             'params': params,
@@ -1027,22 +1027,22 @@ class LSTMIMMUKF(tf.Module):
             'h_lstm2': h2,      # [B, T, 128]
             'h_attention': h_attn  # [B, T, 128]
         })
-        
+
         return model
-    
+
     def process_lstm_output(self, params_output):
         """Новая обработка выхода LSTM для адаптивной волатильности"""
         params_clipped = tf.clip_by_value(params_output, -8.0, 8.0)
         B = tf.shape(params_clipped)[0]
         T = tf.shape(params_clipped)[1]
-        
+
         # === ИЗВЛЕЧЕНИЕ НОВЫХ ПАРАМЕТРОВ ===
         # ✅ ПРАВИЛЬНОЕ РАЗДЕЛЕНИЕ 36 ПАРАМЕТРОВ
         vol_context_params = params_clipped[..., :7]      # 7 параметров
         base_ukf_params = params_clipped[..., 7:19]       # 12 параметров
-        inflation_params = params_clipped[..., 19:28]     # 9 параметров  
+        inflation_params = params_clipped[..., 19:28]     # 9 параметров
         student_t_params = params_clipped[..., 28:37]     # 9 параметров
-        
+
         # === ОБРАБОТКА ПАРАМЕТРОВ ===
         # 1. Параметры контекстной волатильности
         vol_context = {
@@ -1054,7 +1054,7 @@ class LSTMIMMUKF(tf.Module):
             'memory_factor': 0.8 + 0.2 * tf.nn.sigmoid(vol_context_params[..., 5:6]),
             'leverage_effect_strength': 0.5 + 1.5 * tf.nn.sigmoid(vol_context_params[..., 6:7])
         }
-        
+
         # 2. Базовые параметры UKF
         ukf_params = {
             'q_base': tf.nn.softplus(base_ukf_params[..., 0:1]) + 1e-6,  # базовый Q
@@ -1070,7 +1070,7 @@ class LSTMIMMUKF(tf.Module):
             'q_floor': tf.nn.softplus(base_ukf_params[..., 10:11]) + 1e-8,
             'r_floor': tf.nn.softplus(base_ukf_params[..., 11:12]) + 1e-8
         }
-        
+
         # 3. Параметры для adaptive inflation
         # ✅ ИСПРАВЛЕННАЯ ВЕРСИЯ ДЛЯ inflation_config
         inflation_config = {
@@ -1085,7 +1085,7 @@ class LSTMIMMUKF(tf.Module):
             'memory_decay': 0.7 + 0.3 * tf.nn.sigmoid(inflation_params[..., 7:8]),
             'inflation_limit': 20.0 * tf.nn.sigmoid(inflation_params[..., 8:9])
         }
-        
+
         # 4. Параметры Student-t распределения с асимметричными границами (ИСПРАВЛЕНО: удалены дубликаты)
         student_t_config = {
             'dof_base': 3.0 + 8.0 * tf.nn.sigmoid(student_t_params[..., 0:1]),
@@ -1098,37 +1098,37 @@ class LSTMIMMUKF(tf.Module):
             'confidence_floor': 0.7 + 0.2 * tf.nn.sigmoid(student_t_params[..., 7:8]),
             'confidence_ceil': 0.95 + 0.04 * tf.nn.sigmoid(student_t_params[..., 8:9]),
         }
-        
+
         # === НОВОЕ: РЕЖИМНАЯ КАЛИБРОВКА ДИ ===
         # Вычисляем текущую волатильность из vol_context
         # vol_context['sensitivity_short'] уже содержит влияние текущей волатильности
         vol_level = vol_context['sensitivity_short']  # [B, T, 1]
         vol_squeezed = tf.squeeze(vol_level, axis=-1)  # [B, T]
-        
+
         # Для каждого элемента батча и шага времени: мягкое распределение по режимам
         B = tf.shape(vol_context['sensitivity_short'])[0]
         T = tf.shape(vol_context['sensitivity_short'])[1]
-        
+
         # Процесс по времени: для каждого шага вычисляем soft-веса
         # vol_squeezed: [B, T] → нужно для каждого (b, t) вычислить soft_weights
-        
+
         # Переформируем: [B, T] → [B*T]
         vol_flat = tf.reshape(vol_squeezed, [B * T])
-        
+
         # Получаем мягкие веса для каждого элемента
         regime_info = self.regime_selector.assign_soft_regimes(vol_flat)
         soft_weights = regime_info['soft_weights']  # [B*T, num_regimes]
-        
+
         # Получаем масштабы режимов
         regime_scale = self.regime_selector.get_regime_scales(soft_weights)  # [B*T, 1]
-        
+
         # Переформируем обратно: [B*T, 1] → [B, T, 1]
         regime_scale = tf.reshape(regime_scale, [B, T, 1])
-        
+
         # Добавляем масштаб в student_t_config
         student_t_config['regime_scale'] = regime_scale  # [B, T, 1]
         student_t_config['regime_soft_weights'] = tf.reshape(soft_weights, [B, T, self.regime_selector.num_regimes])
-        
+
         return vol_context, ukf_params, inflation_config, student_t_config
 
     @tf.function
@@ -1143,30 +1143,30 @@ class LSTMIMMUKF(tf.Module):
         B = tf.shape(innov_prev)[0]
         leverage_strength_t = tf.reshape(leverage_strength_t, [B, 1])
         leverage_strength_t = tf.clip_by_value(leverage_strength_t, 0.5, 5.0)  # Расширяем диапазон
-            
+
         base_vol = volatility_level  # [B]
         direction = tf.sign(innov_prev)  # [B]
         direction = tf.reshape(direction, [B, 1])  # [B, 1]
-            
+
         # Адаптивный множитель волатильности - более гибкий для экстремальных рынков
         vol_multiplier = tf.where(
             direction < 0,
             leverage_strength_t * (1.0 + 0.5 * base_vol),  # При падении: больше усиление при высокой волатильности
             1.0 / (leverage_strength_t * (1.0 + 0.5 * base_vol) + 1e-8)  # При росте: больше сглаживание
         )
-            
+
         vol_adaptive = base_vol * vol_multiplier  # [B, 1]
         vol_adaptive = tf.clip_by_value(vol_adaptive, 0.0, 10.0)  # Расширяем верхний предел
-            
+
         # Вычисление Q и R с правильными размерностями
         q_val = q_base_t * (1.0 + q_sensitivity_t * vol_adaptive)  # [B, 1]
         q_val = tf.maximum(q_val, q_floor_t)  # [B, 1]
         Q_t = tf.reshape(q_val, [B, 1, 1])
-            
+
         r_val = r_base_t * (1.0 + r_sensitivity_t * vol_adaptive)  # [B, 1]
         r_val = tf.maximum(r_val, r_floor_t)  # [B, 1]
         R_t = tf.reshape(r_val, [B, 1, 1])
-            
+
         return Q_t, R_t, vol_adaptive
 
     def _process_filter_params(self, filter_params):
@@ -1174,38 +1174,38 @@ class LSTMIMMUKF(tf.Module):
         params_clipped = tf.clip_by_value(filter_params, -8.0, 8.0)
         B = tf.shape(params_clipped)[0]
         T = tf.shape(params_clipped)[1]
-        
+
         # Базовые параметры
         M_params = params_clipped[..., :9]
         q_raw = params_clipped[..., 9:12]
         r_raw = params_clipped[..., 12:15]
         hyperparams = params_clipped[..., 15:22]
-        
+
         # Обработка матрицы переходов M
         M_matrix = tf.reshape(M_params, [B, T, self.num_modes, self.num_modes])
-        
+
         # Вычисление обучаемой temperature с ограничением на минимальное значение
         temperature = tf.nn.softplus(self.m_temp_logit) + 0.1  # ≥ 0.1
         M_matrix = tf.nn.softmax(M_matrix / temperature, axis=-1)
-        
+
         # === ОБУЧАЕМЫЕ МАСШТАБНЫЕ КОЭФФИЦИЕНТЫ ДЛЯ Q И R ===
         # Вычисление масштабов через softplus для положительности
         scale_factors_q = tf.nn.softplus(self.q_scale_logits) + 1e-6
         scale_factors_r = tf.nn.softplus(self.r_scale_logits) + 1e-6
-        
+
         # Обработка Q параметров с иерархией
         q_sorted = tf.sort(tf.math.softplus(q_raw) + 1e-6, axis=-1)
         q_params = q_sorted * scale_factors_q
         q_params = tf.clip_by_value(q_params, 1e-5, 5.0)
-        
+
         # Обработка R параметров с иерархией
         r_sorted = tf.sort(tf.math.softplus(r_raw) + 1e-6, axis=-1)
         r_params = r_sorted * scale_factors_r
         r_params = tf.clip_by_value(r_params, 1e-6, 2.0)
-        
+
         # Обработка гиперпараметров дифференцируемого UKF
         ukf_hyperparams = {}
-        
+
         # 1. Relax factor для сигма-точек
         sigma_relax_raw = hyperparams[..., 0:1]
         sigma_relax = 0.5 + 1.0 * tf.nn.sigmoid(sigma_relax_raw)
@@ -1213,33 +1213,33 @@ class LSTMIMMUKF(tf.Module):
             tf.squeeze(sigma_relax, axis=-1),
             [None, None]  # Гарантируем [B, T]!
         )
-        
+
         # 2. Alpha factor для каждого шага
         alpha_factor_raw = hyperparams[..., 1:2]
         alpha_factor_t = 0.5 + 0.5 * tf.nn.sigmoid(alpha_factor_raw)  # [0.5, 1.0]
         ukf_hyperparams['alpha_factor_t'] = tf.squeeze(alpha_factor_t, axis=-1)  # [B, T]
-        
+
         # 3. Kappa factor для каждого шага
         kappa_factor_raw = hyperparams[..., 2:3]
         kappa_factor_t = 0.5 + 2.0 * tf.nn.sigmoid(kappa_factor_raw)  # [0.5, 2.5]
         ukf_hyperparams['kappa_factor_t'] = tf.squeeze(kappa_factor_t, axis=-1)  # [B, T]
-        
+
         # 4. Joseph blend
         joseph_blend_raw = hyperparams[..., 3:4]
         joseph_blend = tf.nn.sigmoid(joseph_blend_raw)
         ukf_hyperparams['joseph_blend'] = tf.squeeze(joseph_blend, axis=-1)
-        
+
         # 5. Spectral regularization
         spectral_reg_raw = hyperparams[..., 4:5]
         spectral_reg = 0.01 + 0.1 * tf.nn.sigmoid(spectral_reg_raw)
         ukf_hyperparams['spectral_reg'] = tf.squeeze(spectral_reg, axis=-1)
-        
+
         # 6-7. Регуляризация alpha_t/kappa_t
         alpha_t_reg_target = hyperparams[..., 5:6]
         kappa_t_reg_target = hyperparams[..., 6:7]
         ukf_hyperparams['alpha_t_reg_target'] = tf.squeeze(alpha_t_reg_target, axis=-1)
         ukf_hyperparams['kappa_t_reg_target'] = tf.squeeze(kappa_t_reg_target, axis=-1)
-        
+
         return M_matrix, q_params, r_params, ukf_hyperparams, scale_factors_q, scale_factors_r
 
     def _process_forecast_params(self, forecast_params):
@@ -1247,139 +1247,139 @@ class LSTMIMMUKF(tf.Module):
         params_clipped = tf.clip_by_value(forecast_params, -8.0, 8.0)
         B = tf.shape(params_clipped)[0]
         T = tf.shape(params_clipped)[1]
-        
+
         # Гиперпараметры для прогнозирования (14 параметров)
         ukf_hyperparams_forecast = {}
-        
+
         # 1. Relax factor для прогноза (для каждого режима)
         sigma_relax_raw = params_clipped[..., 0:3]  # 3 значения для 3 режимов
         sigma_relax = 0.7 + 1.5 * tf.nn.sigmoid(sigma_relax_raw)  # Расширенный диапазон для прогноза
         ukf_hyperparams_forecast['sigma_relax'] = sigma_relax[:, -1, :]  # Берем последний шаг
-        
+
         # 2. Alpha factor для прогноза
         alpha_factor_raw = params_clipped[..., 3:6]
         alpha_factor_t = 0.3 + 1.2 * tf.nn.sigmoid(alpha_factor_raw)  # Более гибкие значения для прогноза
         ukf_hyperparams_forecast['alpha_factor_t'] = alpha_factor_t[:, -1, :]
-        
+
         # 3. Kappa factor для прогноза
         kappa_factor_raw = params_clipped[..., 6:9]
         kappa_factor_t = 0.2 + 3.0 * tf.nn.sigmoid(kappa_factor_raw)  # Более широкий диапазон
         ukf_hyperparams_forecast['kappa_factor_t'] = kappa_factor_t[:, -1, :]
-        
+
         # 4. Дополнительные параметры для прогноза
         q_forecast_scale = params_clipped[..., 9:12]  # Масштабы шумов процесса для прогноза
         ukf_hyperparams_forecast['q_forecast_scale'] = tf.nn.softplus(q_forecast_scale[:, -1, :]) + 1e-6
-        
+
         # 5. Параметры коррекции прогноза
         forecast_adjustment = params_clipped[..., 12:14]  # 2 дополнительных параметра для коррекции
         ukf_hyperparams_forecast['forecast_adjustment'] = tf.tanh(forecast_adjustment[:, -1, :])
-        
+
         # 6. Параметр boost_factor для экстремальных режимов
         jump_boost_factor = params_clipped[..., 13:14]  # последний параметр
         ukf_hyperparams_forecast['jump_boost_factor'] = tf.nn.softplus(jump_boost_factor[:, -1, :]) + 1.0
-        
+
         return ukf_hyperparams_forecast
 
     @tf.function
     def _student_t_update(
-        self, 
-        x_pred, P_pred, z, R, 
+        self,
+        x_pred, P_pred, z, R,
         volatility_level,
-        dof_adaptive, 
-        asymmetry_pos, 
+        dof_adaptive,
+        asymmetry_pos,
         asymmetry_neg
     ):
         """Student-t обновление UKF с коррекцией под толстые хвосты и асимметрию"""
         batch_size = tf.shape(x_pred)[0]
-        
+
         # ✅ Гарантируем правильные размерности
         x_pred = tf.reshape(x_pred, [batch_size, 1])  # [B, 1]
         P_pred = tf.reshape(P_pred, [batch_size, 1, 1])  # [B, 1, 1]
         z = tf.reshape(z, [batch_size, 1])  # [B, 1]
         R = tf.reshape(R, [batch_size, 1, 1])  # [B, 1, 1]
-        
+
         x_pred_scalar = tf.squeeze(x_pred, -1)  # [B]
         P_pred_scalar = tf.squeeze(P_pred, [-2, -1])  # [B]
         z_scalar = tf.squeeze(z, -1)  # [B]
         R_scalar = tf.squeeze(R, [-2, -1])  # [B]
-        
+
         # ✅ Стандартные параметры Student-t
         dof_scalar = tf.squeeze(dof_adaptive, -1)  # [B]
         asymmetry_pos_scalar = tf.squeeze(asymmetry_pos, -1)  # [B]
         asymmetry_neg_scalar = tf.squeeze(asymmetry_neg, -1)  # [B]
-        
+
         # ✅ Стандартное калманово обновление
         K_scalar = P_pred_scalar / (P_pred_scalar + R_scalar + 1e-8)  # [B]
         innov_scalar = z_scalar - x_pred_scalar  # [B]
         x_upd_scalar = x_pred_scalar + K_scalar * innov_scalar  # [B]
-        
+
         # ✅ Joseph форма для стабильности
         P_upd_scalar = (1.0 - K_scalar) * P_pred_scalar * (1.0 - K_scalar) + K_scalar * R_scalar * K_scalar  # [B]
-        
+
         # === СТРОГИЕ ОГРАНИЧЕНИЯ STUDENT-T ПАРАМЕТРОВ ===
         # Степени свободы: 4.0-8.0 вместо 2.0-15.0
         dof_scalar = tf.clip_by_value(dof_scalar, 3.0, 15.0)  # [B] Уменьшенный диапазон (было 5.0-7.0)
-        
+
         # ✅ Нормализуем инновацию в единицах сигмы
         sigma_total = tf.sqrt(P_pred_scalar + R_scalar + 1e-8)  # [B]
         normalized_innov = innov_scalar / sigma_total  # [B]
-        
+
         # ✅ Фактор увеличения ковариации для толстых хвостов (БОЛЕЕ СТРОГИЙ)
         # dof_scalar ∈ [4, 8] → heavy_tail_factor ∈ [1.0, 1.6]
         heavy_tail_factor = 1.0 + (dof_scalar - 4.0) / 6.0  # [B]
         heavy_tail_factor = tf.clip_by_value(heavy_tail_factor, 1.0, 1.6)  # [B]
-        
+
         # ✅ УЖЕСТВЛЕННОЕ обнаружение больших инноваций
         tail_adjustment = tf.nn.softplus(1.0 * (tf.abs(normalized_innov) - 2.0))  # [B]
         tail_adjustment = tf.clip_by_value(tail_adjustment, 0.0, 1.5)  # [B]
-        
+
         # АДАПТИВНЫЕ ограничения на асимметрию с учетом волатильности
         vol_factor = 0.8 + 1.2 * volatility_level  # Увеличиваем асимметрию при высокой волатильности
         asymmetry_pos_bound = 0.85 * vol_factor  # [B] - расширяем диапазон до 0.7-1.4
         asymmetry_neg_bound = 1.15 * vol_factor  # [B]
         asymmetry_pos_scalar = tf.clip_by_value(asymmetry_pos_scalar, 0.7, 1.4)
         asymmetry_neg_scalar = tf.clip_by_value(asymmetry_neg_scalar, 0.7, 1.4)
-        
+
         # ✅ Асимметричное взвешивание хвостов (БОЛЕЕ КОНСЕРВАТИВНОЕ)
         asymmetry_weight = tf.where(
             innov_scalar >= 0,
             asymmetry_pos_scalar,  # [B]
             asymmetry_neg_scalar   # [B]
         )
-        
+
         # ✅ Финальная коррекция ковариации с УЖЕСТВЛЕННЫМИ ПАРАМЕТРАМИ
         correction_factor = 1.0 + (heavy_tail_factor * tail_adjustment * asymmetry_weight)  # [B]
         correction_factor = tf.clip_by_value(correction_factor, 1.0, 2.0)  # [B]
         P_upd_scalar = P_upd_scalar * correction_factor  # [B]
         P_upd_scalar = tf.maximum(P_upd_scalar, 1e-8)  # [B]
-        
+
         # ===== ДОПОЛНИТЕЛЬНЫЕ СТРОГИЕ ОГРАНИЧЕНИЯ =====
-        # АСИММЕТРИЯ: ограничиваем в очень узком диапазоне 
+        # АСИММЕТРИЯ: ограничиваем в очень узком диапазоне
         asymmetry_pos = tf.clip_by_value(asymmetry_pos, 0.8, 1.2)  # [B, 1]
         asymmetry_neg = tf.clip_by_value(asymmetry_neg, 0.8, 1.2)  # [B, 1]
-        
+
         # Фактор хвостов (для внешних расчетов)
         tail_weight_pos = tf.ones([batch_size, 1]) * 1.0  # Фиксированный базовый вес
         tail_weight_neg = tf.ones([batch_size, 1]) * 1.0  # Фиксированный базовый вес
-        
+
         # ===== КОНЕЦ СТРОГИХ ОГРАНИЧЕНИЙ =====
-        
+
         # ✅ Форматирование выходных данных с правильными размерностями
         x_upd = tf.reshape(x_upd_scalar, [batch_size, 1])  # [B, 1]
         P_upd = tf.reshape(P_upd_scalar, [batch_size, 1, 1])  # [B, 1, 1]
         innov = tf.reshape(innov_scalar, [batch_size, 1, 1])  # [B, 1, 1]
         K = tf.reshape(K_scalar, [batch_size, 1, 1])  # [B, 1, 1]
-        
+
         return x_upd, P_upd, innov, K
 
-    def _apply_inflation_limits(self, inflation_factor, steps_above_threshold, 
+    def _apply_inflation_limits(self, inflation_factor, steps_above_threshold,
                               max_threshold=15.0, max_steps=5):
         """Сброс инфляции, если она застряла на высоком уровне
         inflation_factor: [B] - текущий фактор инфляции
         steps_above_threshold: [B] - счетчик шагов с высокой инфляцией
         max_threshold: максимальное значение инфляции перед сбросом
         max_steps: максимальное количество шагов перед сбросом
-        
+
         Возвращает:
         inflation_factor: [B] - скорректированный фактор инфляции
         steps_above_threshold: [B] - обновленный счетчик шагов
@@ -1390,21 +1390,21 @@ class LSTMIMMUKF(tf.Module):
         inflation_factor > max_threshold,
         steps_above_threshold > max_steps
         )  # [B]
-        
+
         # ✅ СНИЖЕНО пороговое значение сброса с 5.0 до 2.0
         inflation_factor = tf.where(
         reset_mask,
         tf.ones_like(inflation_factor) * 2.0,  # БЫЛО 5.0, СТАЛО 2.0
         inflation_factor
         )  # [B]
-        
+
         # ✅ Обновление счетчика: сброс на 0 при сбросе инфляции, иначе инкремент
         steps_above_threshold = tf.where(
             reset_mask,
             tf.zeros_like(steps_above_threshold),
             tf.minimum(steps_above_threshold + 1, max_steps + 1)  # ограничиваем рост счетчика
         )  # [B]
-        
+
         # ✅ Финальное ограничение счетчика снизу
         return inflation_factor, tf.maximum(steps_above_threshold, 0)  # [B], [B]
 
@@ -1423,14 +1423,14 @@ class LSTMIMMUKF(tf.Module):
     ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
         """
         Адаптивный UKF фильтр с контекстной волатильностью.
-        
+
         Входные размерности:
         - Xbatch: [B, T, n_features]
         - y_level_batch: [B, T]
         - vol_context, ukf_params, inflation_config, student_t_config: [B, T, 1] каждый
         - initial_state: [B, 1]
         - initial_covariance: [B, 1, 1]
-        
+
         Выходные размерности:
         - states: [B, T, 1]
         - innovations: [B, T, 1]
@@ -1443,7 +1443,7 @@ class LSTMIMMUKF(tf.Module):
         B = tf.shape(Xbatch)[0]
         state_dim = self.state_dim
         innov_window_size = 20  # Размер окна для истории инноваций
-    
+
         # Инициализация буфера для динамической коррекции порога
         if not hasattr(self, 'anomaly_buffer') or not hasattr(self, 'buffer_index'):
             self.anomaly_buffer_size = 100
@@ -1453,28 +1453,28 @@ class LSTMIMMUKF(tf.Module):
                 name='anomaly_buffer'
             )
             self.buffer_index = tf.Variable(0, dtype=tf.int32, trainable=False, name='buffer_index')
-        
+
         # ЯВНОЕ УПРАВЛЕНИЕ РАЗМЕРНОСТЯМИ
         Xbatch = tf.cast(Xbatch, tf.float32)
         y_level_batch = tf.cast(y_level_batch, tf.float32)
         initial_state = tf.cast(initial_state, tf.float32)
         initial_covariance = tf.cast(initial_covariance, tf.float32)
-        
+
         if not hasattr(self, 'feature_to_idx'):
             self.feature_to_idx = {feature: idx for idx, feature in enumerate(self.feature_columns)}
-        
+
         # ✅ СОЗДАНИЕ TensorArray С ЯВНЫМИ ТИПАМИ И ФОРМАМИ
-        states_hist = tf.TensorArray(tf.float32, size=T, element_shape=tf.TensorShape([None]), 
+        states_hist = tf.TensorArray(tf.float32, size=T, element_shape=tf.TensorShape([None]),
                                    dynamic_size=False, clear_after_read=False)
-        innovations_hist = tf.TensorArray(tf.float32, size=T, element_shape=tf.TensorShape([None]), 
+        innovations_hist = tf.TensorArray(tf.float32, size=T, element_shape=tf.TensorShape([None]),
                                         dynamic_size=False, clear_after_read=False)
-        volatility_levels = tf.TensorArray(tf.float32, size=T, element_shape=tf.TensorShape([None]), 
+        volatility_levels = tf.TensorArray(tf.float32, size=T, element_shape=tf.TensorShape([None]),
                                          dynamic_size=False, clear_after_read=False)
-        inflation_factors_hist = tf.TensorArray(tf.float32, size=T, element_shape=tf.TensorShape([None]), 
+        inflation_factors_hist = tf.TensorArray(tf.float32, size=T, element_shape=tf.TensorShape([None]),
                                               dynamic_size=False, clear_after_read=False)
-        high_infl_steps_hist = tf.TensorArray(tf.int32, size=T, element_shape=tf.TensorShape([None]), 
+        high_infl_steps_hist = tf.TensorArray(tf.int32, size=T, element_shape=tf.TensorShape([None]),
                                             dynamic_size=False, clear_after_read=False)
-        
+
         # АДАПТИВНАЯ инициализация текущих состояний с учетом волатильности
         current_state = initial_state  # [B, state_dim]
         # Инициализация ковариации зависит от уровня волатильности в данных
@@ -1482,7 +1482,7 @@ class LSTMIMMUKF(tf.Module):
         initial_cov_value = tf.maximum(initial_vol * 0.5, 0.1)  # Минимум 0.1 для стабильности
         current_covariance = tf.reshape(initial_cov_value, [B, 1, 1])  # [B, 1, 1]
         current_volatility = tf.zeros([B], dtype=tf.float32)  # [B]
-        
+
         # ✅ ИНИЦИАЛИЗАЦИЯ ПАРАМЕТРОВ ДЛЯ ADAPTIVE INFLATION С ЕДИНООБРАЗНЫМИ ТИПАМИ
         if inflation_state_input is None:
             # Все значения с типом tf.int32 для единообразия
@@ -1495,12 +1495,12 @@ class LSTMIMMUKF(tf.Module):
             remaining_steps_init = tf.cast(inflation_state_input.get('remaining_steps', tf.zeros([B], dtype=tf.int32)), tf.int32)
             last_anomaly_time_init = tf.cast(inflation_state_input.get('last_anomaly_time', tf.fill([B], tf.constant(-100, dtype=tf.int32))), tf.int32)
             high_inflation_steps_init = tf.cast(inflation_state_input.get('high_inflation_steps', tf.zeros([B], dtype=tf.int32)), tf.int32)
-        
+
         # ✅ ИНИЦИАЛИЗАЦИЯ ОКНА ИННОВАЦИЙ
         initial_std = 0.1
         innov_window_init = tf.random.normal(
-            [B, innov_window_size], 
-            mean=0.0, 
+            [B, innov_window_size],
+            mean=0.0,
             stddev=initial_std, # небольшой начальный шум вместо нулей
             dtype=tf.float32
         )
@@ -1510,11 +1510,11 @@ class LSTMIMMUKF(tf.Module):
             tf.print("   • Форма окна:", tf.shape(innov_window_init))
             tf.print("   • Размер батча (B):", B)
             tf.print("   • Размер окна:", innov_window_size)
-        
+
         def cond(t, state, cov, vol, innov_win, inf_factor, rem_steps, last_anom_time,
                  s_hist, i_hist, v_hist, f_hist, high_infl_steps):
             return t < T
-        
+
         def body(t, state, cov, vol, innov_win, inf_factor, rem_steps, last_anom_time,
                  s_hist, i_hist, v_hist, f_hist, high_infl_steps):
             """
@@ -1529,19 +1529,19 @@ class LSTMIMMUKF(tf.Module):
             rem_steps = tf.ensure_shape(rem_steps, [None])
             last_anom_time = tf.ensure_shape(last_anom_time, [None])
             # high_infl_steps = tf.ensure_shape(high_infl_steps, [None])
-            
+
             # ✅ СТАБИЛЬНОЕ ОПРЕДЕЛЕНИЕ РАЗМЕРА БАТЧА ЧЕРЕЗ B
             B_batch = B
-            
+
             # Извлечение текущих признаков и наблюдений
             current_features = tf.gather(Xbatch, t, axis=1)  # [B, n_features]
             current_observation = tf.gather(y_level_batch, t, axis=1)  # [B]
             t_idx = tf.cast(t, tf.int32)
-            
+
             # ════════════════════════════════════════════════════════════════
             # ЭТАП 1: ИЗВЛЕЧЕНИЕ ПАРАМЕТРОВ С ПОМОЩЬЮ tf.gather
             # ════════════════════════════════════════════════════════════════
-            
+
             # --- Извлечение параметров из vol_context ---
             leverage_strength_t = tf.gather(vol_context['leverage_effect_strength'], t_idx, axis=1)  # [B, 1]
             sensitivity_short_t = tf.gather(vol_context['sensitivity_short'], t_idx, axis=1)  # [B, 1]
@@ -1550,7 +1550,7 @@ class LSTMIMMUKF(tf.Module):
             entropy_weight_t = tf.gather(vol_context['entropy_weight'], t_idx, axis=1)  # [B, 1]
             accel_weight_t = tf.gather(vol_context['accel_weight'], t_idx, axis=1)  # [B, 1]
             memory_factor_t = tf.gather(vol_context['memory_factor'], t_idx, axis=1)  # [B, 1]
-            
+
             # --- Извлечение параметров из ukf_params ---
             q_base_t = tf.gather(ukf_params['q_base'], t_idx, axis=1)  # [B, 1]
             q_sensitivity_t = tf.gather(ukf_params['q_sensitivity'], t_idx, axis=1)  # [B, 1]
@@ -1564,7 +1564,7 @@ class LSTMIMMUKF(tf.Module):
             alpha_sensitivity_t = tf.gather(ukf_params['alpha_sensitivity'], t_idx, axis=1)  # [B, 1]
             kappa_base_t = tf.gather(ukf_params['kappa_base'], t_idx, axis=1)  # [B, 1]
             kappa_sensitivity_t = tf.gather(ukf_params['kappa_sensitivity'], t_idx, axis=1)  # [B, 1]
-            
+
             # --- Извлечение параметров из inflation_config ---
             base_inflation_t = tf.gather(inflation_config['base_inflation'], t_idx, axis=1)  # [B, 1]
             vol_sensitivity_t = tf.gather(inflation_config['vol_sensitivity'], t_idx, axis=1)  # [B, 1]
@@ -1575,35 +1575,35 @@ class LSTMIMMUKF(tf.Module):
             asymmetry_factor_t = tf.gather(inflation_config['asymmetry_factor'], t_idx, axis=1)  # [B, 1]
             memory_decay_t = tf.gather(inflation_config['memory_decay'], t_idx, axis=1)  # [B, 1]
             inflation_limit_t = tf.gather(inflation_config['inflation_limit'], t_idx, axis=1)  # [B, 1]
-            
+
             # --- Извлечение параметров из student_t_config ---
             dof_base_t = tf.gather(student_t_config['dof_base'], t_idx, axis=1)  # [B, 1]
             dof_sensitivity_t = tf.gather(student_t_config['dof_sensitivity'], t_idx, axis=1)  # [B, 1]
             asymmetry_pos_t = tf.gather(student_t_config['asymmetry_pos'], t_idx, axis=1)  # [B, 1]
             asymmetry_neg_t = tf.gather(student_t_config['asymmetry_neg'], t_idx, axis=1)  # [B, 1]
-            
+
             # ════════════════════════════════════════════════════════════════
             # ЭТАП 2: ВЫЧИСЛЕНИЕ RAW VOLATILITY
             # ════════════════════════════════════════════════════════════════
-            
+
             vol_short_idx = self.feature_to_idx.get('log_vol_short', 2)
             rel_vol_short_long_idx = self.feature_to_idx.get('rel_vol_short_long', 18)
             vol_accel_idx = self.feature_to_idx.get('vol_accel_rel', 19)
             rel_entropy_idx = self.feature_to_idx.get('rel_entropy', 20)
-            
+
             rel_vol_short_long = tf.gather(current_features, rel_vol_short_long_idx, axis=1)  # [B]
             vol_accel = tf.gather(current_features, vol_accel_idx, axis=1)  # [B]
             rel_entropy = tf.gather(current_features, rel_entropy_idx, axis=1)  # [B]
             vol_medium_est = tf.abs(tf.gather(current_features, self.feature_to_idx.get('yz', 8), axis=1))  # [B]
             vol_long_est = tf.abs(tf.gather(current_features, self.feature_to_idx.get('ht', 12), axis=1))  # [B]
-            
+
             # ✅ ИСПРАВЛЕНО: распаковка [B, 1] → [B] перед умножением
             sensitivity_short = tf.squeeze(sensitivity_short_t, axis=-1)  # [B]
             sensitivity_medium = tf.squeeze(sensitivity_medium_t, axis=-1)  # [B]
             sensitivity_long = tf.squeeze(sensitivity_long_t, axis=-1)  # [B]
             entropy_weight = tf.squeeze(entropy_weight_t, axis=-1)  # [B]
             accel_weight = tf.squeeze(accel_weight_t, axis=-1)  # [B]
-            
+
             # Формирование компонентов волатильности - [B] * [B] = [B] ✅
             vol_components = tf.stack([
                 sensitivity_short * rel_vol_short_long,
@@ -1613,30 +1613,30 @@ class LSTMIMMUKF(tf.Module):
                 accel_weight * tf.abs(vol_accel)
             ], axis=1)  # [B, 5]
             raw_volatility = tf.reduce_mean(vol_components, axis=1)  # [B]
-            
+
             # ════════════════════════════════════════════════════════════════
             # ЭТАП 3: ЭКСПОНЕНЦИАЛЬНОЕ СГЛАЖИВАНИЕ ВОЛАТИЛЬНОСТИ
             # ════════════════════════════════════════════════════════════════
-            
+
             memory_factor_val = tf.squeeze(memory_factor_t, axis=-1)  # [B, 1] → [B]
             new_volatility = memory_factor_val * vol + (1.0 - memory_factor_val) * raw_volatility  # [B]
             new_volatility = tf.ensure_shape(new_volatility, [None])
             volatility_level = tf.nn.sigmoid(new_volatility)  # [0, 1]
-            
+
             # ════════════════════════════════════════════════════════════════
             # ЭТАП 4: ПОЛУЧЕНИЕ ПРЕДЫДУЩЕЙ ИННОВАЦИИ
             # ════════════════════════════════════════════════════════════════
-            
+
             innov_prev = tf.cond(
                 t > 0,
                 lambda: tf.ensure_shape(i_hist.read(t - 1), [None]),  # [B]
                 lambda: tf.zeros([B_batch], dtype=tf.float32)  # [B]
             )
-            
+
             # ════════════════════════════════════════════════════════════════
             # ЭТАП 5: ВЫЧИСЛЕНИЕ АДАПТИВНЫХ Q И R
             # ════════════════════════════════════════════════════════════════
-            
+
             Q_t, R_t, vol_adaptive = self.compute_adaptive_Q_R_with_leverage(
                 innov_prev,  # [B]
                 leverage_strength_t,  # [B, 1]
@@ -1644,48 +1644,48 @@ class LSTMIMMUKF(tf.Module):
                 r_base_t, r_sensitivity_t, r_floor_t,
                 tf.reshape(new_volatility, [B_batch, 1])  # [B] → [B, 1]
             )  # → Q_t: [B, 1, 1], R_t: [B, 1, 1]
-            
+
             # ════════════════════════════════════════════════════════════════
             # ЭТАП 6: АДАПТИВНЫЕ ПАРАМЕТРЫ UKF
             # ════════════════════════════════════════════════════════════════
-            
+
             # ✅ ИСПРАВЛЕНО: явное преобразование [B, 1] → [B]
             relax_base_val = tf.squeeze(relax_base_t, axis=-1)  # [B]
             alpha_base_val = tf.squeeze(alpha_base_t, axis=-1)  # [B]
             kappa_base_val = tf.squeeze(kappa_base_t, axis=-1)  # [B]
-            
+
             relax_sensitivity_val = tf.squeeze(relax_sensitivity_t, axis=-1)  # [B]
             alpha_sensitivity_val = tf.squeeze(alpha_sensitivity_t, axis=-1)  # [B]
             kappa_sensitivity_val = tf.squeeze(kappa_sensitivity_t, axis=-1)  # [B]
-            
+
             relax_factor = relax_base_val * (1.0 + relax_sensitivity_val * volatility_level)  # [B]
             alpha_t = alpha_base_val * (1.0 + alpha_sensitivity_val * volatility_level)  # [B]
             kappa_t = kappa_base_val * (1.0 + kappa_sensitivity_val * volatility_level)  # [B]
-            
+
             # ════════════════════════════════════════════════════════════════
             # ЭТАП 7: СИММЕТРИЧНОЕ ПРИМЕНЕНИЕ ИНФЛЯЦИИ К Q И R
             # ════════════════════════════════════════════════════════════════
-            
+
             # === СИММЕТРИЧНОЕ ПРИМЕНЕНИЕ ИНФЛЯЦИИ К R ===
             inflation_limit_val = tf.squeeze(inflation_limit_t, axis=-1)  # [B]
             inflation_factor_for_R = tf.reshape(inf_factor, [B_batch, 1, 1])  # [B] → [B, 1, 1]
             inflation_limit_val_reshape = tf.reshape(inflation_limit_val, [B_batch, 1, 1])  # [B] → [B, 1, 1]
             R_inflated = R_t * inflation_factor_for_R
             R_inflated = tf.clip_by_value(R_inflated, 1e-8, inflation_limit_val_reshape)  # [B, 1, 1]
-            
+
             # === СИММЕТРИЧНОЕ ПРИМЕНЕНИЕ ИНФЛЯЦИИ К Q ===
             # Менее агрессивное ослабление для Q (0.03 вместо 0.05)
-            time_penalty_Q = tf.exp(-0.03 * tf.cast(t, tf.float32))  
+            time_penalty_Q = tf.exp(-0.03 * tf.cast(t, tf.float32))
             inflation_factor_for_Q = inflation_factor_for_R * (0.6 + 0.4 * time_penalty_Q)
-            
+
             # Применяем инфляцию к Q с более мягкими ограничениями
             Q_inflated = Q_t * inflation_factor_for_Q  # [B, 1, 1]
             Q_inflated = tf.clip_by_value(Q_inflated, 1e-8, inflation_limit_val_reshape * 0.8)  # Ограничение 80% от максимума для R
-            
+
             # ════════════════════════════════════════════════════════════════
             # ЭТАП 8: UKF ПРЕДСКАЗАНИЕ (PREDICT)
             # ════════════════════════════════════════════════════════════════
-            
+
             x_pred, P_pred = self.diff_ukf_component.predict(
                 state,  # [B, 1]
                 Q_inflated,  # [B, 1, 1] ← ИСПРАВЛЕНО: используем инфлированный Q
@@ -1693,132 +1693,132 @@ class LSTMIMMUKF(tf.Module):
                 alpha_t=alpha_t,            # [B]
                 kappa_t=kappa_t             # [B]
             )  # → x_pred: [B, 1], P_pred: [B, 1, 1]
-            
+
             # ════════════════════════════════════════════════════════════════
             # ЭТАП 9: ГИБРИДНЫЙ ДЕТЕКТОР СКАЧКОВ
             # ════════════════════════════════════════════════════════════════
-    
+
             # Используем историю инноваций для расчета статистик
             innov_window = innov_win  # [B, innov_window_size]
-            
+
             # === 1. Вычисляем статистику инноваций за последние 20 шагов ===
             innov_mean = tf.math.reduce_mean(innov_window, axis=1)  # [B]
-            
+
             # === 2. ОПРЕДЕЛЕНИЕ detection_strength (постепенная активация детектора)
             min_warmup_steps = 10
             is_warmup_phase = tf.cast(t < min_warmup_steps, tf.float32)
             detection_strength = tf.minimum(1.0, tf.cast(t, tf.float32) / min_warmup_steps)
-            
+
             # === 3. Нормализованная инновация ===
             current_observation_scalar = tf.squeeze(current_observation)  # [B]
             state_scalar = tf.squeeze(state[:, 0])  # [B]
             current_innov = current_observation_scalar - state_scalar  # [B]
-            
+
             # ✅ УЛУЧШЕННАЯ ЗАЩИТА ОТ ДЕЛЕНИЯ НА НОЛЬ
             innov_std = tf.math.reduce_std(innov_window, axis=1)
             # Гарантируем минимальное стандартное отклонение
             min_std = tf.maximum(0.01, tf.reduce_mean(tf.abs(innov_window)) * 0.1)
             innov_std = tf.maximum(innov_std, min_std) + 1e-8  # [B]
-            
+
             max_allowed_innov = 5.0 + 3.0 * volatility_level  # Вместо фиксированного 10.0
-            
+
             # ✅ ПРАВИЛЬНЫЙ РАСЧЕТ СТАНДАРТНОГО ОТКЛОНЕНИЯ НА ОСНОВЕ P_pred И Q_inflated
             P_sqrt = tf.sqrt(tf.maximum(P_pred[:, 0, 0], 1e-8))  # [B]
             Q_sqrt = tf.sqrt(tf.maximum(Q_inflated[:, 0, 0], 1e-8))  # [B]
             std_dev_scalar = tf.sqrt(P_sqrt**2 + Q_sqrt**2)  # Комбинированное std для прогноза
-            
+
             # Ограничение для численной стабильности
             std_dev_scalar = tf.maximum(std_dev_scalar, 1e-8)
-            
+
             normalized_innov = tf.abs(current_innov) / std_dev_scalar
-            
+
             # === 4. УЛУЧШЕННЫЙ АДАПТИВНЫЙ ПОРОГ С ОГРАНИЧЕННЫМ ДИАПАЗОНОМ ===
             adaptive_threshold_val = tf.squeeze(anomaly_threshold_t, axis=-1)  # [B]
-            
+
             # Используем обучаемый confidence_base для нормализации порога
             base_confidence = tf.squeeze(self.confidence_base)  # [скаляр]
             confidence_adjusted = base_confidence * (0.85 + 0.15 * volatility_level)
             confidence_adjusted = tf.clip_by_value(confidence_adjusted, 0.75, 0.99)
-            
+
             # Адаптивный порог с учетом confidence_base
             adaptive_threshold = (3.5 - 2.0 * confidence_adjusted) * (1.0 + 0.5 * volatility_level)
             adaptive_threshold = tf.clip_by_value(adaptive_threshold, 2.3, 3.8)
-            
+
             # Нормализация инновации с использованием confidence_base
             confidence_factor = 1.0 + (1.0 - confidence_adjusted) * 2.0
             normalized_threshold = adaptive_threshold / confidence_factor
-            
+
             is_anomaly_t = normalized_innov > normalized_threshold
             is_anomaly = tf.cast(is_anomaly_t, tf.float32) * detection_strength  # [B]
-    
+
             if self.debug_mode:
                 if t < 10:  # Первые 10 шагов
                     tf.print(f"=== Step {t} ===")
-                    tf.print("adaptive_threshold min/max:", 
-                             tf.reduce_min(adaptive_threshold), "/", 
+                    tf.print("adaptive_threshold min/max:",
+                             tf.reduce_min(adaptive_threshold), "/",
                              tf.reduce_max(adaptive_threshold))
-                    tf.print("normalized_innov min/max abs:", 
+                    tf.print("normalized_innov min/max abs:",
                              tf.reduce_min(tf.abs(normalized_innov)), "/",
                              tf.reduce_max(tf.abs(normalized_innov)))
                     tf.print("sigmoid(vol):", tf.reduce_mean(volatility_level))
-                    tf.print("is_anomaly %:", 
+                    tf.print("is_anomaly %:",
                              tf.reduce_mean(tf.cast(is_anomaly, tf.float32)) * 100.0)
-    
+
             # === ДИНАМИЧЕСКАЯ КОРРЕКЦИЯ ПОРОГА НА ОСНОВЕ СТАТИСТИКИ ===
             # Обновляем буфер аномалий
             current_anomaly_rate = tf.reduce_mean(is_anomaly, axis=0)
             buffer_pos = tf.math.mod(self.buffer_index, self.anomaly_buffer_size)
             self.anomaly_buffer.scatter_nd_update([[buffer_pos]], [current_anomaly_rate])
             self.buffer_index.assign_add(1)
-            
+
             # Рассчитываем скользящее среднее по аномалиям
             effective_buffer_size = tf.minimum(self.buffer_index, self.anomaly_buffer_size)
             rolling_anomaly_mean = tf.reduce_mean(self.anomaly_buffer.value()[:effective_buffer_size])
-            
+
             # Динамический коэффициент доверия: при высоком проценте аномалий повышаем порог
             # Целевой уровень аномалий: 20%
             target_anomaly_rate = 0.20
             # Если реальный уровень выше целевого, увеличиваем порог
             confidence_factor = 1.0 + tf.maximum(0.0, rolling_anomaly_mean - target_anomaly_rate) * 3.0
-            
+
             # Корректируем порог детекции
             adaptive_threshold = adaptive_threshold * confidence_factor
-            
+
             # === 5. ПОСТЕПЕННАЯ АКТИВАЦИЯ ГИСТЕРЕЗИСА ===
             min_anomaly_interval = 7  # Минимальное количество шагов между аномалиями
             max_consecutive_anomalies = 3  # Максимальное число последовательных аномалий
-            
+
             # Рассчитываем степень заполнения буфера аномалий
             buffer_fill_ratio = tf.cast(self.buffer_index, tf.float32) / self.anomaly_buffer_size
             # Постепенная активация гистерезиса: 0.0 на старте → 1.0 при заполнении 50% буфера
             hysteresis_activation = tf.minimum(1.0, buffer_fill_ratio * 2.0)
-            
+
             # Базовые условия блокировки
             time_since_last_anomaly = t - last_anom_time  # [B]
             is_blocked = time_since_last_anomaly < min_anomaly_interval  # [B]
             is_too_many_consecutive = last_anom_time >= t - max_consecutive_anomalies  # [B]
-            
+
             # Условие блокировки при высоком проценте аномалий
             rolling_anomaly_mean = tf.reduce_mean(self.anomaly_buffer.value()[:tf.minimum(self.buffer_index, self.anomaly_buffer_size)])
             is_high_anomaly_rate = rolling_anomaly_mean > 0.35  # Блокируем при >35% аномалий
-            
+
             # Объединяем все условия блокировки
             should_block_base = tf.logical_or(
                 tf.logical_or(is_blocked, is_too_many_consecutive),
                 is_high_anomaly_rate
             )  # [B]
-            
+
             # Применяем постепенную активацию гистерезиса
             hysteresis_mask = tf.cast(hysteresis_activation > 0.5, tf.bool)  # Активируем только после 50% заполнения
             should_block_detection = tf.logical_and(should_block_base, hysteresis_mask)  # [B]
-    
+
             # ════════════════════════════════════════════════════════════════
             # ЭТАП 10: РЕЗЕРВНАЯ КОРРЕКЦИЯ ДЛЯ ПРОПУЩЕННЫХ СКАЧКОВ
             # ════════════════════════════════════════════════════════════════
-            
+
             fallback_multiplier = tf.ones([B_batch, 1], dtype=tf.float32)
             is_missed_jump_flag = tf.zeros([B_batch, 1], dtype=tf.float32)
-            
+
             if t > 0:
                 # ✅ ИСПРАВЛЕНО: читаем из s_hist (история состояний), а не из i_hist (история инноваций)
                 x_pred_prev = tf.reshape(s_hist.read(t - 1), [B_batch, 1])  # [B] → [B, 1]
@@ -1844,14 +1844,14 @@ class LSTMIMMUKF(tf.Module):
                 # ✅ БЕЗОПАСНОЕ ПРИСВАИВАНИЕ С УЧЕТОМ ФОРМЫ
                 fallback_multiplier = tf.reshape(fallback_multiplier_new, [B_batch, 1])
                 is_missed_jump_flag = tf.reshape(is_missed_jump_flag_new, [B_batch, 1])
-            
+
             # Объединяем детекцию: аномалия ИЛИ пропущенный скачок
             should_activate_combined = tf.cast(is_anomaly, tf.bool)
-    
+
             if self.debug_mode:
                 # DEBUG: Внутри adaptive_ukf_filter, после вычисления is_anomaly
                 is_missed_jump_flag = tf.zeros([B_batch, 1], dtype=tf.float32)
-        
+
                 if t < 5 and tf.reduce_sum(tf.cast(is_anomaly, tf.int32)) > 0:
                     tf.print("\n🔍 ДИАГНОСТИКА ШАГА", t)
                     tf.print("• Нормализованная инновация:", normalized_innov[:5])
@@ -1862,36 +1862,36 @@ class LSTMIMMUKF(tf.Module):
                     tf.print("• is_anomaly:", is_anomaly[:5])
                     tf.print("• is_missed_jump_flag:", tf.squeeze(is_missed_jump_flag)[:5])
                     tf.print("• should_activate_combined:", should_activate_combined[:5])
-            
+
             # ════════════════════════════════════════════════════════════════
             # ЭТАП 11: АДАПТИВНАЯ ИНФЛЯЦИЯ
             # ════════════════════════════════════════════════════════════════
-            
+
             current_inflation_factor = inf_factor  # [B]
             remaining_steps = rem_steps  # [B]
             t_scalar = tf.cast(t, tf.int32)
-            
+
             # Определение, нужно ли активировать inflation
             should_activate = tf.logical_and(
                 should_activate_combined,
                 tf.equal(remaining_steps, 0)
             )  # [B]
-            
+
             # Длительность инфляции - ✅ ИСПРАВЛЕНО: выравнивание размерностей
             min_dur_val = tf.squeeze(min_duration_float_t, axis=-1)  # [B]
             max_dur_val = tf.squeeze(max_duration_float_t, axis=-1)  # [B]
             duration_f = min_dur_val + (max_dur_val - min_dur_val) * volatility_level  # [B]
             duration = tf.cast(duration_f, tf.int32)  # [B]
-            
+
             # Если активация нужна, используем вычисленную длительность, иначе уменьшаем текущую
             duration = tf.where(should_activate, duration, remaining_steps)  # [B]
             duration = tf.ensure_shape(duration, [None])
-            
+
             # Расчет нового фактора инфляции - ✅ ИСПРАВЛЕНО: выравнивание размерностей
             base_inflation_val = tf.squeeze(base_inflation_t, axis=-1)  # [B]
             vol_sensitivity_val = tf.squeeze(vol_sensitivity_t, axis=-1)  # [B]
             base_factor = base_inflation_val * (1.0 + vol_sensitivity_val * volatility_level)  # [B]
-            
+
             # Асимметрия: увеличиваем инфляцию при падении цены
             asymmetry_factor_val = tf.squeeze(asymmetry_factor_t, axis=-1)  # [B]
             asymmetry_factor = tf.where(
@@ -1900,7 +1900,7 @@ class LSTMIMMUKF(tf.Module):
                 1.0 / (tf.maximum(asymmetry_factor_val, 1e-8) + 1e-8)  # [B]
             )  # [B]
             new_factor = base_factor * asymmetry_factor  # [B]
-            
+
             # Активация inflation с резервной коррекцией
             fallback_mult_val = tf.squeeze(fallback_multiplier, axis=-1)  # [B]
             inflation_factor = tf.where(
@@ -1908,7 +1908,7 @@ class LSTMIMMUKF(tf.Module):
                 new_factor * fallback_mult_val,  # [B]
                 current_inflation_factor  # [B]
             )  # [B]
-            
+
             # Обновление времени последней аномалии
             batch_size = tf.shape(last_anom_time)[0]
             last_anom_time_updated = tf.where(
@@ -1917,18 +1917,18 @@ class LSTMIMMUKF(tf.Module):
                 last_anom_time
             )  # [B]
             last_anom_time_updated = tf.ensure_shape(last_anom_time_updated, [None])
-            
+
             # ════════════════════════════════════════════════════════════════
             # ЭТАП 12: DYNAMIC INFLATION FLOOR
             # ════════════════════════════════════════════════════════════════
-            
+
             current_high_inflation_steps = tf.cond(
                 t > 0,
                 lambda: tf.ensure_shape(high_infl_steps.read(t - 1), [None]),  # [B]
                 lambda: tf.zeros([B_batch], dtype=tf.int32)  # [B]
             )
             current_high_inflation_steps = tf.ensure_shape(current_high_inflation_steps, [None])
-            
+
             inflation_threshold_val = inflation_limit_val * 0.8  # [B]
             inflation_factor_flat, updated_high_inflation_steps = self._apply_inflation_limits(
                 inflation_factor,  # [B]
@@ -1936,11 +1936,11 @@ class LSTMIMMUKF(tf.Module):
                 max_threshold=inflation_threshold_val,  # [B]
                 max_steps=5
             )  # → inflation_factor_flat: [B], updated_high_inflation_steps: [B]
-            
+
             # === НОВОЕ: ЖЕСТКИЕ ОГРАНИЧЕНИЯ НА ИНФЛЯЦИЮ ===
             max_inflation = tf.minimum(5.0, tf.maximum(3.0, inflation_factor_flat))  # жесткий cap на inflation
             inflation_factor_flat = max_inflation  # [B] - обновленный фактор инфляции
-            
+
             inflation_factor_flat = tf.ensure_shape(inflation_factor_flat, [None])
             updated_high_inflation_steps = tf.ensure_shape(updated_high_inflation_steps, [None])
             # Формируем правильную размерность для инфляции
@@ -1949,43 +1949,43 @@ class LSTMIMMUKF(tf.Module):
             inflation_floor = 1.0 - 0.2 * volatility_level  # Минимум снижается при высокой волатильности
             inflation_factor_limited = tf.clip_by_value(inflation_factor_flat, inflation_floor, inflation_cap)
             inflation_factor_for_R = tf.reshape(inflation_factor_limited, [B_batch, 1, 1])  # [B] → [B, 1, 1]
-            
+
             # Дополнительное ослабление: уменьшаем влияние инфляции со временем
             time_penalty = tf.exp(-0.05 * tf.cast(t, tf.float32))  # Экспоненциальное ослабление
             inflation_factor_for_R = inflation_factor_for_R * (0.5 + 0.5 * time_penalty)
             # ===== КОНЕЦ =====
-            
+
             # === НОВОЕ: МЯГКОЕ ЗАТУХАНИЕ ИНФЛЯЦИИ ===
             decay_factor = tf.pow(0.95, tf.cast(t, tf.float32)) + 0.05  # Гарантируем минимум 0.05
             inflation_factor = inflation_factor * decay_factor + 1.0 * (1 - decay_factor)
-            
+
             # ════════════════════════════════════════════════════════════════
             # ЭТАП 13: ПРИМЕНЕНИЕ ИНФЛЯЦИИ К КОВАРИАЦИИ ИЗМЕРЕНИЙ И ПРОЦЕССА
             # ════════════════════════════════════════════════════════════════
-            
+
             # === СИММЕТРИЧНОЕ ПРИМЕНЕНИЕ ИНФЛЯЦИИ К R ===
             R_inflated = R_t * inflation_factor_for_R  # [B, 1, 1]
             inflation_limit_val_reshape = tf.reshape(inflation_limit_val, [B_batch, 1, 1])  # [B] → [B, 1, 1]
             R_inflated = tf.clip_by_value(R_inflated, 1e-8, inflation_limit_val_reshape)  # [B, 1, 1]
-            
+
             # === СИММЕТРИЧНОЕ ПРИМЕНЕНИЕ ИНФЛЯЦИИ К Q ===
             inflation_factor_for_Q = tf.reshape(inflation_factor_limited, [B_batch, 1, 1])  # [B] → [B, 1, 1]
             # Менее агрессивное ослабление для Q (0.03 вместо 0.05)
-            time_penalty_Q = tf.exp(-0.03 * tf.cast(t, tf.float32))  
+            time_penalty_Q = tf.exp(-0.03 * tf.cast(t, tf.float32))
             inflation_factor_for_Q = inflation_factor_for_Q * (0.6 + 0.4 * time_penalty_Q)
-            
+
             # Применяем инфляцию к Q с более мягкими ограничениями
             Q_inflated = Q_t * inflation_factor_for_Q  # [B, 1, 1]
             Q_inflated = tf.clip_by_value(Q_inflated, 1e-8, inflation_limit_val_reshape * 0.8)  # Ограничение 80% от максимума для R
-            
+
             # ════════════════════════════════════════════════════════════════
             # ЭТАП 14: ВЫЧИСЛЕНИЕ АДАПТИВНЫХ ПАРАМЕТРОВ STUDENT-T
             # ════════════════════════════════════════════════════════════════
-            
+
             # ✅ ИСПРАВЛЕНО: выравнивание размерностей
             dof_base_val = tf.squeeze(dof_base_t, axis=-1)  # [B]
             dof_sensitivity_val = tf.squeeze(dof_sensitivity_t, axis=-1)  # [B]
-            
+
             # Адаптация DOF к текущей волатильности
             vol_mean = tf.reduce_mean(new_volatility)
             vol_std = tf.math.reduce_std(new_volatility) + 1e-6
@@ -1993,15 +1993,15 @@ class LSTMIMMUKF(tf.Module):
             dof_adaptive_val = dof_base_val - dof_sensitivity_val * tf.nn.relu(vol_normalized)  # [B]
             dof_adaptive_val = tf.clip_by_value(dof_adaptive_val, 3.0, 11.0)  # [B]
             dof_adaptive = tf.reshape(dof_adaptive_val, [B_batch, 1])  # [B] → [B, 1]
-            
+
             # Асимметричные параметры
             asymmetry_pos = asymmetry_pos_t  # [B, 1]
             asymmetry_neg = asymmetry_neg_t  # [B, 1]
-            
+
             # ════════════════════════════════════════════════════════════════
             # ЭТАП 15: UKF ОБНОВЛЕНИЕ (UPDATE) СО STUDENT-T КОРРЕКЦИЕЙ
             # ════════════════════════════════════════════════════════════════
-            
+
             x_upd, P_upd, innov, K = self._student_t_update(
                 x_pred,  # [B, 1]
                 P_pred,  # [B, 1, 1]
@@ -2012,7 +2012,7 @@ class LSTMIMMUKF(tf.Module):
                 asymmetry_pos,  # [B, 1]
                 asymmetry_neg   # [B, 1]
             )  # → x_upd: [B, 1], P_upd: [B, 1, 1], innov: [B, 1, 1]
-    
+
             # ===== АДАПТИВНОЕ ОГРАНИЧЕНИЕ НА P_pred =====
             P_diag = tf.linalg.diag_part(P_pred)  # [B]
             # Используем адаптивное ограничение в зависимости от текущей волатильности
@@ -2023,44 +2023,44 @@ class LSTMIMMUKF(tf.Module):
             max_var = tf.square(max_std)
             P_diag_clipped = tf.minimum(P_diag, max_var)
             P_pred = tf.linalg.set_diag(P_pred, P_diag_clipped)
-    
+
             # ════════════════════════════════════════════════════════════════
             # ЭТАП 16: ЗАПИСЬ В ИСТОРИЮ
             # ════════════════════════════════════════════════════════════════
-            
+
             # ✅ ЯВНОЕ УКАЗАНИЕ ФОРМ ПРИ ЗАПИСИ В TENSORARRAY
             state_scalar = tf.squeeze(x_upd, axis=-1)  # [B, 1] → [B]
             state_scalar = tf.ensure_shape(state_scalar, [None])
             innov_scalar = tf.squeeze(innov, axis=[-1, -2])  # [B, 1, 1] → [B]
             innov_scalar = tf.ensure_shape(innov_scalar, [None])
-            
+
             s_hist = s_hist.write(t, state_scalar)
             i_hist = i_hist.write(t, innov_scalar)
             v_hist = v_hist.write(t, volatility_level)
             f_hist = f_hist.write(t, inflation_factor_flat)
             high_infl_steps = high_infl_steps.write(t, updated_high_inflation_steps)
-            
+
             # ════════════════════════════════════════════════════════════════
             # ЭТАП 17: ОБНОВЛЕНИЕ ОКНА ИННОВАЦИЙ
             # ════════════════════════════════════════════════════════════════
-            
+
             # Сдвигаем окно: убираем первый элемент, добавляем новый
             new_innov_window = tf.concat(
                 [innov_win[:, 1:], tf.reshape(innov_scalar, [B_batch, 1])],
                 axis=1
             )
             new_innov_window = tf.ensure_shape(new_innov_window, [None, innov_window_size])
-            
+
             # ════════════════════════════════════════════════════════════════
             # ЭТАП 18: ВОЗВРАТ С ПРАВИЛЬНЫМИ РАЗМЕРНОСТЯМИ
             # ════════════════════════════════════════════════════════════════
-            
+
             new_state = x_upd  # [B, 1]
             new_cov = P_upd  # [B, 1, 1]
             new_vol = new_volatility  # [B]
             new_inf_factor = inflation_factor_flat  # [B]
             new_rem_steps = tf.maximum(0, duration - 1)  # [B]
-            
+
             return (
                 t + 1,  # t
                 new_state,  # state [B, 1]
@@ -2076,11 +2076,11 @@ class LSTMIMMUKF(tf.Module):
                 f_hist,  # inflation_factors_hist
                 high_infl_steps  # high_infl_steps_hist
             )
-        
+
         # ════════════════════════════════════════════════════════════════
         # ИНИЦИАЛИЗАЦИЯ ПЕРЕМЕННЫХ ЦИКЛА
         # ════════════════════════════════════════════════════════════════
-        
+
         loop_vars = [
             tf.constant(0, dtype=tf.int32),
             current_state,  # [B, 1]
@@ -2096,11 +2096,11 @@ class LSTMIMMUKF(tf.Module):
             inflation_factors_hist,
             high_infl_steps_hist
         ]
-        
+
         # ════════════════════════════════════════════════════════════════
         # ОПРЕДЕЛЕНИЕ НЕИЗМЕННЫХ ФОРМ
         # ════════════════════════════════════════════════════════════════
-        
+
         shape_invariants = [
             tf.TensorShape([]),                    # t
             tf.TensorShape([None, 1]),             # state
@@ -2116,31 +2116,31 @@ class LSTMIMMUKF(tf.Module):
             tf.TensorShape(None),                  # inflation_factors_hist
             tf.TensorShape(None),                  # high_infl_steps_hist,
         ]
-        
+
         # ════════════════════════════════════════════════════════════════
         # ИСПОЛНЕНИЕ ЦИКЛА
         # ════════════════════════════════════════════════════════════════
-        
+
         final_vars = tf.while_loop(
             cond, body, loop_vars, shape_invariants,
             maximum_iterations=T,
             parallel_iterations=1
         )
-        
+
         # ════════════════════════════════════════════════════════════════
         # РАСПАКОВКА И ФОРМАТИРОВАНИЕ РЕЗУЛЬТАТОВ
         # ════════════════════════════════════════════════════════════════
-        
+
         (_, final_state, final_covariance, final_volatility, final_innov_window,
         final_inflation_factor, final_remaining_steps, final_last_anom_time,  # исправлено имя
         s_hist, i_hist, v_hist, f_hist, high_infl_steps_hist) = final_vars
-        
+
         # Восстановление формы выходных данных
         states_out = tf.transpose(s_hist.stack(), [1, 0])  # [T, B] → [B, T]
         innovations_out = tf.transpose(i_hist.stack(), [1, 0])  # [T, B] → [B, T]
         volatility_out = tf.transpose(v_hist.stack(), [1, 0])  # [T, B] → [B, T]
         inflation_factors_out = tf.transpose(f_hist.stack(), [1, 0])  # [T, B] → [B, T]
-        
+
         result = (
             tf.expand_dims(states_out, axis=-1),  # [B, T] → [B, T, 1]
             tf.expand_dims(innovations_out, axis=-1),  # [B, T] → [B, T, 1]
@@ -2149,7 +2149,7 @@ class LSTMIMMUKF(tf.Module):
             final_state,  # [B, 1]
             final_covariance,  # [B, 1, 1]
         )
-        
+
         return result
 
     @tf.function
@@ -2158,22 +2158,22 @@ class LSTMIMMUKF(tf.Module):
         """Функция потерь с регуляризацией всех параметров для адаптивной волатильности"""
         # MSE loss
         mse_loss = tf.reduce_mean(tf.square(predictions - targets))
-        
+
         # Регуляризация плавности параметров
         smoothness_loss = 0.0
         if hasattr(self, 'last_ukf_params'):
             smoothness_loss += tf.reduce_mean(tf.square(ukf_params - self.last_ukf_params))
-        
+
         # Стабильность: штраф за экстремальные значения инфляции
         stability_penalty = tf.reduce_mean(tf.square(tf.clip_by_value(inflation_factors - 1.0, -5.0, 5.0)))
-        
+
         # Регуляризация спектральных параметров
         spectral_reg = 0.0
         if hasattr(self, 'diff_ukf_component'):
             spectrum = self.diff_ukf_component.get_spectrum_info()
             min_eig = spectrum['min_eigenvalue']
             spectral_reg += tf.reduce_mean(tf.nn.relu(1e-4 - min_eig))
-        
+
         # === КРИТИЧЕСКИ ВАЖНО: РЕГУЛЯРИЗАЦИЯ ВСЕХ ОБУЧАЕМЫХ ПАРАМЕТРОВ ===
         additional_reg = 0.0
         # Для параметров ковариации
@@ -2191,7 +2191,7 @@ class LSTMIMMUKF(tf.Module):
         # Для параметров доверительных интервалов
         additional_reg += 1e-4 * tf.square(self.confidence_base)
         additional_reg += 1e-4 * tf.square(self.confidence_vol_sensitivity)
-        
+
         # === ДОБАВЛЕНО: РЕГУЛЯРИЗАЦИЯ ПАРАМЕТРОВ VOLATILITY REGIME SELECTOR И КОВАРИАЦИИ ===
         selector_reg = 0.0
         entropy_penalty = 0.0
@@ -2203,7 +2203,7 @@ class LSTMIMMUKF(tf.Module):
             # Регуляризация для center_logits, если они обучаемые
             if self.regime_selector.learnable_centers and hasattr(self.regime_selector, 'center_logits'):
                 selector_reg += 1e-3 * tf.reduce_sum(tf.square(self.regime_selector.center_logits))
-        
+
         # === НОВОЕ: РЕГУЛЯРИЗАЦИЯ ПАРАМЕТРОВ КОВАРИАЦИИ ===
         cov_reg = 0.0
         # Базовые регуляризаторы для Q и R
@@ -2211,7 +2211,7 @@ class LSTMIMMUKF(tf.Module):
         cov_reg += 1e-3 * tf.square(self.base_r_logit - tf.math.log(0.8))
         # Регуляризация чувствительности к волатильности
         cov_reg += 1e-4 * tf.square(self.volatility_sensitivity - 0.5)
-            
+
         # === КРИТИЧЕСКИ ВАЖНО: ШТРАФ ЗА ВЫСОКУЮ ЭНТРОПИЮ ===
         # Идеальная энтропия для хорошо разделенных режимов: ~0.6-0.8
         # Текущее значение 1.093 соответствует равномерному распределению (максимальная неопределенность)
@@ -2220,36 +2220,36 @@ class LSTMIMMUKF(tf.Module):
         regime_info = self.regime_selector.assign_soft_regimes(current_vol)
         current_entropy = tf.reduce_mean(regime_info['entropy'])
         entropy_penalty = 0.5 * tf.square(current_entropy - target_entropy)
-        
+
         # Общая потеря с явным штрафом за энтропию
         total_loss = mse_loss + 0.3 * calibration_loss + 0.1 * smoothness_loss + \
         0.05 * stability_penalty + 0.01 * spectral_reg + additional_reg + selector_reg + entropy_penalty + \
         self.lambda_entropy * entropy_loss * 2.0
-        
+
         # Специальный штраф при обнаружении равномерного ра* 2.0спределения (энтропия ≈ ln(3) = 1.0986)
         is_uniform_distribution = tf.cast(tf.abs(current_entropy - tf.math.log(3.0)) < 0.05, tf.float32)
         total_loss += is_uniform_distribution * 1.0  # сильный штраф для выхода из равномерного распределения
-        
+
         # Сохранение текущих параметров для следующей итерации
         self.last_ukf_params = ukf_params
-        
+
         # Защита от NaN/Inf
         total_loss = tf.where(tf.math.is_nan(total_loss), tf.constant(1e6, dtype=tf.float32), total_loss)
         return total_loss
-    
+
     @tf.function
     def train_step(self, X_batch, y_for_filtering_batch, y_target_batch,
                   initial_state, initial_covariance):
         """
         Шаг обучения для адаптивной UKF с контекстной волатильностью
-        
+
         Args:
             X_batch: [B, T=72, n_features=20] - Технические признаки за 72 дня
             y_for_filtering_batch: [B, T=72] - Уровни для фильтрации дней 0-71
             y_target_batch: [B] - Целевой уровень на день 72 (t+1 после окна)
             initial_state: [B, state_dim=1] - Начальное состояние UKF
             initial_covariance: [B, state_dim=1, state_dim=1] - Начальная ковариация UKF
-        
+
         Returns:
             loss: скаляр - Total loss (MSE + calibration + entropy)
             metrics: dict - Словарь с метриками обучения
@@ -2259,9 +2259,9 @@ class LSTMIMMUKF(tf.Module):
             std_dev: [B] - Стандартное отклонение прогноза
             volatility_levels: [B, T, 1] - Уровни волатильности для всех шагов
             regime_info: dict - Информация о распределении по режимам волатильности
-            final_volatility: [B] - Финальный уровень волатильности 
+            final_volatility: [B] - Финальный уровень волатильности
             entropy_stats: dict - Статистика энтропии скрытых состояний LSTM
-        
+
         Физический смысл:
             - Фильтруем дни 0-71, используя y_for_filtering_batch
             - Прогнозируем день 72 (t+1)
@@ -2274,15 +2274,15 @@ class LSTMIMMUKF(tf.Module):
                 lstm_outputs = self.model(X_batch, training=True)
                 params_output = lstm_outputs['params']  # [B, T, 37]
                 h_lstm2 = lstm_outputs['h_lstm2']       # [B, T, 128]
-                
+
                 # 2. ЭНТРОПИЙНАЯ РЕГУЛЯРИЗАЦИЯ
                 entropy_loss = self.entropy_regularizer.compute_entropy_loss(h_lstm2)
-                
+
                 # 3. ОБРАБОТКА ВЫХОДОВ LSTM
                 vol_context, ukf_params, inflation_config, student_t_config = self.process_lstm_output(params_output)
                 initial_state = tf.reshape(initial_state, [B, self.state_dim])
                 initial_covariance = tf.reshape(initial_covariance, [B, self.state_dim, self.state_dim])
-                
+
                 # 4. АДАПТИВНАЯ ФИЛЬТРАЦИЯ UKF
                 results = self.adaptive_ukf_filter(
                     X_batch,
@@ -2294,7 +2294,7 @@ class LSTMIMMUKF(tf.Module):
                     initial_state,
                     initial_covariance
                 )
-                
+
                 # Распаковка результатов
                 x_filtered = results[0]        # [B, T, 1]
                 innovations = results[1]       # [B, T, 1]
@@ -2305,11 +2305,11 @@ class LSTMIMMUKF(tf.Module):
 
                 # ДОБАВЛЕНО: сбор нормализованных инноваций для анализа
                 normalized_innovations = tf.abs(innovations[:, -10:, :])  # последние 10 шагов
-                
+
                 # 5. ЯВНЫЙ PREDICT НА СЛЕДУЮЩИЙ ШАГ - ИЗВЛЕЧЕНИЕ ПАРАМЕТРОВ ПОСЛЕДНЕГО ШАГА
                 final_volatility = tf.squeeze(volatility_levels[:, -1, :])  # [B, T, 1] → [B]
                 t_last = tf.shape(ukf_params['q_base'])[1] - 1
-                
+
                 # Явное извлечение параметров последнего шага
                 q_base_final = tf.gather(ukf_params['q_base'], t_last, axis=1)  # [B, 1]
                 q_sensitivity_final = tf.gather(ukf_params['q_sensitivity'], t_last, axis=1)  # [B, 1]
@@ -2324,10 +2324,10 @@ class LSTMIMMUKF(tf.Module):
                 kappa_base_final = tf.gather(ukf_params['kappa_base'], t_last, axis=1)  # [B, 1]
                 kappa_sensitivity_final = tf.gather(ukf_params['kappa_sensitivity'], t_last, axis=1)  # [B, 1]
                 inf_factor_final = tf.gather(inflation_factors[:, -1, :], t_last, axis=1)
-                
+
                 # === КРИТИЧЕСКИ ВАЖНО: ВЫЧИСЛИТЬ regime_info СРАЗУ ПОСЛЕ ПОЛУЧЕНИЯ final_volatility ===
                 regime_info = self.regime_selector.assign_soft_regimes(final_volatility)
-                
+
                 forecast, std_dev = self._explicit_predict_next_step(
                     final_state,
                     final_covariance,
@@ -2338,12 +2338,12 @@ class LSTMIMMUKF(tf.Module):
                     alpha_base_final, alpha_sensitivity_final,
                     kappa_base_final, kappa_sensitivity_final
                 )
-        
+
                 # 6. РАСЧЕТ CALIBRATION LOSS С АСИММЕТРИЧНЫМИ ГРАНИЦАМИ
                 # Снижаем целевое покрытие для более практичных интервалов
                 base_confidence = 0.88  # Снизить с 0.90 для более узких интервалов
                 confidence_range = 0.15  # Диапазон изменения (0.92-0.75)
-                
+
                 # Целевое покрытие зависит от уровня волатильности
                 confidence_ceil = tf.fill(tf.shape(final_volatility), base_confidence + confidence_range/2)  # 0.92
                 confidence_floor = tf.fill(tf.shape(final_volatility), base_confidence - confidence_range/2)  # 0.75
@@ -2362,7 +2362,7 @@ class LSTMIMMUKF(tf.Module):
                     'tail_weight_neg': tf.fill(batch_shape, 1.0),
                     'confidence_base': tf.fill(batch_shape, 0.85),
                 }
-        
+
                 # Настройка параметров Student-t для асимметричной калибровки - ✅ КОРРЕКТНЫЕ РАЗМЕРНОСТИ [B, 1]
                 batch_shape = tf.shape(final_volatility)
                 tail_weight_pos = tf.fill(batch_shape, 0.8)[:, tf.newaxis]  # [B] -> [B, 1]
@@ -2371,18 +2371,18 @@ class LSTMIMMUKF(tf.Module):
                 student_t_config_final['tail_weight_neg'] = tail_weight_neg
                 student_t_config_final['asymmetry_pos'] = tf.fill(batch_shape, 0.7)[:, tf.newaxis]  # [B] -> [B, 1]
                 student_t_config_final['asymmetry_neg'] = tf.fill(batch_shape, 1.3)[:, tf.newaxis]  # [B] -> [B, 1]
-                
+
                 # Адаптивные АСИММЕТРИЧНЫЕ границы доверительного интервала
-                ci_lower, ci_upper, target_coverage = self._calibrate_confidence_interval_fixed(
+                ci_lower, ci_upper, target_coverage = self._calibrate_confidence_interval(
                     forecast, std_dev, final_volatility, student_t_config_final,
                     innovations=innovations[:, -10:, :] if innovations is not None else None,
                     regime_assignment=regime_info['regime_assignment']
                 )
-                
+
                 # Проверка валидности границ (защита от аномалий)
                 ci_min = tf.minimum(ci_lower, ci_upper)
                 ci_max = tf.maximum(ci_lower, ci_upper)
-                
+
                 # Вычисление покрытия
                 covered = tf.cast(
                     (y_target_batch >= ci_min) & (y_target_batch <= ci_max),
@@ -2393,20 +2393,20 @@ class LSTMIMMUKF(tf.Module):
 
                 # Базовая калибровочная потеря
                 calibration_loss = tf.square(actual_coverage - target_coverage_mean)
-                
+
                 # ===== КРИТИЧЕСКИ ВАЖНО: УСИЛЕННЫЙ ШТРАФ ЗА ШИРОКИЕ ИНТЕРВАЛЫ =====
                 ci_width = ci_max - ci_min
                 avg_stddev = tf.reduce_mean(std_dev)
                 width_ratio = tf.reduce_mean(ci_width / (avg_stddev + 1e-8))
                 # Если интервалы слишком широкие (>1.5x stddev в среднем) - СИЛЬНЫЙ штраф
                 width_penalty = tf.cond(
-                width_ratio > 1.5,  # БЫЛО 1.8, СТАЛО 1.5 (более строгий порог)
-                lambda: 5.0 * tf.square(width_ratio - 1.5),  # БЫЛО 2.0, СТАЛО 5.0 (мощный штраф)
-                lambda: 0.0
+                    width_ratio > 2.0,  # Повысить порог
+                    lambda: 0.5 * tf.square(width_ratio - 2.0),  # Снизить коэффициент
+                    lambda: 0.0
                 )
                 calibration_loss = calibration_loss + width_penalty
                 # ===== КОНЕЦ =====
-                
+
                 # 7. РАСЧЕТ ПОТЕРИ
                 loss = self.compute_loss(
                     forecast,
@@ -2417,14 +2417,14 @@ class LSTMIMMUKF(tf.Module):
                     calibration_loss,
                     entropy_loss
                 )
-                
+
                 # 8. СБОР ВСЕХ ОБУЧАЕМЫХ ПЕРЕМЕННЫХ
                 trainable_vars = []
                 if self.model is not None:
                     trainable_vars.extend(self.model.trainable_variables)
                 if self.use_diff_ukf and hasattr(self, 'diff_ukf_component'):
                     trainable_vars.extend(self.diff_ukf_component.trainable_variables)
-                
+
                 additional_vars = [
                     self.base_q_logit, self.base_r_logit,
                     self.volatility_sensitivity,
@@ -2436,7 +2436,7 @@ class LSTMIMMUKF(tf.Module):
                 for var in additional_vars:
                     if var is not None and isinstance(var, tf.Variable):
                         trainable_vars.append(var)
-        
+
                 if hasattr(self, 'regime_selector') and self.regime_selector is not None:
                     trainable_vars.extend([
                         self.regime_selector.regime_scales,
@@ -2444,20 +2444,20 @@ class LSTMIMMUKF(tf.Module):
                     ])
                     if self.regime_selector.learnable_centers and hasattr(self.regime_selector, 'center_logits'):
                         trainable_vars.append(self.regime_selector.center_logits)
-        
+
                 # 9. ВЫЧИСЛЕНИЕ И ПРИМЕНЕНИЕ ГРАДИЕНТОВ
                 gradients = tape.gradient(loss, trainable_vars)
                 clipped_grads, global_norm = tf.clip_by_global_norm(gradients, 1.0)
                 self._optimizer.apply_gradients(zip(clipped_grads, trainable_vars))
-                
+
                 # 10. РАСЧЕТ МЕТРИК
                 mse_loss = tf.reduce_mean(tf.square(forecast - y_target_batch))
                 avg_volatility = tf.reduce_mean(final_volatility)
-                
+
                 # ✅ regime_info уже вычислена выше, используем ее для сбора метрик
                 regime_soft_weights = tf.reduce_mean(regime_info['soft_weights'], axis=0)  # [3]
                 regime_entropy = tf.reduce_mean(regime_info['entropy'])  # скаляр
-                
+
                 # Сбор Q/R ratio статистики
                 q_current = tf.reduce_mean(q_base_final)
                 r_current = tf.reduce_mean(r_base_final)
@@ -2466,21 +2466,21 @@ class LSTMIMMUKF(tf.Module):
 
                 # Сбор статистики по адаптивному inflation
                 avg_inflation = tf.reduce_mean(inflation_factors[:, -1, :])
-                
+
                 dynamic_threshold, inflation_anomaly_ratio = compute_adaptive_threshold(
                     inflation_factors,          # [B, T, 1] ✓
                     final_volatility,           # [B] ✓ (это то, что нужно)
                     self.threshold_ema,         # tf.Variable ✓
-                    target_anomaly_ratio=0.35   # баланс между нормальными и аномальными состояниями 
+                    target_anomaly_ratio=0.35   # баланс между нормальными и аномальными состояниями
                 )
                 if self.debug_mode:
                     tf.print("Dynamic threshold:", dynamic_threshold)
                     tf.print("Inflation anomaly ratio:", inflation_anomaly_ratio)
-                
+
                 # Сбор статистики по спектральным параметрам UKF
                 spectrum_info = self.diff_ukf_component.get_spectrum_info()
                 min_eigenvalue = spectrum_info['min_eigenvalue']
-                
+
                 # Сборка метрик
                 metrics = {
                     'total_loss': loss,
@@ -2504,13 +2504,13 @@ class LSTMIMMUKF(tf.Module):
                     'ci_width_vs_stddev': width_ratio,
                     'calibration_error': tf.abs(actual_coverage - target_coverage_mean),
                 }
-        
+
                 # 11. ДОПОЛНИТЕЛЬНАЯ ИНФОРМАЦИЯ ОБ ЭНТРОПИИ ДЛЯ ЛОГИРОВАНИЯ
                 entropy_stats = self.entropy_regularizer.get_entropy_stats(h_lstm2)
-                
+
                 # 12. ОБНОВЛЕНИЕ ИСТОРИИ ВОЛАТИЛЬНОСТИ (только после сбора всех метрик)
                 self.regime_selector.update_history(final_volatility)
-                
+
                 # 13. АДАПТАЦИЯ ПАРАМЕТРОВ РЕЖИМОВ ПРИ ВЫСОКОЙ ЭНТРОПИИ
                 entropy_val = tf.reduce_mean(regime_info['entropy'])
                 if entropy_val > 1.05:
@@ -2518,7 +2518,7 @@ class LSTMIMMUKF(tf.Module):
                     self.regime_selector.temperature.assign(new_temp)
                     regime_info = self.regime_selector.assign_soft_regimes(final_volatility)
                     entropy_val = tf.reduce_mean(regime_info['entropy'])
-                
+
                 # ВЕРНЁМ РЕЗУЛЬТАТЫ
                 return loss, metrics, final_state, final_covariance, forecast, std_dev, \
                        volatility_levels, regime_info, final_volatility, entropy_stats, normalized_innovations
@@ -2530,10 +2530,10 @@ class LSTMIMMUKF(tf.Module):
                                    alpha_base_final, alpha_sensitivity_final,
                                    kappa_base_final, kappa_sensitivity_final):
         """Предсказание следующего шага с симметричным применением инфляции"""
-        
+
         batch_size = tf.shape(final_state)[0]
         current_vol_scalar = tf.reshape(tf.squeeze(current_volatility), [batch_size])
-        
+
         # Преобразование параметров в [B]
         q_base_final = tf.squeeze(q_base_final)
         q_sensitivity_final = tf.squeeze(q_sensitivity_final)
@@ -2545,19 +2545,19 @@ class LSTMIMMUKF(tf.Module):
         kappa_base_final = tf.squeeze(kappa_base_final)
         kappa_sensitivity_final = tf.squeeze(kappa_sensitivity_final)
         inf_factor = tf.squeeze(inf_factor)  # [B]
-        
+
         # Вычисление Q с инфляцией
         q_val = q_base_final * (1.0 + q_sensitivity_final * current_vol_scalar)  # [B]
         q_val = tf.maximum(q_val, q_floor_final)  # [B]
         inflation_factor_for_Q = tf.reshape(inf_factor, [batch_size, 1, 1])  # [B, 1, 1]
         Q_t = tf.reshape(q_val, [batch_size, 1, 1]) * inflation_factor_for_Q  # ← ПРИМЕНЕНИЕ ИНФЛЯЦИИ
         Q_t = tf.clip_by_value(Q_t, 1e-8, 5.0)  # жесткие ограничения
-        
+
         # Параметры адаптации UKF
         relax_factor = relax_base_final * (1.0 + relax_sensitivity_final * current_vol_scalar)
         alpha_t = alpha_base_final * (1.0 + alpha_sensitivity_final * current_vol_scalar)
         kappa_t = kappa_base_final * (1.0 + kappa_sensitivity_final * current_vol_scalar)
-        
+
         # PREDICT шаг
         x_pred, P_pred = self.diff_ukf_component.predict(
             final_state,
@@ -2566,202 +2566,21 @@ class LSTMIMMUKF(tf.Module):
             alpha_t=alpha_t,
             kappa_t=kappa_t
         )
-        
+
         # Прогнозируемая дисперсия
         forecast_var = P_pred[:, 0, 0] + Q_t[:, 0, 0]
         std_dev = tf.sqrt(tf.maximum(forecast_var, 1e-8))
-        
+
         forecast_value = tf.squeeze(x_pred, axis=-1)
         std_dev_value = tf.squeeze(std_dev)
-        
+
         return forecast_value, std_dev_value
 
-    @tf.function
-    def _calibrate_confidence_interval(self, forecast, stddev, volatility_level, student_t_config, innovations=None, regime_assignment=None):
-        """
-        Калибрирует асимметричные доверительные интервалы с адаптацией к текущей волатильности.
-        
-        ИСПРАВЛЕННАЯ версия с корректными ограничениями на ширину ДИ.
-        
-        Args:
-            forecast: [B] предсказанное значение
-            stddev: [B] стандартное отклонение предсказания
-            volatility_level: [B] текущий уровень волатильности (нормализованный)
-            student_t_config: dict с параметрами Student-t распределения
-            innovations: [B, window_size, 1] опционально, инновации для анализа асимметрии
-        
-        Returns:
-            ci_lower: [B] нижняя граница ДИ
-            ci_upper: [B] верхняя граница ДИ
-            target_coverage: [B] целевое покрытие для каждого элемента батча
-        """
-        batch_size = tf.shape(forecast)[0]
-        
-        # ===== 1. НОРМАЛИЗАЦИЯ ВХОДНЫХ ДАННЫХ =====
-        forecast = tf.squeeze(forecast)  # [B]
-        stddev = tf.squeeze(stddev)  # [B]
-        volatility_level = tf.squeeze(volatility_level)  # [B]
-        
-        # Гарантируем положительность stddev
-        stddev = tf.maximum(stddev, 1e-8)
-        
-        # ===== 2. БАЗОВЫЙ УРОВЕНЬ ДОВЕРИЯ (ЖЕСТКИЕ ГРАНИЦЫ) =====
-        # ===== АДАПТИВНЫЙ ЦЕЛЕВОЙ ДИАПАЗОН ПОКРЫТИЯ =====
-        base_confidence_ceil = 0.95  # Расширяем максимум до 95% покрытия
-        base_confidence_floor = 0.75  # Поднимаем минимум до 75% покрытия
-        # Адаптивное изменение в зависимости от волатильности
-        confidence_range = 0.20  # Расширяем диапазон покрытия до 0.75-0.95
-        # Используем более агрессивную адаптацию в HIGH режиме
-        vol_adjustment = 0.15 * volatility_level  # Увеличиваем максимальную корректировку до 15%
-        target_coverage = base_confidence_ceil - confidence_range + vol_adjustment
-        target_coverage = tf.clip_by_value(target_coverage, base_confidence_floor, base_confidence_ceil)  # [B]
-        
-        # ===== 3. БЕЗОПАСНОЕ ИЗВЛЕЧЕНИЕ ПАРАМЕТРОВ Student-t =====
-        def safe_get_param(param_dict, key, default_value=0.5):
-            """Безопасное извлечение параметра из словаря"""
-            if key not in param_dict or param_dict[key] is None:
-                return tf.ones([batch_size], dtype=tf.float32) * default_value
-            param = param_dict[key]
-            return tf.squeeze(param)
-        
-        dof_base = safe_get_param(student_t_config, 'dof_base', 6.0)  # [B]
-        dof_sensitivity = safe_get_param(student_t_config, 'dof_sensitivity', 0.5)
-        tail_weight_pos = safe_get_param(student_t_config, 'tail_weight_pos', 0.8)
-        tail_weight_neg = safe_get_param(student_t_config, 'tail_weight_neg', 1.2)
-        regime_scale = safe_get_param(student_t_config, 'regime_scale', 1.0)
-        
-        # ===== 4. АДАПТИВНОЕ ВЫЧИСЛЕНИЕ СТЕПЕНЕЙ СВОБОДЫ =====
-        dof_adjusted = dof_base + 2.0 * (1.0 - volatility_level) * dof_sensitivity
-        dof_adjusted = tf.clip_by_value(dof_adjusted, 2.0, 15.0)  # [B]
-        
-        # ===== 5. ВЫЧИСЛЕНИЕ Z-КВАНТИЛЕЙ ДЛЯ t-РАСПРЕДЕЛЕНИЯ =====
-        # Используем аппроксимацию: t_α ≈ sqrt((df-1)/(df*(1-α)^2 - 1))
-        
-        # Нижний квантиль (для нижней границы)
-        prob_lower = (1.0 - target_coverage) / 2.0  # [B]
-        prob_lower = tf.maximum(prob_lower, 0.001)  # Избегаем деления на ноль
-        
-        denominator_lower = dof_adjusted * (prob_lower ** 2) - 1.0
-        denominator_lower = tf.maximum(denominator_lower, 0.1)  # Численная стабильность
-        
-        z_lower_raw = -tf.sqrt((dof_adjusted - 1.0) / denominator_lower)
-        z_lower = tf.clip_by_value(z_lower_raw, -2.5, -0.5)  # ОГРАНИЧИВАЕМ [-5.0, -0.5]
-        
-        # Верхний квантиль (для верхней границы)
-        prob_upper = (1.0 - target_coverage) / 2.0  # [B]
-        prob_upper = tf.maximum(prob_upper, 0.001)
-        
-        denominator_upper = dof_adjusted * (prob_upper ** 2) - 1.0
-        denominator_upper = tf.maximum(denominator_upper, 0.1)
-        
-        z_upper_raw = tf.sqrt((dof_adjusted - 1.0) / denominator_upper)
-        z_upper = tf.clip_by_value(z_upper_raw, 0.5, 2.5)  # ОГРАНИЧИВАЕМ [0.5, 5.0]
-        
-        # ===== 6. АНАЛИЗ АСИММЕТРИИ ИННОВАЦИЙ (если доступны) =====
-        center_shift = tf.zeros([batch_size], dtype=tf.float32)  # [B]
-        
-        if innovations is not None:
-            innovations_processed = tf.squeeze(innovations, axis=-1)  # [B, window_size]
-            actual_batch_size = tf.shape(innovations_processed)[0]
-            
-            # Проверка размера батча
-            if actual_batch_size == batch_size:
-                pos_mask = tf.cast(innovations_processed > 0, tf.float32)
-                neg_mask = tf.cast(innovations_processed <= 0, tf.float32)
-                
-                abs_innov = tf.abs(innovations_processed)
-                
-                pos_sum = tf.reduce_sum(pos_mask * abs_innov, axis=1)
-                pos_count = tf.reduce_sum(pos_mask, axis=1)
-                pos_magnitude = pos_sum / tf.maximum(pos_count, 1.0)
-                
-                neg_sum = tf.reduce_sum(neg_mask * abs_innov, axis=1)
-                neg_count = tf.reduce_sum(neg_mask, axis=1)
-                neg_magnitude = neg_sum / tf.maximum(neg_count, 1.0)
-                
-                # Center shift = смещение центра прогноза на основе асимметрии
-                # ОГРАНИЧИВАЕМ до ±0.5*stddev
-                center_shift = tf.clip_by_value(
-                    stddev * (pos_magnitude - neg_magnitude) / (pos_magnitude + neg_magnitude + 1e-8),
-                    -0.5 * stddev,
-                    0.5 * stddev
-                )  # [B]
-        
-        # ===== 7. ВЫЧИСЛЕНИЕ МАРЖ С АДАПТИВНЫМИ ГРАНИЦАМИ =====
-        # Расширяем допустимый диапазон для z-квантилей (для t-распределения)
-        z_lower = z_lower_raw  # Удаляем жесткое ограничение для более точных квантилей
-        z_upper = z_upper_raw  # Удаляем жесткое ограничение для более точных квантилей
-        
-        # Адаптивные границы для ширины ДИ в зависимости от режима волатильности
-        regime_scale_factor = tf.maximum(1.5, regime_scale)  # Режимный масштаб из VolatilityRegimeSelector
-        max_width_factor = 2.5 + 1.0 * regime_scale_factor  # Базовый максимум 2.5 с адаптацией под режим волатильности
-        margin_lower = stddev * tf.clip_by_value(
-            tf.abs(z_lower) * tail_weight_neg * regime_scale,
-            0.1,  # Минимум
-            max_width_factor   # АДАПТИВНЫЙ МАКСИМУМ с учетом режима волатильности
-        )  # [B]
-        margin_upper = stddev * tf.clip_by_value(
-            tf.abs(z_upper) * tail_weight_pos * regime_scale,
-            0.1,  # Минимум
-            max_width_factor   # АДАПТИВНЫЙ МАКСИМУМ с учетом режима волатильности
-        )  # [B]
-
-        # ===== ЯВНАЯ КАЛИБРОВКА ПОКРЫТИЯ =====
-        # Вычисляем текущее покрытие на обучающих данных
-        if hasattr(self, 'coverage_history') and hasattr(self.coverage_history, '__len__') and len(self.coverage_history) >= 100:
-            # Берем последние 100 значений покрытия
-            recent_coverage = self.coverage_history[-100:]
-            current_coverage = tf.reduce_mean(tf.stack(recent_coverage))
-            # Вычисляем целевое покрытие как среднее по батчу
-            target_coverage_mean = tf.reduce_mean(target_coverage)
-            # Корректируем ширину интервалов для достижения целевого покрытия
-            coverage_ratio = target_coverage_mean / (current_coverage + 1e-8)
-            coverage_ratio = tf.clip_by_value(coverage_ratio, 0.8, 1.25)  # Ограничиваем корректировку
-            # Применяем корректировку к обеим границам
-            margin_lower = margin_lower * coverage_ratio
-            margin_upper = margin_upper * coverage_ratio
-        
-        # ===== 8. ВЫЧИСЛЕНИЕ ГРАНИЦ =====
-        ci_lower = forecast - margin_lower + center_shift  # [B]
-        ci_upper = forecast + margin_upper + center_shift  # [B]
-        
-        # ===== 9. ПРОВЕРКА И КОРРЕКЦИЯ ВАЛИДНОСТИ =====
-        ci_min = tf.minimum(ci_lower, ci_upper)
-        ci_max = tf.maximum(ci_lower, ci_upper)
-        
-        # ===== АДАПТИВНЫЙ ЛИМИТ НА ШИРИНУ ИНТЕРВАЛОВ С ЗАВИСИМОСТЬЮ ОТ РЕЖИМА ВОЛАТИЛЬНОСТИ =====
-        # Максимальная ширина зависит от режима волатильности
-        regime_scale_factor = tf.maximum(1.5, regime_scale)  # Режимный масштаб из VolatilityRegimeSelector
-        max_allowed_width = 3.0 * stddev * regime_scale_factor  # Базовый максимум 3.0× с адаптацией
-        current_width = ci_max - ci_min  # [B]
-        # Корректируем слишком широкие интервалы только в режиме LOW волатильности
-        needs_narrowing = tf.logical_and(
-            current_width > max_allowed_width,
-            volatility_level < 0.4  # Не сужаем интервалы в режимах MID/HIGH (волатильность > 0.4)
-        )
-        # ===== КОНЕЦ АДАПТИВНОГО ЛИМИТА =====
-        
-        # АДАПТИВНАЯ КОРРЕКЦИЯ ДЛЯ ГАРАНТИИ ВАЛИДНОСТИ ИНТЕРВАЛОВ
-        # Берем текущий уровень волатильности для адаптации
-        current_volatility_level = tf.squeeze(volatility_level)
-        
-        # Адаптивная ширина расширения в зависимости от волатильности
-        expansion_factor = 1.0 + 0.5 * current_volatility_level  # Больше расширение при высокой волатильности
-        needs_expansion = tf.logical_or(
-            forecast < ci_min,
-            forecast > ci_max
-        )
-        ci_min = tf.where(needs_expansion, forecast - stddev * 1.5 * expansion_factor, ci_min)
-        ci_max = tf.where(needs_expansion, forecast + stddev * 1.5 * expansion_factor, ci_max)
-
-        
-        return ci_min, ci_max, target_coverage
-
-    def _calibrate_confidence_interval_fixed(self, forecast, stddev, volatility_level, student_t_config, innovations=None, regime_assignment=None, true_values=None):
+    def _calibrate_confidence_interval(self, forecast, stddev, volatility_level, student_t_config, innovations=None, regime_assignment=None, true_values=None):
         """
         Калибрирует асимметричные доверительные интервалы с адаптацией к текущей волатильности.
         ИСПРАВЛЕННАЯ версия с учетом широкого диапазона значений и высокой волатильности.
-        
+
         Args:
             forecast: [B] предсказанное значение
             stddev: [B] стандартное отклонение предсказания
@@ -2769,22 +2588,22 @@ class LSTMIMMUKF(tf.Module):
             student_t_config: dict с параметрами Student-t распределения
             innovations: [B, window_size, 1] опционально, инновации для анализа асимметрии
             true_values: [B] опционально, истинные значения для дополнительной адаптации
-        
+
         Returns:
             ci_lower: [B] нижняя граница ДИ
             ci_upper: [B] верхняя граница ДИ
             target_coverage: [B] целевое покрытие для каждого элемента батча
         """
         batch_size = tf.shape(forecast)[0]
-        
+
         # ===== 1. НОРМАЛИЗАЦИЯ ВХОДНЫХ ДАННЫХ =====
         forecast = tf.squeeze(forecast)  # [B]
         stddev = tf.squeeze(stddev)  # [B]
         volatility_level = tf.squeeze(volatility_level)  # [B]
-        
+
         # Гарантируем положительность stddev
         stddev = tf.maximum(stddev, 1e-8)
-        
+
         # ===== 2. АДАПТИРОВАННЫЙ ПОД ШИРОКИЙ ДИАПАЗОН УРОВЕНЬ ДОВЕРИЯ =====
         base_confidence_ceil = 0.92  # Снижаем целевое покрытие из-за высокой волатильности
         base_confidence_floor = 0.75  # Уменьшаем минимум для более широких интервалов
@@ -2794,7 +2613,7 @@ class LSTMIMMUKF(tf.Module):
         vol_adjustment = 0.10 * volatility_level  # Увеличиваем максимальную корректировку до 10%
         target_coverage = base_confidence_ceil - confidence_range + vol_adjustment
         target_coverage = tf.clip_by_value(target_coverage, base_confidence_floor, base_confidence_ceil)  # [B]
-        
+
         # ===== 3. БЕЗОПАСНОЕ ИЗВЛЕЧЕНИЕ ПАРАМЕТРОВ Student-t =====
         def safe_get_param(param_dict, key, default_value=0.5):
             """Безопасное извлечение параметра из словаря"""
@@ -2802,64 +2621,64 @@ class LSTMIMMUKF(tf.Module):
                 return tf.ones([batch_size], dtype=tf.float32) * default_value
             param = param_dict[key]
             return tf.squeeze(param)
-        
+
         # Используем параметры с толстыми хвостами для сигналов с широким диапазоном
         dof_base = safe_get_param(student_t_config, 'dof_base', 2.5)  # Меньше степеней свободы для толстых хвостов
         dof_sensitivity = safe_get_param(student_t_config, 'dof_sensitivity', 0.5)
         tail_weight_pos = safe_get_param(student_t_config, 'tail_weight_pos', 0.4)  # Меньше вес для позитивных хвостов
         tail_weight_neg = safe_get_param(student_t_config, 'tail_weight_neg', 2.0)  # Больше вес для негативных хвостов
         regime_scale = safe_get_param(student_t_config, 'regime_scale', 1.0)
-        
+
         # ===== 4. АДАПТИВНОЕ ВЫЧИСЛЕНИЕ СТЕПЕНЕЙ СВОБОДЫ =====
         # Уменьшаем степени свободы для толстых хвостов
         dof_adjusted = dof_base + 1.0 * (1.0 - volatility_level) * dof_sensitivity
         dof_adjusted = tf.clip_by_value(dof_adjusted, 1.5, 10.0)  # [B] - снижаем минимальное значение
-        
+
         # ===== 5. ВЫЧИСЛЕНИЕ Z-КВАНТИЛЕЙ ДЛЯ t-РАСПРЕДЕЛЕНИЯ =====
         # Используем аппроксимацию: t_α ≈ sqrt((df-1)/(df*(1-α)^2 - 1))
-        
+
         # Нижний квантиль (для нижней границы)
         prob_lower = (1.0 - target_coverage) / 2.0  # [B]
         prob_lower = tf.maximum(prob_lower, 0.001)  # Избегаем деления на ноль
-        
+
         denominator_lower = dof_adjusted * (prob_lower ** 2) - 1.0
         denominator_lower = tf.maximum(denominator_lower, 0.01)  # Численная стабильность
-        
+
         z_lower_raw = -tf.sqrt((dof_adjusted - 1.0) / denominator_lower)
         z_lower = tf.clip_by_value(z_lower_raw, -7.0, -0.1)  # Расширяем диапазон для экстремальных значений
-        
+
         # Верхний квантиль (для верхней границы)
         prob_upper = (1.0 - target_coverage) / 2.0  # [B]
         prob_upper = tf.maximum(prob_upper, 0.001)
-        
+
         denominator_upper = dof_adjusted * (prob_upper ** 2) - 1.0
         denominator_upper = tf.maximum(denominator_upper, 0.01)
-        
+
         z_upper_raw = tf.sqrt((dof_adjusted - 1.0) / denominator_upper)
         z_upper = tf.clip_by_value(z_upper_raw, 0.1, 7.0)   # Расширяем диапазон для экстремальных значений
-        
+
         # ===== 6. АНАЛИЗ АСИММЕТРИИ ИННОВАЦИЙ (если доступны) =====
         center_shift = tf.zeros([batch_size], dtype=tf.float32)  # [B]
-        
+
         if innovations is not None:
             innovations_processed = tf.squeeze(innovations, axis=-1)  # [B, window_size]
             actual_batch_size = tf.shape(innovations_processed)[0]
-            
+
             # Проверка размера батча
             if actual_batch_size == batch_size:
                 pos_mask = tf.cast(innovations_processed > 0, tf.float32)
                 neg_mask = tf.cast(innovations_processed <= 0, tf.float32)
-                
+
                 abs_innov = tf.abs(innovations_processed)
-                
+
                 pos_sum = tf.reduce_sum(pos_mask * abs_innov, axis=1)
                 pos_count = tf.reduce_sum(pos_mask, axis=1)
                 pos_magnitude = pos_sum / tf.maximum(pos_count, 1.0)
-                
+
                 neg_sum = tf.reduce_sum(neg_mask * abs_innov, axis=1)
                 neg_count = tf.reduce_sum(neg_mask, axis=1)
                 neg_magnitude = neg_sum / tf.maximum(neg_count, 1.0)
-                
+
                 # Center shift = смещение центра прогноза на основе асимметрии
                 # ОГРАНИЧИВАЕМ до ±0.5*stddev
                 center_shift = tf.clip_by_value(
@@ -2867,11 +2686,11 @@ class LSTMIMMUKF(tf.Module):
                     -0.5 * stddev,
                     0.5 * stddev
                 )  # [B]
-        
+
         # ===== 7. ВЫЧИСЛЕНИЕ МАРЖ С УЧЕТОМ ШИРОКОГО ДИАПАЗОНА И ВЫСОКОЙ ВОЛАТИЛЬНОСТИ =====
         # Убираем дублирование с инфляцией, фокусируемся на реальном диапазоне данных
         regime_scale_factor = tf.maximum(1.2, regime_scale)
-        max_width_factor = 10.0 + 5.0 * regime_scale_factor  # Значительно увеличиваем базовую ширину
+        max_width_factor = 2.0 + 0.5 * regime_scale_factor
 
         # Добавляем прямую коррекцию на основе stddev
         stddev_factor = 1.0 + 0.5 * (stddev / tf.reduce_mean(stddev + 1e-8))  # Учет относительной волатильности
@@ -2933,7 +2752,7 @@ class LSTMIMMUKF(tf.Module):
             recent_coverage = tf.stack(self.coverage_history[-50:])
             current_coverage = tf.reduce_mean(recent_coverage)
             target_coverage_mean = tf.reduce_mean(target_coverage)
-            
+
             coverage_error = target_coverage_mean - current_coverage
             # Увеличиваем агрессивность корректировки для сигналов с высокой волатильностью
             adjustment_factor = tf.where(
@@ -2945,15 +2764,15 @@ class LSTMIMMUKF(tf.Module):
                     1.0 - 0.8 * tf.abs(coverage_error)
                 )
             )
-            
+
             # Дополнительная коррекция для сигналов с высокой волатильностью
             volatility_correction = 1.0 + 1.5 * volatility_level  # Усиливаем коррекцию при высокой волатильности
             adjustment_factor = adjustment_factor * volatility_correction
-            
+
             # Применяем корректировку с учетом асимметрии
             margin_lower = margin_lower * adjustment_factor
             margin_upper = margin_upper * adjustment_factor
-            
+
             # Дополнительная асимметричная коррекция
             if coverage_error > 0.15:
                 asymmetry_factor = 1.0 + 1.5 * coverage_error * volatility_level
@@ -2962,11 +2781,11 @@ class LSTMIMMUKF(tf.Module):
         # ===== 10. ВЫЧИСЛЕНИЕ ГРАНИЦ =====
         ci_lower = forecast - margin_lower + center_shift  # [B]
         ci_upper = forecast + margin_upper + center_shift  # [B]
-        
+
         # ===== 11. ПРОВЕРКА И КОРРЕКЦИЯ ВАЛИДНОСТИ =====
         ci_min = tf.minimum(ci_lower, ci_upper)
         ci_max = tf.maximum(ci_lower, ci_upper)
-        
+
         # ===== УЛУЧШЕННАЯ КОРРЕКЦИЯ ДЛЯ ЭКСТРЕМАЛЬНЫХ ЗНАЧЕНИЙ =====
         # Учитываем широкий диапазон данных
         current_volatility_level = tf.squeeze(volatility_level)
@@ -3007,13 +2826,13 @@ class LSTMIMMUKF(tf.Module):
 
     def _create_innovation_window(self, innovations_hist, t, B, window_size=20):
         """Эффективное создание окна истории инноваций для анализа
-        
+
         Args:
             innovations_hist: TensorArray с историей инноваций формы [t_current, B, 1]
             t: текущий временной шаг (скаляр)
             B: размер батча (скаляр)
             window_size: размер окна для анализа (по умолчанию 20)
-        
+
         Returns:
             window: тензор формы [B, window_size] с окном истории инноваций
         """
@@ -3031,7 +2850,7 @@ class LSTMIMMUKF(tf.Module):
             # Берем последние window_size значений из истории
             start_idx = t - window_size
             window = innovations_hist.gather(tf.range(start_idx, t))
-        
+
         # Преобразуем в правильную форму [B, window_size]
         # 1. Убираем последнее измерение (axis=2) -> [window_size, B]
         # 2. Транспонируем -> [B, window_size]
@@ -3048,21 +2867,21 @@ class LSTMIMMUKF(tf.Module):
     ):
         """..."""
         B = tf.shape(x_pred_prev)[0]
-        
+
         # ✅ ИСПРАВКА: Убедитесь, что vol_current одномерный [B]
         if len(vol_current.shape) > 1:
             vol_current = vol_current[:, -1] if vol_current.shape[-1] != 1 else tf.squeeze(vol_current, -1)
         vol_current = tf.squeeze(vol_current)  # Гарантия [B]
-        
+
         # ✅ Ошибка предсказания в сигмах
         sigma_upd = tf.sqrt(tf.maximum(P_upd_curr, 1e-8))  # [B, 1, 1]
         sigma_upd_scalar = tf.squeeze(sigma_upd, [-2, -1])  # [B]
         prediction_error = tf.abs(x_pred_prev[:, 0] - x_upd_curr[:, 0]) / (sigma_upd_scalar + 1e-8)  # [B]
-        
+
         # ✅ Если ошибка > 3σ → пропущен скачок
         missed_jump_threshold = 3.0
         is_missed_jump = prediction_error > missed_jump_threshold  # [B]
-        
+
         # ✅ Коррекция инфляции для пропущенных скачков
         severity = tf.clip_by_value(
             prediction_error / missed_jump_threshold, 1.0, 3.0  # [B]
@@ -3072,16 +2891,16 @@ class LSTMIMMUKF(tf.Module):
             1.5 * severity,        # При пропуске: коррекция 1.5-4.5x
             tf.ones_like(severity)  # Нет пропуска: коррекция=1.0
         )  # [B]
-        
+
         # ✅ Волатильность-зависимая коррекция
         vol_correction = 0.9 + 0.2 * tf.nn.sigmoid(vol_current - 1.0)  # [B]
         inflation_correction = correction_adaptive * vol_correction  # [B]
         inflation_correction = tf.reshape(inflation_correction, [B, 1])  # [B, 1]
-        
+
         # ✅ Флаг пропущенного скачка для совместимости
         is_missed_jump_flag = tf.cast(is_missed_jump, tf.float32)  # [B]
         is_missed_jump_flag = tf.reshape(is_missed_jump_flag, [B, 1])  # [B, 1]
-        
+
         return inflation_correction, is_missed_jump_flag
 
     @tf.function
@@ -3094,15 +2913,15 @@ class LSTMIMMUKF(tf.Module):
             lstm_outputs = self.model(X_batch, training=False)
             params_output = lstm_outputs['params']  # [B, T, 37]
             h_lstm2 = lstm_outputs['h_lstm2']       # [B, T, 128]
-            
+
             # 2. ЭНТРОПИЙНАЯ РЕГУЛЯРИЗАЦИЯ
             entropy_loss = self.entropy_regularizer.compute_entropy_loss(h_lstm2)
-            
+
             # 3. Обработка выходов LSTM
             vol_context, ukf_params, inflation_config, student_t_config = self.process_lstm_output(params_output)
             initial_state = tf.reshape(initial_state, [B, self.state_dim])
             initial_covariance = tf.reshape(initial_covariance, [B, self.state_dim, self.state_dim])
-            
+
             # 4. Адаптивная UKF фильтрация
             results = self.adaptive_ukf_filter(
                 X_batch,
@@ -3114,7 +2933,7 @@ class LSTMIMMUKF(tf.Module):
                 initial_state,
                 initial_covariance
             )
-            
+
             # Распаковка результатов
             x_filtered = results[0]        # [B, T, 1]
             innovations = results[1]       # [B, T, 1]
@@ -3122,26 +2941,26 @@ class LSTMIMMUKF(tf.Module):
             inflation_factors = results[3] # [B, T, 1]
             raw_final_state = results[4]   # [B, 1]
             final_covariance = results[5]  # [B, 1, 1]
-    
+
             # === КРИТИЧЕСКИ ВАЖНО: ВЫЧИСЛИТЬ regime_info СРАЗУ ПОСЛЕ ПОЛУЧЕНИЯ final_volatility ===
             final_volatility = tf.squeeze(volatility_levels[:, -1, :])  # [B]
             regime_info = self.regime_selector.assign_soft_regimes(final_volatility)
-            
+
             # === ЯВНАЯ ПРОВЕРКА СООТВЕТСТВИЯ FINAL STATE ===
             expected_final_state = x_filtered[:, -1, :]  # [B, 1]
             final_state = tf.reshape(expected_final_state, [B, 1])  # [B, 1]
-            
+
             if self.debug_mode:
                 state_diff = tf.reduce_mean(tf.abs(raw_final_state - final_state))
                 tf.print("Проверка соответствия final state:", state_diff)
-            
+
             final_state = final_state  # [B, 1]
-            
+
             # 5. ЯВНЫЙ PREDICT-ШАГ НА СЛЕДУЮЩИЙ ШАГ
             final_volatility = volatility_levels[:, -1, :]  # [B, T, 1] → [B, 1]
             final_volatility = tf.squeeze(final_volatility, -1)  # [B, 1] → [B]
             t_last = tf.shape(ukf_params['q_base'])[1] - 1
-            
+
             # Явное извлечение параметров последнего шага
             q_base_final = tf.gather(ukf_params['q_base'], t_last, axis=1)  # [B, 1]
             q_sensitivity_final = tf.gather(ukf_params['q_sensitivity'], t_last, axis=1)  # [B, 1]
@@ -3156,7 +2975,7 @@ class LSTMIMMUKF(tf.Module):
             kappa_base_final = tf.gather(ukf_params['kappa_base'], t_last, axis=1)  # [B, 1]
             kappa_sensitivity_final = tf.gather(ukf_params['kappa_sensitivity'], t_last, axis=1)  # [B, 1]
             inf_factor_final = tf.gather(inflation_factors[:, -1, :], t_last, axis=1)
-            
+
             forecast, std_dev = self._explicit_predict_next_step(
                 final_state,
                 final_covariance,
@@ -3167,17 +2986,17 @@ class LSTMIMMUKF(tf.Module):
                 alpha_base_final, alpha_sensitivity_final,
                 kappa_base_final, kappa_sensitivity_final
             )
-            
+
             # 6. РАСЧЕТ CALIBRATION LOSS С АСИММЕТРИЧНЫМИ ГРАНИЦАМИ
             # Снижаем целевое покрытие для более практичных интервалов
             base_confidence = 0.80  # Снизить с 0.90 для более узких интервалов
             confidence_range = 0.10  # Диапазон изменения (0.92-0.75)
-            
+
             # Целевое покрытие зависит от уровня волатильности
             confidence_ceil = tf.fill(tf.shape(final_volatility), base_confidence + confidence_range/2)  # 0.85
             confidence_floor = tf.fill(tf.shape(final_volatility), base_confidence - confidence_range/2)  # 0.75
             target_coverage = confidence_ceil - (confidence_ceil - confidence_floor) * final_volatility
-            
+
             batch_shape = (B,)
             # Создание всех параметров с правильной формой (B,)
             student_t_config_final = {
@@ -3192,7 +3011,7 @@ class LSTMIMMUKF(tf.Module):
                 'tail_weight_neg': tf.fill(batch_shape, 1.0),
                 'confidence_base': tf.fill(batch_shape, 0.85),
             }
-            
+
             # Настройка параметров Student-t для асимметричной калибровки
             batch_shape_tensor = tf.shape(final_volatility)
             tail_weight_pos = tf.fill(batch_shape_tensor, 1.2)[:, tf.newaxis]  # Увеличено с 0.8
@@ -3201,44 +3020,44 @@ class LSTMIMMUKF(tf.Module):
             student_t_config_final['tail_weight_neg'] = tail_weight_neg
             student_t_config_final['asymmetry_pos'] = tf.fill(batch_shape_tensor, 0.7)[:, tf.newaxis]  # [B] -> [B, 1]
             student_t_config_final['asymmetry_neg'] = tf.fill(batch_shape_tensor, 1.3)[:, tf.newaxis]  # [B] -> [B, 1]
-            
+
             # Адаптивные АСИММЕТРИЧНЫЕ границы доверительного интервала
-            ci_lower, ci_upper, target_coverage = self._calibrate_confidence_interval_fixed(
-                forecast, std_dev, final_volatility, student_t_config_final, 
+            ci_lower, ci_upper, target_coverage = self._calibrate_confidence_interval(
+                forecast, std_dev, final_volatility, student_t_config_final,
                 innovations=innovations[:, -10:, :] if innovations is not None else None,
                 regime_assignment=regime_info['regime_assignment']
             )
-            
+
             # Проверка валидности границ
             ci_min = tf.minimum(ci_lower, ci_upper)
             ci_max = tf.maximum(ci_lower, ci_upper)
-            
+
             # Вычисление покрытия
             covered = tf.cast(
                 (y_target_batch >= ci_min) & (y_target_batch <= ci_max),
                 tf.float32
             )  # [B]
             actual_coverage = tf.reduce_mean(covered)  # Скаляр [0, 1]
-            
+
             # target_coverage уже адаптирован под каждый элемент батча
             target_coverage_mean = tf.reduce_mean(target_coverage)  # [B] → скаляр [0, 1]
-            
+
             # Базовая калибровочная потеря
             calibration_loss = 2.0 * tf.square(actual_coverage - target_coverage_mean)
-            
+
             # Дополнительный штраф за слишком широкие интервалы
             ci_width = ci_max - ci_min
             avg_stddev = tf.reduce_mean(std_dev)
             width_ratio = tf.reduce_mean(ci_width / (avg_stddev + 1e-8))
-            
+
             # Если интервалы слишком широкие (>2.5x stddev в среднем) - штрафуем
             width_penalty = tf.cond(
-                width_ratio > 2.5,
-                lambda: 0.3 * tf.square(width_ratio - 2.5),  # Штраф за широкие интервалы
+                width_ratio > 2.0,  # Повысить порог
+                lambda: 0.5 * tf.square(width_ratio - 2.0),  # Снизить коэффициент
                 lambda: 0.0
             )
             calibration_loss = calibration_loss + width_penalty
-            
+
             # 7. РАСЧЕТ ПОТЕРИ
             loss = self.compute_loss(
                 forecast,
@@ -3249,41 +3068,41 @@ class LSTMIMMUKF(tf.Module):
                 calibration_loss,
                 entropy_loss
             )
-            
+
             # 8. РАСЧЕТ МЕТРИК
             mse_loss = tf.reduce_mean(tf.square(forecast - y_target_batch))
             avg_volatility = tf.reduce_mean(final_volatility)
             avg_inflation = tf.reduce_mean(inflation_factors[:, -1, :])
             forecast_std = tf.reduce_mean(std_dev)
-            
+
             # ✅ regime_info уже вычислена выше, используем ее для сбора метрик
             regime_soft_weights = tf.reduce_mean(regime_info['soft_weights'], axis=0)  # [3]
             regime_entropy = tf.reduce_mean(regime_info['entropy'])  # скаляр
-            
+
             # Сбор Q/R ratio статистики (используем базовые параметры)
             q_val = tf.reduce_mean(q_base_final)
             r_val = tf.reduce_mean(r_base_final)
             qr_ratio_val = q_val / (r_val + 1e-8)
-            
+
             # Сбор статистики по адаптивному inflation
             avg_inflation = tf.reduce_mean(inflation_factors[:, -1, :])
-            
+
             dynamic_threshold, inflation_anomaly_ratio = compute_adaptive_threshold(
                 inflation_factors,          # [B, T, 1] ✓
                 final_volatility,           # [B] ✓ (это то, что нужно)
                 self.threshold_ema,         # tf.Variable ✓
-                target_anomaly_ratio=0.35   # баланс между нормальными и аномальными состояниями 
+                target_anomaly_ratio=0.35   # баланс между нормальными и аномальными состояниями
             )
-            
+
             # Сбор статистики по спектральным параметрам UKF
             spectrum_info_val = self.diff_ukf_component.get_spectrum_info()
             min_eigenvalue_val = spectrum_info_val['min_eigenvalue']
-    
+
             # Вычисление дополнительных метрик для диагностики
             ci_width_mean = tf.reduce_mean(ci_max - ci_min)
             stddev_mean = tf.reduce_mean(std_dev)
             ci_width_vs_stddev = ci_width_mean / (stddev_mean + 1e-8)
-    
+
             # Сборка метрик
             metrics = {
                 'total_loss': loss,
@@ -3307,9 +3126,9 @@ class LSTMIMMUKF(tf.Module):
                 'ukf_min_eigenvalue': min_eigenvalue_val,
                 'calibration_error': tf.abs(actual_coverage - target_coverage_mean),
             }
-            
+
             return loss, metrics, final_state, final_covariance, forecast, std_dev, ci_min, ci_max, target_coverage
-    
+
     def get_lr_scheduler(self, epoch, totalepochs=50, warmupepochs=8, baselr=1e-4, minlr=1e-5, warmup_type='exponential', gamma=2.0):
         """Улучшенный планировщик learning rate с явным указанием устройства"""
         with tf.device(self.device):
@@ -3319,7 +3138,7 @@ class LSTMIMMUKF(tf.Module):
             baselr = tf.cast(baselr, tf.float32)
             minlr = tf.cast(minlr, tf.float32)
             gamma = tf.cast(gamma, tf.float32)
-            
+
             if epoch < warmupepochs:
                 # Экспоненциальный warmup - плавное начало обучения
                 if warmup_type == 'exponential':
@@ -3337,29 +3156,29 @@ class LSTMIMMUKF(tf.Module):
                 progress = tf.minimum(1.0, (epoch - warmupepochs) / (totalepochs - warmupepochs))
                 return minlr + 0.5 * (baselr - minlr) * (1.0 + math.cos(math.pi * progress))
 
-    def _stratified_split(self, 
-                         df_with_features, 
-                         stratify_col='level', 
+    def _stratified_split(self,
+                         df_with_features,
+                         stratify_col='level',
                          volatility_col='log_vol_short',
-                         train_ratio=0.70, 
+                         train_ratio=0.70,
                          val_ratio=0.15,
                          window_size=400,
                          seed=42):
         """
         ✅ V3: ЛУЧШИЙ ПОДХОД - Окна с балансировкой режимов
-        
+
         Алгоритм:
         1. Разбить ВЕСЬ датасет на окна (в исходном порядке)
         2. Для каждого окна вычислить его режим (по среднему vol)
         3. Раздать окна каждого режима пропорционально train/val/test
         4. Одновременно сбалансировать по режимам (LOW/MID/HIGH)
-        
+
         Преимущества:
         - Простая логика, без граничных случаев
         - Гарантированное распределение (Train > 0, Val > 0, Test > 0)
         - Отличная балансировка режимов в каждом сплите
         - Сохранение временного порядка
-        
+
         Args:
             df_with_features: DataFrame с рассчитанными фичами
             stratify_col: колонка для проверки распределения ('level')
@@ -3368,17 +3187,17 @@ class LSTMIMMUKF(tf.Module):
             val_ratio: доля для валидации (0.15 = 15%)
             window_size: размер окна для разбиения (400)
             seed: случайное зерно (42)
-        
+
         Returns:
             (train_df, val_df, test_df)
         """
-        
+
         np.random.seed(seed)
-        
+
         # === ПАРАМЕТРЫ ===
         test_ratio = 1.0 - train_ratio - val_ratio
         regime_names = {0: 'LOW', 1: 'MID', 2: 'HIGH'}
-        
+
         print(f"\n" + "="*80)
         print(f"📊 СТРАТИФИЦИРОВАННОЕ РАЗДЕЛЕНИЕ V3 (ОКНА С БАЛАНСИРОВКОЙ РЕЖИМОВ)")
         print(f"="*80)
@@ -3386,25 +3205,25 @@ class LSTMIMMUKF(tf.Module):
         print(f"   Train: {100*train_ratio:.1f}%")
         print(f"   Val:   {100*val_ratio:.1f}%")
         print(f"   Test:  {100*test_ratio:.1f}%")
-        
+
         # === ПОДГОТОВКА ===
         df = df_with_features.copy()
         df_clean = df.dropna()
-        
+
         print(f"\n🧹 Датасет: {len(df)} → {len(df_clean)} примеров (после dropna)")
-        
+
         # === ШАГ 1: РАЗБИТЬ ВЕСЬ ДАТАСЕТ НА ОКНА ===
         # Окна идут в исходном порядке - сохраняем временные зависимости!
-        
+
         print(f"\n🪟 ШАГ 1: РАЗБИЕНИЕ НА ОКНА")
         print(f"   Размер окна: {window_size} примеров")
-        
+
         windows_data = []  # List[{'indices': [...], 'regime': int, 'mean_vol': float, 'size': int}]
-        
+
         # Получить квантили волатильности один раз
         vol_q33 = df_clean[volatility_col].quantile(0.33)
         vol_q67 = df_clean[volatility_col].quantile(0.67)
-        
+
         # ✅ Функция для классификации режима (определи один раз)
         def classify_regime_vol(vol):
             """Классифицировать волатильность в режим"""
@@ -3414,62 +3233,62 @@ class LSTMIMMUKF(tf.Module):
                 return 1  # MID
             else:
                 return 2  # HIGH
-        
+
         for i in range(0, len(df_clean), window_size):
             # Индексы окна в исходном датасете
             window_indices = df_clean.index[i:i + window_size].tolist()
-            
+
             # Определить режим окна (по среднему волатильности в окне)
             window_vol = df_clean.loc[window_indices, volatility_col]
             mean_vol = window_vol.mean()
             regime = classify_regime_vol(mean_vol)
-            
+
             windows_data.append({
                 'indices': window_indices,
                 'regime': regime,
                 'mean_vol': mean_vol,
                 'size': len(window_indices)
             })
-        
+
         print(f"   ✅ Создано {len(windows_data)} окон")
-        
+
         # === ШАГ 2: СОРТИРОВАТЬ ОКНА ПО РЕЖИМУ (для информации) ===
-        
+
         print(f"\n🎚️ ШАГ 2: РАСПРЕДЕЛЕНИЕ ОКОН ПО РЕЖИМАМ")
-        
+
         windows_by_regime = {0: [], 1: [], 2: []}
-        
+
         for w in windows_data:
             windows_by_regime[w['regime']].append(w)
-        
+
         for regime_id in [0, 1, 2]:
             regime_windows = windows_by_regime[regime_id]
             n_windows = len(regime_windows)
             total_size = sum(w['size'] for w in regime_windows)
             pct = 100 * total_size / len(df_clean)
             print(f"   {regime_names[regime_id]:6s}: {n_windows:3d} окон ({total_size:5d} примеров, {pct:5.1f}%)")
-        
+
         # === ШАГ 3: РАЗДАТЬ ОКНА ПРОПОРЦИОНАЛЬНО ===
         # ✅ КОМПРОМИСС: Режимная балансировка с гарантией min 1 окна в каждом сплите
-        
+
         print(f"\n📋 ШАГ 3: РАЗДАЧА ОКОН ПО СПЛИТАМ")
-        
+
         train_indices = []
         val_indices = []
         test_indices = []
-        
+
         # Раздаём КАЖДЫЙ РЕЖИМ пропорционально
         for regime_id in [0, 1, 2]:
             regime_windows = windows_by_regime[regime_id]
             n_windows = len(regime_windows)
-            
+
             if n_windows == 0:
                 continue
-            
+
             # ✅ КОМПРОМИССНЫЙ РАСЧЁТ:
             # - Стараемся придерживаться пропорций
             # - Но гарантируем min 1 в каждом сплите
-            
+
             if n_windows >= 3:
                 n_train = max(1, int(np.round(n_windows * train_ratio)))
                 n_val = max(1, int(np.round(n_windows * val_ratio)))
@@ -3479,7 +3298,7 @@ class LSTMIMMUKF(tf.Module):
                 n_train = 1
                 n_val = 1 if n_windows > 2 else 0
                 n_test = n_windows - n_train - (1 if n_windows > 2 else 0)
-            
+
             # Раздать окна этого режима
             for j, window in enumerate(regime_windows):
                 if j < n_train:
@@ -3488,58 +3307,58 @@ class LSTMIMMUKF(tf.Module):
                     val_indices.extend(window['indices'])
                 else:
                     test_indices.extend(window['indices'])
-            
+
             # Правильный расчёт размеров
             train_size = sum(regime_windows[j]['size'] for j in range(n_train))
             val_size = sum(regime_windows[j]['size'] for j in range(n_train, n_train + n_val))
             test_size = sum(regime_windows[j]['size'] for j in range(n_train + n_val, n_windows))
-            
+
             print(f"   {regime_names[regime_id]:6s}: Train {n_train} окон ({train_size:4d} примеров) | "
                   f"Val {n_val} окон ({val_size:4d} примеров) | "
                   f"Test {n_test} окон ({test_size:4d} примеров)")
-        
+
         # === ШАГ 4: ВЕРНУТЬСЯ К ИСХОДНОМУ ПОРЯДКУ ===
         # Важно для сохранения временных зависимостей!
-        
+
         train_indices = sorted(train_indices)
         val_indices = sorted(val_indices)
         test_indices = sorted(test_indices)
-        
+
         # === СОЗДАТЬ ФИНАЛЬНЫЕ СПЛИТЫ ===
-        
+
         train_df = df.loc[train_indices].reset_index(drop=True)
         val_df = df.loc[val_indices].reset_index(drop=True)
         test_df = df.loc[test_indices].reset_index(drop=True)
-        
+
         # === ФИНАЛЬНАЯ ПРОВЕРКА И СТАТИСТИКА ===
-        
+
         total = len(train_df) + len(val_df) + len(test_df)
-        
+
         print(f"\n" + "="*80)
         print(f"✅ РАЗДЕЛЕНИЕ ЗАВЕРШЕНО")
         print(f"="*80)
-        
+
         if total > 0:
             train_pct = 100 * len(train_df) / total
             val_pct = 100 * len(val_df) / total
             test_pct = 100 * len(test_df) / total
-            
+
             # Проверка на близость к целевым значениям (допуск 3%)
             train_ok = abs(train_pct - 100*train_ratio) < 3
             val_ok = abs(val_pct - 100*val_ratio) < 3
             test_ok = abs(test_pct - 100*test_ratio) < 3
-            
+
             print(f"\n📊 ФИНАЛЬНОЕ РАСПРЕДЕЛЕНИЕ:")
             print(f"   Train: {len(train_df):5d} ({train_pct:5.1f}%) [target: {100*train_ratio:5.1f}%] {'✅' if train_ok else '⚠️'}")
             print(f"   Val:   {len(val_df):5d} ({val_pct:5.1f}%) [target: {100*val_ratio:5.1f}%] {'✅' if val_ok else '⚠️'}")
             print(f"   Test:  {len(test_df):5d} ({test_pct:5.1f}%) [target: {100*test_ratio:5.1f}%] {'✅' if test_ok else '⚠️'}")
             print(f"   Total: {total:5d}")
-            
+
             # === ПРОВЕРКА РАСПРЕДЕЛЕНИЯ ЦЕЛЕВОЙ ПЕРЕМЕННОЙ ===
-            
+
             print(f"\n📈 РАСПРЕДЕЛЕНИЕ {stratify_col}:")
             print(f"-" * 80)
-            
+
             stats_list = []
             for split_name, split_df in [('Train', train_df), ('Val', val_df), ('Test', test_df)]:
                 if len(split_df) > 0:
@@ -3550,38 +3369,38 @@ class LSTMIMMUKF(tf.Module):
                     max_val = col_data.max()
                     q25 = col_data.quantile(0.25)
                     q75 = col_data.quantile(0.75)
-                    
+
                     stats_list.append(mean)
-                    
+
                     print(f"{split_name:<8}: mean={mean:8.2f}, std={std:8.2f}, "
                           f"q25={q25:8.2f}, q75={q75:8.2f}, "
                           f"range=[{min_val:8.2f}, {max_val:8.2f}]")
-            
+
             # Проверка сбалансированности mean
             if len(stats_list) >= 2:
                 mean_std = np.std(stats_list)
-                overall_std = np.mean([train_df[stratify_col].std(), 
+                overall_std = np.mean([train_df[stratify_col].std(),
                                        val_df[stratify_col].std() if len(val_df) > 0 else 0,
                                        test_df[stratify_col].std() if len(test_df) > 0 else 0])
                 if overall_std > 0:
                     mean_std_pct = 100 * mean_std / overall_std
                 else:
                     mean_std_pct = 0
-                
+
                 if mean_std_pct < 10:
                     status = "✅ ОТЛИЧНО"
                 elif mean_std_pct < 20:
                     status = "✅ ХОРОШО"
                 else:
                     status = "⚠️ ТРЕБУЕТ ВНИМАНИЯ"
-                
+
                 print(f"   → Std средних: {mean_std:.2f} ({mean_std_pct:.1f}%) {status}")
-            
+
             # === ПРОВЕРКА РАСПРЕДЕЛЕНИЯ РЕЖИМОВ ===
-            
+
             print(f"\n🎚️ РАСПРЕДЕЛЕНИЕ РЕЖИМОВ:")
             print(f"-" * 80)
-            
+
             # ✅ Переопредели функцию для гарантии области видимости
             def classify_regime_final(vol):
                 if vol < vol_q33:
@@ -3590,45 +3409,45 @@ class LSTMIMMUKF(tf.Module):
                     return 1
                 else:
                     return 2
-            
+
             for split_name, split_df in [('Train', train_df), ('Val', val_df), ('Test', test_df)]:
                 if len(split_df) > 0:
                     split_clean = split_df.dropna()
-                    
+
                     split_clean_copy = split_clean.copy()
                     split_clean_copy['regime_check'] = split_clean_copy[volatility_col].apply(classify_regime_final)  # ← Используй эту
-                    
+
                     regime_dist = split_clean_copy['regime_check'].value_counts(normalize=True).sort_index() * 100
-                    
+
                     low_pct = regime_dist.get(0, 0)
                     mid_pct = regime_dist.get(1, 0)
                     high_pct = regime_dist.get(2, 0)
-                    
+
                     print(f"{split_name:<8}: LOW={low_pct:5.1f}%, MID={mid_pct:5.1f}%, HIGH={high_pct:5.1f}%")
-        
+
         print(f"="*80 + "\n")
-    
+
         # === ВИЗУАЛИЗАЦИЯ ДАТАСЕТОВ ===
         # Первый график
         plt.figure()  # создаем новую фигуру
         train_df.level.plot(title='train_df')
         plt.savefig('train_df.png')
         plt.close()  # закрываем текущую фигуру
-        
-        # Второй график  
+
+        # Второй график
         plt.figure()  # создаем новую фигуру
         val_df.level.plot(title='val_df')
         plt.savefig('val_df.png')
         plt.close()  # закрываем текущую фигуру
 
-        # Третий график  
+        # Третий график
         plt.figure()  # создаем новую фигуру
         test_df.level.plot(title='test_df')
         plt.savefig('test_df.png')
         plt.close()  # закрываем текущую фигуру
-        
+
         return train_df, val_df, test_df
-    
+
     def _prepare_datasets(self, train_df, val_df, test_df):
         """Оптимизированная подготовка датасетов для максимальной загрузки GPU"""
         print("\n" + "=" * 80)
@@ -3638,15 +3457,15 @@ class LSTMIMMUKF(tf.Module):
         full_df = pd.concat([train_df, val_df, test_df], ignore_index=True)
         print(f"✅ Объединены train ({len(train_df)}) + val ({len(val_df)}) "
                       f"+ test ({len(test_df)})")
-        
+
         print(f"📊 Полный датасет: {len(full_df)} примеров")
 
         df_with_features = self.prepare_features(full_df, mode='batch')
         print(f"✅ Фичи рассчитаны: {df_with_features.shape[1]} колонок")
-        
+
         print("\n🔄 ЭТАП 2: Стратифицированное разделение...")
         print("-" * 80)
-            
+
         train_features, val_features, test_features = self._stratified_split(
             df_with_features,
             stratify_col='level',
@@ -3655,29 +3474,29 @@ class LSTMIMMUKF(tf.Module):
             val_ratio=0.2,
             seed=42
         )
-        
+
         print(f"✅ Разделение завершено:")
         print(f"   Train: {len(train_features)}")
         print(f"   Val:   {len(val_features)}")
         print(f"   Test:  {len(test_features)}")
-        
+
         # === 2. ГРУППИРОВКА ПРИЗНАКОВ ДЛЯ МАСШТАБИРОВАНИЯ ===
         self.scale_groups = {
             'robust': ['level', 'velocity', 'acceleration', 'energy', 'st_comp_diff',
-                       'extreme_pos_momentum', 'tail_weight_indicator', 'log_vol_short', 
+                       'extreme_pos_momentum', 'tail_weight_indicator', 'log_vol_short',
                        'rel_vol_short_long', 'vol_accel_rel', 'rel_entropy'],
             'standard': ['log_vol', 'amplitude', 'yz', 'gc', 'p', 'rs', 'ht'],
             'minmax': ['percentile_pos'],
             'none': ['asymmetry_ratio', 'percentile_pos_fisher', 'skew']
         }
-    
+
         # Добавление пропущенных признаков в 'robust' группу
         all_grouped = {f for group in self.scale_groups.values() for f in group}
         missing = [f for f in self.feature_columns if f not in all_grouped]
         if missing:
             print(f"⚠️  Добавление пропущенных признаков в 'robust': {missing}")
             self.scale_groups['robust'].extend(missing)
-    
+
         # === 3. ИНИЦИАЛИЗАЦИЯ И ОБУЧЕНИЕ СКЕЙЛЕРОВ ===
         print("\n📊 Инициализация и обучение скейлеров на CPU...")
         self.feature_scalers = {
@@ -3687,7 +3506,7 @@ class LSTMIMMUKF(tf.Module):
             'none': None,
             'Y': PowerTransformer(method='yeo-johnson', standardize=True)
         }
-    
+
         # Обучение скейлеров признаков
         for group_name, features in self.scale_groups.items():
             if self.feature_scalers.get(group_name) is not None:
@@ -3695,11 +3514,11 @@ class LSTMIMMUKF(tf.Module):
                 if valid_features:
                     self.feature_scalers[group_name].fit(train_features[valid_features].values)
                     print(f"✅ {group_name} скейлер обучен на {len(valid_features)} признаках")
-    
+
         # Обучение скейлера целевой переменной
         self.feature_scalers['Y'].fit(train_features[['level']].values)
         print("✅ Скейлер 'Y' обучен на целевой переменной 'level'")
-    
+
         # === 4. МАСШТАБИРОВАНИЕ И СОЗДАНИЕ ПОСЛЕДОВАТЕЛЬНОСТЕЙ ===
         print("\n🔄 Масштабирование данных и создание последовательностей...")
         datasets = {}
@@ -3712,24 +3531,24 @@ class LSTMIMMUKF(tf.Module):
             # Создание последовательностей
             X_seq, y_target = self._create_sequences(X_scaled.values, y_scaled)
             y_for_filtering = np.array([y_scaled[i:i+self.seq_len] for i in range(len(X_seq))], dtype=np.float32)
-    
+
             datasets[name] = (X_seq, y_for_filtering, y_target)
-    
+
             if name == 'train':
                 print(f"   ✅ Обучающие последовательности: X={X_seq.shape}, y_filter={y_for_filtering.shape}, y_target={y_target.shape}")
             else:
                 print(f"   ✅ Валидационные последовательности: X={X_seq.shape}, y_filter={y_for_filtering.shape}, y_target={y_target.shape}")
-    
+
         # === 5. СОЗДАНИЕ TF.DATA PIPELINE ===
         print("\n⚡ Настройка tf.data pipeline с оптимальным prefetch и batching...")
-    
+
         def preprocess_batch(X, y_filt, y_tgt):
             return (
                 tf.cast(X, tf.float32),
                 tf.cast(y_filt, tf.float32),
                 tf.cast(y_tgt, tf.float32)
             )
-    
+
         # Автоматический подбор batch_size
         batch_size = 64
         gpus = tf.config.list_physical_devices('GPU')
@@ -3742,13 +3561,13 @@ class LSTMIMMUKF(tf.Module):
                     batch_size = min(128, max(32, memory_limit // (1024 * 1024 * 2)))
             except Exception:
                 pass
-    
+
         print(f"   📦 Batch size: {batch_size}")
-    
+
         # Создание датасетов
         train_ds = tf.data.Dataset.from_tensor_slices(datasets['train'])
         val_ds = tf.data.Dataset.from_tensor_slices(datasets['val'])
-    
+
         for ds_name, ds in [('train', train_ds), ('val', val_ds)]:
             ds = ds.map(preprocess_batch, num_parallel_calls=tf.data.AUTOTUNE)
             ds = ds.batch(batch_size, drop_remainder=True)
@@ -3757,34 +3576,34 @@ class LSTMIMMUKF(tf.Module):
                 train_ds = ds
             else:
                 val_ds = ds
-    
+
         print(f"✅ Обучающий датасет: {len(train_ds)} батчей")
         print(f"✅ Валидационный датасет: {len(val_ds)} батчей")
-    
+
         # Кэширование валидации в памяти
         print("\n💾 Кэширование валидационного набора...")
         val_ds = val_ds.cache()
-    
+
         print("\n" + "=" * 80)
         print("✅ ОПТИМИЗИРОВАННАЯ ПОДГОТОВКА ДАТАСЕТОВ ЗАВЕРШЕНА")
         print("=" * 80)
-    
+
         return train_ds, val_ds
-    
+
     def _create_sequences(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         n_samples = len(X) - self.seq_len
-        
+
         # ✅ ПРАВИЛЬНО: y СДВИНУТА на forecast_horizon=1 timesteps в будущее!
         X_seq = np.array([X[i:i + self.seq_len] for i in range(n_samples)], dtype=np.float32)
         # Вариант B: предсказываем только один шаг вперед (скалярное значение)
         y_seq = np.array([y[i + self.seq_len] for i in range(n_samples)], dtype=np.float32)
-        
-        return X_seq, y_seq      
-    
+
+        return X_seq, y_seq
+
     def _scale_features(self, features_df):
         """✅ ОПТИМАЛЬНАЯ ВЕРСИЯ: Применение скейлеров с сохранением группировки"""
         scaled_df = pd.DataFrame(index=features_df.index)
-        
+
         # ✅ ГРУППИРОВКА ИСПОЛЬЗУЕТСЯ ЗДЕСЬ ДЛЯ ПРИМЕНЕНИЯ
         # 1. Признаки для RobustScaler
         for group_name, features in self.scale_groups.items():
@@ -3795,7 +3614,7 @@ class LSTMIMMUKF(tf.Module):
                     for i, col in enumerate(valid_features):
                         scaled_df[col] = scaled_values[:, i]
                     print(f"  ✅ {group_name} скейлер применен к {len(valid_features)} признакам")
-        
+
         # 2. Признаки без масштабирования
         if 'none' in self.scale_groups:
             for col in self.scale_groups['none']:
@@ -3807,7 +3626,7 @@ class LSTMIMMUKF(tf.Module):
                     elif col == 'percentile_pos_fisher':
                         scaled_df[col] = np.clip(scaled_df[col], -5.0, 5.0)
                     print(f"  ✅ {col}: семантика сохранена (без масштабирования)")
-        
+
         # 3. Обработка пропущенных признаков
         missing_cols = [col for col in self.feature_columns if col not in scaled_df.columns]
         if missing_cols:
@@ -3819,23 +3638,23 @@ class LSTMIMMUKF(tf.Module):
                         scaled_df[col] = self.feature_scalers['robust'].transform(features_df[[col]].values)[:, 0]
                     else:
                         scaled_df[col] = features_df[col].values
-        
+
         # 4. Обработка ошибок
         scaled_df = scaled_df.replace([np.inf, -np.inf], np.nan)
         scaled_df = scaled_df.fillna(0.0)
-        
+
         return scaled_df
-    
+
     def prepare_features(self, df: pd.DataFrame, mode='batch', include_ground_truth=False) -> pd.DataFrame:
         """
         Подготовка признаков с фокусом на многошкальные оценки волатильности
         для поддержки контекстной адаптации UKF параметров.
-        
+
         Args:
             df: DataFrame с OHLC данными
             mode: 'batch' для обучения/валидации, 'online' для онлайн-прогнозирования
             include_ground_truth: включать ли ground truth значение для следующего шага
-            
+
         Returns:
             DataFrame с вычисленными признаками
         """
@@ -3843,29 +3662,29 @@ class LSTMIMMUKF(tf.Module):
         if len(df) < self.min_history_for_features:
             raise ValueError(
                 f"Недостаточно данных для расчета признаков. Требуется минимум {self.min_history_for_features} точек")
-        
+
         # Проверка обязательных колонок
         required_cols = ['Open', 'High', 'Low', 'Close']
         missing_cols = [col for col in required_cols if col not in df.columns]
         if missing_cols:
             raise ValueError(f"Отсутствуют обязательные колонки: {missing_cols}")
-        
+
         # Расчет St_comp через EMD декомпозицию
         st_comp, _ = get_emd_components(df['Close'].values)
-        
+
         # Создание DataFrame с признаками
         features_df = pd.DataFrame(index=df.index)
         features_df['St_comp'] = st_comp
-        
+
         # Динамические окна для вычисления волатильности
         span_short = self.vol_window_short  # 36 по умолчанию
         span_medium = self.vol_window_long // 2  # ~75
         span_long = self.vol_window_long  # 150 по умолчанию
         perc_window = self.rolling_window_percentile  # 100 по умолчанию
-        
+
         # 1. БАЗОВЫЕ ПРИЗНАКИ
         features_df['level'] = features_df['St_comp']
-        
+
         # 2. МНОГОШКАЛЬНЫЕ ОЦЕНКИ ВОЛАТИЛЬНОСТИ
         # Короткосрочная волатильность (EWMA)
         features_df['vol_short'] = features_df['St_comp'].ewm(
@@ -3874,7 +3693,7 @@ class LSTMIMMUKF(tf.Module):
             adjust=False
         ).std()
         features_df['log_vol_short'] = np.log(features_df['vol_short'].clip(lower=1e-8) + 1e-8)
-        
+
         # Среднесрочная волатильность
         features_df['vol_medium'] = features_df['St_comp'].ewm(
             span=span_medium,
@@ -3882,7 +3701,7 @@ class LSTMIMMUKF(tf.Module):
             adjust=False
         ).std().clip(lower=1e-8)
         features_df['rel_vol_short_medium'] = features_df['vol_short'] / features_df['vol_medium']
-        
+
         # Долгосрочная волатильность
         features_df['vol_long'] = features_df['St_comp'].ewm(
             span=span_long,
@@ -3890,50 +3709,50 @@ class LSTMIMMUKF(tf.Module):
             adjust=False
         ).std().clip(lower=1e-8)
         features_df['rel_vol_short_long'] = features_df['vol_short'] / features_df['vol_long']
-        
+
         # 3. ПРОИЗВОДНЫЕ ПО ВОЛАТИЛЬНОСТИ
         features_df['vol_accel_short'] = features_df['vol_short'].pct_change().fillna(0)
         features_df['vol_accel_rel'] = features_df['rel_vol_short_long'].pct_change().fillna(0)
         features_df['norm_vol_accel'] = features_df['vol_accel_rel'] / features_df['vol_long']
-        
+
         # 4. АБСОЛЮТНО БЕЗОПАСНЫЙ РАСЧЕТ ДОХОДНОСТЕЙ
         price_change = features_df['St_comp'] - features_df['St_comp'].shift(1)
         prev_price = features_df['St_comp'].shift(1)
-        
+
         # Защита от деления на ноль и отрицательных цен
         valid_prev_price = prev_price.clip(lower=1e-8)
         ratio = price_change / valid_prev_price
-        
+
         # Защита от недопустимых значений для логарифма
         ratio_safe = np.clip(ratio, -0.99, 10.0)  # Ограничиваем реалистичными значениями
         returns = np.log1p(ratio_safe)  # log(1+x) более стабилен для малых x
-        
+
         # Явная обработка оставшихся некорректных значений
         returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
         returns = np.clip(returns, -10.0, 10.0)
         returns_series = pd.Series(returns, index=features_df.index)  # ✅ ВАЖНО: создаем pandas Series с индексом
-        
+
         # 5. ЭНТРОПИЙНЫЕ ПРИЗНАКИ
         def safe_entropy(x):
             """Безопасное вычисление энтропии с защитой от всех граничных случаев"""
             if len(x) < 5:
                 return 0.0
-                
+
             # Явная обработка NaN и бесконечностей
             x_clean = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-            
+
             # Если все значения одинаковые - энтропия 0
             if np.allclose(x_clean, x_clean[0], atol=1e-8):
                 return 0.0
-                
+
             # Нормализация
             mean_val = np.mean(x_clean)
             std_val = np.std(x_clean) + 1e-8
             x_norm = (x_clean - mean_val) / std_val
-            
+
             # Защита от неконечных значений после нормализации
             x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=0.0, neginf=0.0)
-            
+
             try:
                 # Вычисление гистограммы с защитой
                 hist, _ = np.histogram(x_norm, bins=5, range=(-3, 3), density=True)
@@ -3944,23 +3763,23 @@ class LSTMIMMUKF(tf.Module):
                 return np.clip(entropy, 0.0, 10.0)
             except Exception:
                 return 0.0
-        
+
         # Короткосрочная энтропия
         features_df['entropy_short'] = returns_series.rolling(
             window=span_short,
             min_periods=5
         ).apply(safe_entropy, raw=True).fillna(0.0)
-        
+
         # Долгосрочная энтропия
         features_df['entropy_long'] = returns_series.rolling(
             window=span_long,
             min_periods=10
         ).apply(safe_entropy, raw=True).fillna(0.0)
-        
+
         # Относительная энтропия
         features_df['entropy_long_safe'] = features_df['entropy_long'].clip(lower=1e-8)
         features_df['rel_entropy'] = features_df['entropy_short'] / features_df['entropy_long_safe']
-        
+
         # 6. ДОПОЛНИТЕЛЬНЫЕ СТАТИСТИЧЕСКИЕ ПРИЗНАКИ
         # Статистические характеристики доходностей
         features_df['skew'] = returns_series.rolling(
@@ -3971,7 +3790,7 @@ class LSTMIMMUKF(tf.Module):
             window=span_short,
             min_periods=5
         ).kurt().fillna(0)
-        
+
         # Процентильная позиция
         features_df['q5_long'] = features_df['St_comp'].rolling(
             window=perc_window,
@@ -3981,17 +3800,17 @@ class LSTMIMMUKF(tf.Module):
             window=perc_window,
             min_periods=10
         ).quantile(0.95).ffill().fillna(0.0)
-        
+
         # Безопасное вычисление знаменателя
         denom = (features_df['q95_long'] - features_df['q5_long']).clip(lower=1e-8)
         features_df['percentile_pos'] = (features_df['St_comp'] - features_df['q5_long']) / denom
-        
+
         # Безопасное преобразование Фишера
         percentile_pos = np.clip(features_df['percentile_pos'].values, 1e-6, 1 - 1e-6)
         fisher_arg = percentile_pos / (1 - percentile_pos + 1e-8)
         fisher_arg = np.clip(fisher_arg, 1e-6, 1e6)  # Защита от экстремальных значений
         features_df['percentile_pos_fisher'] = 0.5 * np.log(fisher_arg + 1e-8)
-        
+
         # 7. ВОЛАТИЛЬНОСТЬ ПО РАЗЛИЧНЫМ МЕТОДИКАМ
         # Безопасные вычисления с явной обработкой ошибок
         def safe_volatility_calc(func, *args, **kwargs):
@@ -4000,82 +3819,82 @@ class LSTMIMMUKF(tf.Module):
                 return np.nan_to_num(result.values, nan=0.0, posinf=0.0, neginf=0.0)
             except Exception:
                 return np.zeros(len(features_df))
-        
+
         features_df['yz'] = safe_volatility_calc(yang_zhang, df, window=span_short, trading_periods=2190, clean=False)
         features_df['gc'] = safe_volatility_calc(garman_klass, df, window=span_short, trading_periods=2190, clean=False)
         features_df['p'] = safe_volatility_calc(parkinson, df, window=span_short, trading_periods=2190, clean=False)
         features_df['rs'] = safe_volatility_calc(rogers_satchell, df, window=span_short, trading_periods=2190, clean=False)
         features_df['ht'] = safe_volatility_calc(hodges_tompkins, df, window=span_short, trading_periods=2190, clean=False)
-        
+
         # 8. ПРИЗНАКИ АСИММЕТРИИ И ЭНЕРГИИ
         diff_comp = features_df['St_comp'].diff().fillna(0)
-        
+
         # Энергия колебаний
         features_df['energy'] = (diff_comp ** 2).ewm(
             span=span_short,
             min_periods=5,
             adjust=False
         ).mean().clip(lower=0.0)
-        
+
         # Амплитуда колебаний
         rolling_max = features_df['St_comp'].rolling(window=3, min_periods=2).max().ffill()
         rolling_min = features_df['St_comp'].rolling(window=3, min_periods=2).min().bfill()
         features_df['amplitude'] = ((rolling_max - rolling_min) / 2).fillna(0).clip(lower=0.0)
-        
+
         # Импульс экстремальных позиций
         pos_diff = diff_comp.where(diff_comp > 0, 0)
         features_df['extreme_pos_momentum'] = pos_diff.rolling(
-            window=span_short, 
+            window=span_short,
             min_periods=5
         ).mean().fillna(0)
-        
+
         # Отношение асимметрий
         up_movements = diff_comp.where(diff_comp > 0, 0)
         down_movements = diff_comp.where(diff_comp < 0, 0).abs()
-        
+
         up_std = up_movements.rolling(window=span_short, min_periods=10).std().fillna(0)
         down_std = down_movements.rolling(window=span_short, min_periods=10).std().fillna(0)
-        
+
         # Безопасное вычисление отношения
         denominator = down_std.clip(lower=1e-8)
         features_df['asymmetry_ratio'] = (up_std + 1e-8) / denominator
-        
+
         # Вес хвостовых событий
         abs_diff = diff_comp.abs()
         tail90 = abs_diff.rolling(window=span_short, min_periods=5).quantile(0.9).fillna(0)
         tail50 = abs_diff.rolling(window=span_short, min_periods=5).quantile(0.5).fillna(0)
         tail50_safe = tail50.clip(lower=1e-8)
         features_df['tail_weight_indicator'] = (tail90 + 1e-8) / tail50_safe
-        
+
         # 9. СКОРОСТЬ И УСКОРЕНИЕ
         features_df['velocity'] = diff_comp
         features_df['acceleration'] = features_df['velocity'].diff().fillna(0)
-        
+
         # 10. ЧИСЛОВАЯ СТАБИЛЬНОСТЬ
         features_df = features_df.replace([np.inf, -np.inf], np.nan)
-        
+
         # 11. ФИНАЛЬНАЯ ОБРАБОТКА
         # Удаление вспомогательных колонок
         cols_to_drop = ['q5_long', 'q95_long', 'St_comp', 'entropy_long_safe']
         for col in cols_to_drop:
             if col in features_df.columns:
                 features_df = features_df.drop(col, axis=1)
-        
+
         # Финальная очистка
         features_df = features_df.ffill().bfill()
         features_df = features_df.fillna(0.0)
-        
+
         # Защита от экстремальных значений
         for col in features_df.columns:
             if 'entropy' in col or 'vol' in col or 'ratio' in col:
                 features_df[col] = np.clip(features_df[col], -10.0, 10.0)
             elif 'fisher' in col:
                 features_df[col] = np.clip(features_df[col], -5.0, 5.0)
-        
+
         # Проверка на оставшиеся некорректные значения
         features_df = features_df.replace([np.inf, -np.inf], np.nan)
         features_df = features_df.fillna(0.0)
-        
+
         # Возврат результатов в зависимости от режима
         if mode == 'online':
             if include_ground_truth:
@@ -4086,26 +3905,26 @@ class LSTMIMMUKF(tf.Module):
                 return features_for_batch.astype(np.float32)
             else:
                 return features_df.tail(self.seq_len).astype(np.float32)
-        
+
         return features_df.astype(np.float32)
-    
+
     def fit(self, train_features, val_features, test_features, epochs=50, min_epochs=5,
             patience=15, save_best_weights=True, early_stopping=True, log_dir=None):
         """Оптимизированный метод обучения для адаптивной UKF с контекстной волатильностью"""
         print("=" * 80)
         print("🚀 ОБУЧЕНИЕ LSTM-АДАПТИВНОЙ UKF МОДЕЛИ С КОНТЕКСТНОЙ ВОЛАТИЛЬНОСТЬЮ")
         print("=" * 80)
-        
+
         # 0. Сброс отслеживания лучших весов
         self.reset_best_weights_tracking()
         print("🔄 Отслеживание лучших весов сброшено")
-        
+
         # 1. Подготовка датасетов
         print("\n📊 Подготовка оптимизированных датасетов...")
-        train_ds, val_ds = self._prepare_datasets(train_features, val_features, test_features) 
+        train_ds, val_ds = self._prepare_datasets(train_features, val_features, test_features)
         log_interval = max(1, len(train_ds) // 10)  # логируем ~10 раз за эпоху
         print("✅ Оптимизированные датасеты успешно подготовлены")
-        
+
         # 2. Инициализация модели на GPU
         print("\n🔧 Инициализация LSTM модели на GPU...")
         for X_batch, y_for_filtering_batch, y_target_batch in train_ds.take(1):
@@ -4115,7 +3934,7 @@ class LSTMIMMUKF(tf.Module):
                 self.model = self._build_model(input_shape, training=True)
             print(f"✅ LSTM модель инициализирована с формой входа: {input_shape}")
             break
-        
+
         # 3. Инициализация оптимизатора
         if self._optimizer is None:
             base_lr = 5e-4
@@ -4127,7 +3946,7 @@ class LSTMIMMUKF(tf.Module):
                 amsgrad=False
             )
             print(f"✅ Оптимизатор инициализирован с learning_rate={base_lr:.1e}")
-        
+
         # 4. История обучения
         history = {
             'train_loss': [],
@@ -4137,11 +3956,11 @@ class LSTMIMMUKF(tf.Module):
             'best_val_loss': float('inf'),
             'patience_counter': 0
         }
-        
+
         # 5. Основной цикл обучения
         print("\n🔥 НАЧАЛО ОБУЧЕНИЯ")
         print("=" * 80)
-        
+
         try:
             for epoch in range(epochs):
                 epoch_start_time = datetime.datetime.now()
@@ -4150,7 +3969,7 @@ class LSTMIMMUKF(tf.Module):
                 if epoch > 0 and self.best_weights_dict is not None:
                     print(f"🔄 Восстановление состояния перед эпохой {epoch + 1}")
                     self.load_best_weights()  # Это загрузит и состояние буфера
-                
+
                 # Обновление learning rate
                 current_lr = self.get_lr_scheduler(
                     epoch=epoch,
@@ -4163,7 +3982,7 @@ class LSTMIMMUKF(tf.Module):
                 self._optimizer.learning_rate.assign(current_lr)
                 print(f"\n{'─' * 80}")
                 print(f"📅 EPOCH {epoch + 1}/{epochs} | LR: {current_lr:.2e} | Начало: {epoch_start_time.strftime('%H:%M:%S')}")
-                
+
                 # ===== ОБУЧЕНИЕ =====
                 print("\n📈 ОБУЧЕНИЕ...")
                 epoch_losses = []
@@ -4174,37 +3993,37 @@ class LSTMIMMUKF(tf.Module):
 
                 # ДОБАВЛЕНО: сбор всех нормализованных инноваций за эпоху
                 all_normalized_innov = []
-                
+
                 for batch_idx, (X_batch, y_for_filtering_batch, y_target_batch) in enumerate(train_ds):
                     batch_size = tf.shape(X_batch)[0]
                     current_state_size = tf.shape(self._last_state)[0]
-                    
+
                     # === ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ UKF С АДАПТИВНОЙ ДИСПЕРСИЕЙ ===
                     if batch_idx == 0 and epoch == 0:
                         # Инициализируем состояния с правильным размером батча
                         print(f"🔄 Инициализация состояний UKF для батча размером {batch_size}")
-                        
+
                         # Адаптивная инициализация с учетом волатильности данных
                         window_std = tf.math.reduce_std(y_for_filtering_batch[:, :20], axis=1)  # Берем первые 20 точек для лучшей оценки
                         initial_variance = tf.maximum(window_std ** 2, 0.05)  # Минимум 0.05 для стабильности
                         # Максимальная дисперсия зависит от уровня волатильности в данных
                         max_variance = 0.5 * tf.math.reduce_variance(y_for_filtering_batch) + 0.1  # Адаптивный максимум
                         initial_variance = tf.minimum(initial_variance, max_variance)
-                        
+
                         # ✅ ПРАВИЛЬНАЯ ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЙ
                         # Получаем числовое значение размера батча
                         batch_size_val = batch_size.numpy()  # ← ВАЖНО: преобразуем тензор в число
-                        
+
                         # Инициализируем состояние средним значением из первого шага для всех элементов батча
                         initial_state_val = tf.fill([batch_size_val], tf.reduce_mean(y_for_filtering_batch[:, 0]))
-                        
+
                         # ✅ СОЗДАЕМ ПЕРЕМЕННУЮ С ПРАВИЛЬНОЙ ФОРМОЙ
                         self._last_state = tf.Variable(
                             initial_state_val,
                             trainable=False,
                             name='last_state'
                         )
-                        
+
                         # Формируем начальную ковариацию правильной формы
                         initial_cov_value = tf.reshape(initial_variance, [batch_size_val, self.state_dim, self.state_dim])
                         self._last_P = tf.Variable(
@@ -4212,29 +4031,29 @@ class LSTMIMMUKF(tf.Module):
                             trainable=False,
                             name='last_P'
                         )
-                        
+
                         self._state_initialized.assign(False)
                         print(f"✅ Переменные состояния инициализированы: state={self._last_state.shape}, P={self._last_P.shape}")
                         print(f"   Начальная дисперсия ограничена: {tf.reduce_mean(initial_variance):.6f}")
-                        
+
                     elif tf.logical_not(tf.equal(tf.shape(self._last_state)[0], batch_size)):
                         # Сбрасываем состояние при изменении размера батча
                         print(f"⚠️ Размер состояния ({tf.shape(self._last_state)[0]}) не совпадает с размером батча ({batch_size}). Сброс состояния...")
-                        
+
                         # Получаем числовое значение размера батча
                         batch_size_val = batch_size.numpy()
-                        
+
                         # Создаем новое состояние
                         base_value = y_for_filtering_batch[:, 0]
                         initial_state_val = tf.reshape(base_value, [batch_size_val])
-                        
+
                         # Адаптивная инициализация с учетом волатильности данных
                         window_std = tf.math.reduce_std(y_for_filtering_batch[:, :20], axis=1)  # Берем первые 20 точек для лучшей оценки
                         initial_variance = tf.maximum(window_std ** 2, 0.05)  # Минимум 0.05 для стабильности
                         # Максимальная дисперсия зависит от уровня волатильности в данных
                         max_variance = 0.5 * tf.math.reduce_variance(y_for_filtering_batch) + 0.1  # Адаптивный максимум
                         initial_variance = tf.minimum(initial_variance, max_variance)
-                        
+
                         self._last_state = tf.Variable(
                             tf.reduce_mean(y_for_filtering_batch[:, 0]),  # Инициализация средним значением
                             shape=[batch_size],
@@ -4247,14 +4066,14 @@ class LSTMIMMUKF(tf.Module):
                             name='last_P'
                         )
                         self._state_initialized.assign(False)
-                    
+
                     # Определение начального состояния
                     should_use_saved_state = tf.logical_and(self._state_initialized, self._step_counter > 0)
                     state_size_match = tf.equal(tf.shape(self._last_state)[0], batch_size)
-                    
+
                     def use_saved_state():
                         return (tf.expand_dims(self._last_state, axis=1), self._last_P)
-                    
+
                     def initialize_from_data():
                         base_value = y_for_filtering_batch[:, 0]
                         initial_state = tf.reshape(base_value, [batch_size, self.state_dim])
@@ -4262,14 +4081,14 @@ class LSTMIMMUKF(tf.Module):
                         initial_variance = tf.maximum(window_std ** 2, 0.01)  # Минимум 0.01 для стабильности
                         initial_covariance = tf.reshape(initial_variance, [batch_size, self.state_dim, self.state_dim])
                         return (initial_state, initial_covariance)
-                    
+
                     # Используем tf.cond для графового режима
                     initial_state, initial_covariance = tf.cond(
                         tf.logical_and(should_use_saved_state, state_size_match),
                         use_saved_state,
                         initialize_from_data
                     )
-                    
+
                     # Шаг обучения
                     results = self.train_step(
                         X_batch, y_for_filtering_batch, y_target_batch,
@@ -4280,7 +4099,7 @@ class LSTMIMMUKF(tf.Module):
 
                     # ДОБАВЛЕНО: сбор инноваций
                     all_normalized_innov.append(batch_normalized_innov.numpy())
-                    
+
                     # Преобразуем тензоры в числовые значения для логирования
                     entropy_stats_np = {
                         'entropy_mean': entropy_stats['entropy_mean'].numpy(),
@@ -4288,33 +4107,33 @@ class LSTMIMMUKF(tf.Module):
                         'entropy_min': entropy_stats['entropy_min'].numpy(),
                         'entropy_max': entropy_stats['entropy_max'].numpy(),
                     }
-                                            
+
                     # ===== СОХРАНЕНИЕ СОСТОЯНИЯ ДЛЯ СЛЕДУЮЩЕГО ШАГА =====
                     self._last_state.assign(tf.squeeze(final_state, axis=1))      # [B, 1] → [B]
                     self._last_P.assign(final_covariance)                         # [B, state_dim, state_dim]
                     self._state_initialized.assign(True)
                     self._step_counter.assign_add(1)
-                    
+
                     # ДОПОЛНИТЕЛЬНО: принудительно применяем статистику истории для адаптации центров
                     if self._step_counter % 10 == 0:  # каждые 10 шагов
                         self.regime_selector.get_centers()  # вызов для обновления адаптивных центров
-                    
+
                     # Агрегация метрик
                     epoch_losses.append(loss)
                     epoch_mse_losses.append(metrics['mse_loss'])
                     epoch_coverage_ratios.append(metrics['coverage_ratio'])
                     epoch_volatility_levels.append(metrics['avg_volatility'])
                     train_metrics.append(metrics)  # Сохраняем все метрики для детального анализа
-                    
+
                     # Прогресс-бар
                     if batch_idx % 20 == 0:
                         progress = (batch_idx + 1) / len(train_ds) * 100
                         entropy_val = entropy_stats_np['entropy_mean']  # Используем предварительно вычисленную статистику
-                        
+
                         # Мягкие веса (вероятности режимов)
                         soft_weights = regime_info['soft_weights']  # [B, num_regimes]
                         soft_weights_mean = tf.reduce_mean(soft_weights, axis=0).numpy()
-                        
+
                         # Красивый вывод
                         regime_names = ['LOW', 'MID', 'HIGH']
                         regime_dist = ' | '.join([
@@ -4326,13 +4145,13 @@ class LSTMIMMUKF(tf.Module):
                               f"LSTM_Ent:{entropy_val:.1f} | "  # сократить название
                               f"Regimes(LOW/MID/HIGH): {soft_weights_mean[0]:.0%}/{soft_weights_mean[1]:.0%}/{soft_weights_mean[2]:.0%}", end='', flush=True)
                 print()  # Новая строка после прогресс-бара
-                
+
                 # Средние метрики по эпохе
                 train_loss_avg = tf.reduce_mean(epoch_losses)
                 train_mse_avg = tf.reduce_mean(epoch_mse_losses)
                 train_coverage_avg = tf.reduce_mean(tf.stack(epoch_coverage_ratios))
                 train_volatility_avg = tf.reduce_mean(tf.stack(epoch_volatility_levels))
-                
+
                 # ===== ВАЛИДАЦИЯ =====
                 print("\n📉 ВАЛИДАЦИЯ...")
                 val_losses = []
@@ -4342,18 +4161,18 @@ class LSTMIMMUKF(tf.Module):
                 val_metrics = []  # Список для хранения всех метрик по шагам валидации
                 for batch_idx, (X_val_batch, y_val_for_filtering_batch, y_val_target_batch) in enumerate(val_ds):
                     B_val = tf.shape(X_val_batch)[0]
-                    
+
                     # === ФУНКЦИИ ДЛЯ ВЫБОРА СОСТОЯНИЯ ДЛЯ ВАЛИДАЦИИ ===
                     def use_saved_state_for_val():
                         # Усредняем состояние для всех примеров валидации
                         avg_state = tf.reduce_mean(self._last_state)
                         initial_state = tf.fill([B_val, self.state_dim], avg_state)
-                        
+
                         # Для ковариации используем усредненную матрицу
                         avg_P = tf.reduce_mean(self._last_P, axis=0, keepdims=True)
                         initial_covariance = tf.tile(avg_P, [B_val, 1, 1])
                         return initial_state, initial_covariance
-                    
+
                     def initialize_val_from_data():
                         base_value = y_val_for_filtering_batch[:, 0]
                         initial_state = tf.reshape(base_value, [B_val, self.state_dim])
@@ -4361,14 +4180,14 @@ class LSTMIMMUKF(tf.Module):
                         initial_covariance = tf.reshape(initial_variance, [B_val, self.state_dim, self.state_dim])
                         initial_covariance = tf.maximum(initial_covariance, 1e-8)
                         return initial_state, initial_covariance
-                    
+
                     # Используем tf.cond для графового режима
                     initial_state_val, initial_covariance_val = tf.cond(
                         tf.logical_and(self._state_initialized, self._step_counter > 0),
                         use_saved_state_for_val,
                         initialize_val_from_data
                     )
-                    
+
                     # Шаг валидации
                     results_val = self.val_step(
                         X_val_batch, y_val_for_filtering_batch, y_val_target_batch,
@@ -4383,34 +4202,34 @@ class LSTMIMMUKF(tf.Module):
                         self.all_ci_uppers = []
                         self.all_actuals = []
                         self.all_target_coverages = []
-                    
+
                     self.all_forecasts.extend(forecast_val.numpy())
                     self.all_ci_lowers.extend(ci_lower_val.numpy())
                     self.all_ci_uppers.extend(ci_upper_val.numpy())
                     self.all_actuals.extend(y_val_target_batch.numpy())
                     self.all_target_coverages.extend(target_coverage_val.numpy())
-                    
+
                     # Агрегация метрик
                     val_losses.append(val_loss)
                     val_mse_losses.append(metrics_val['mse_loss'])
                     val_coverage_ratios.append(metrics_val['coverage_ratio'])
                     val_volatility_levels.append(metrics_val['avg_volatility'])
                     val_metrics.append(metrics_val)  # Сохраняем все метрики для детального анализа
-                    
+
                     # Прогресс-бар
                     if batch_idx % 10 == 0:
                         progress = (batch_idx + 1) / len(val_ds) * 100
                         print(f"\r   Batch {batch_idx+1}/{len(val_ds)} | "
                               f"Progress: {progress:.1f}% | val_loss={val_loss:.6f}", end='')
-                
+
                 print()  # Новая строка после прогресс-бара
-                
+
                 # Средние метрики валидации
                 val_loss_avg = tf.reduce_mean(val_losses)
                 val_mse_avg = tf.reduce_mean(val_mse_losses)
                 val_coverage_avg = tf.reduce_mean(tf.stack(val_coverage_ratios))
                 val_volatility_avg = tf.reduce_mean(tf.stack(val_volatility_levels))
-                
+
                 # ===== ОБРАБОТКА РЕЗУЛЬТАТОВ =====
                 epoch_end_time = datetime.datetime.now()
                 epoch_duration = (epoch_end_time - epoch_start_time).total_seconds()
@@ -4418,11 +4237,11 @@ class LSTMIMMUKF(tf.Module):
                 if all_normalized_innov:
                     all_normalized_innov = np.concatenate(all_normalized_innov, axis=0)
                     all_normalized_innov = np.abs(all_normalized_innov).flatten()  # делаем одномерным
-                
+
                 # Генерация и вывод детального отчета
                 epoch_report = self.generate_epoch_report(epoch, train_metrics, val_metrics, all_normalized_innov)
                 print(epoch_report)
-                
+
                 # ===== СОХРАНЕНИЕ ЛУЧШИХ ВЕСОВ И РАННЯЯ ОСТАНОВКА =====
                 current_val_loss = val_loss_avg.numpy()
                 if save_best_weights and not np.isnan(current_val_loss) and not np.isinf(current_val_loss):
@@ -4440,7 +4259,7 @@ class LSTMIMMUKF(tf.Module):
                         self.patience_counter += 1
                 else:
                     self.patience_counter += 1
-                
+
                 # Проверка условий ранней остановки
                 should_stop = False
                 if early_stopping and epoch >= min_epochs and patience is not None:
@@ -4450,26 +4269,26 @@ class LSTMIMMUKF(tf.Module):
                     elif current_val_loss > self.best_val_loss * 1.5 and epoch > min_epochs:
                         print(f"\n🛑 РАННЯЯ ОСТАНОВКА: резкое ухудшение качества (loss вырос более чем в 1.5 раза)")
                         should_stop = True
-                
+
                 # Сохранение истории
                 history['train_loss'].append(train_loss_avg.numpy())
                 history['val_loss'].append(val_loss_avg.numpy())
                 history['learning_rates'].append(current_lr.numpy())
                 history['patience_counter'] = self.patience_counter
-                
+
                 if should_stop:
                     if self.best_weights_dict is not None:
                         print(f"\n📥 Загружаем лучшие веса с эпохи {self.best_epoch + 1}")
                         self.load_best_weights()
                     break
-                
+
                 # Сохранение модели каждые 10 эпох
                 if (epoch + 1) % 10 == 0 and save_best_weights:
                     # Формируем полный путь с использованием save_dir
                     save_path = os.path.join(self.save_dir, f"model_epoch_{epoch+1}")
                     self.save(save_path)
                     print(f"\n💾 Промежуточная модель сохранена: {os.path.abspath(save_path)}")
-        
+
         except Exception as e:
             print(f"❌ КРИТИЧЕСКАЯ ОШИБКА в эпохе {epoch+1}: {str(e)}")
             import traceback
@@ -4479,85 +4298,85 @@ class LSTMIMMUKF(tf.Module):
                 print("🔄 Восстановление лучших весов")
                 self.load_best_weights()
             raise
-        
+
         # ===== ЗАВЕРШЕНИЕ ОБУЧЕНИЯ =====
         if self.best_weights_dict is not None:
             print(f"\n📥 Загружаем лучшие веса с эпохи {self.best_epoch + 1} (val_loss: {self.best_val_loss:.6f})")
             self.load_best_weights()
-        
+
         print(f"\n{'=' * 80}")
         print(f"🎉 ОБУЧЕНИЕ ЗАВЕРШЕНО!")
         print(f"{'=' * 80}")
         print(f"✅ Лучшая валидационная потеря: {self.best_val_loss:.6f} (эпоха {self.best_epoch + 1})")
         print(f"   Общая длительность: {datetime.datetime.now().strftime('%H:%M:%S')}")
         print("=" * 80)
-        
+
         return history
-        
+
     def evaluate_coverage(self, ci_lower, ci_upper, y_actual):
         covered = (y_actual >= ci_lower) & (y_actual <= ci_upper)
         coverage = np.mean(covered)
-        
+
         # ===== ДОБАВИТЬ: Диагностические проверки =====
         print(f"\n{'='*50}")
         print(f"📊 АНАЛИЗ ПОКРЫТИЯ ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ")
         print(f"{'='*50}")
-        
+
         if coverage >= 0.99:
             print(f"🚨 КРИТИЧНО: Покрытие = {coverage:.1%} (слишком высокое!)")
             print(f"   → Проверьте adaptive_ukf_filter (ограничение P)")
             print(f"   → Проверьте _student_t_update (ограничение tail_weight)")
         elif coverage < 0.70:
             print(f"⚠️ ПРЕДУПРЕЖДЕНИЕ: Покрытие = {coverage:.1%} (слишком низкое!)")
-        
+
         ci_width = np.mean(ci_upper - ci_lower)
         y_std = np.std(y_actual)
         width_ratio = ci_width / (y_std + 1e-8)
-        
+
         status_indicator = '⚠️' if width_ratio > 3.0 or width_ratio < 0.5 else '✅'
         print(f"{status_indicator} Отношение ширины ДИ к std: {width_ratio:.2f}")
         if width_ratio > 3.0:
             print(f"   → СЛИШКОМ ШИРОКИЕ интервалы (width_ratio > 3.0)")
         elif width_ratio < 0.5:
             print(f"   → СЛИШКОМ УЗКИЕ интервалы (width_ratio < 0.5)")
-        
+
         print(f"📈 Покрытие: {coverage:.2%}")
         print(f"   Количество попаданий: {np.sum(covered)} / {len(covered)}")
         status = '✅ ХОРОШО' if 0.80 <= coverage <= 0.95 else '❌ ПРОБЛЕМА'
         print(f"🎯 Качество калибровки: {status}")
         print(f"{'='*50}\n")
         # ===== КОНЕЦ =====
-        
+
         return {
             'coverage': coverage,
             'ci_width': ci_width,
             'width_ratio': width_ratio,
             'is_valid': (0.80 <= coverage <= 0.95)
         }
-        
+
     def generate_epoch_report(self, epoch, train_metrics, val_metrics, all_normalized_innov=None):
         """Генерация детального отчета по результатам эпохи"""
         report = f"\n{'='*80}\n🔍 ДЕТАЛЬНЫЙ ОТЧЕТ ПО ЭПОХЕ {epoch+1}\n{'='*80}\n"
-        
+
         # Средние метрики по обучению
         report += "\n📈 ОБУЧЕНИЕ:\n"
         report += f"   • Total Loss: {tf.reduce_mean([m['total_loss'] for m in train_metrics]).numpy():.6f}\n"
         report += f"   • MSE Loss: {tf.reduce_mean([m['mse_loss'] for m in train_metrics]).numpy():.6f}\n"
         report += f"   • Entropy Loss: {tf.reduce_mean([m['entropy_loss'] for m in train_metrics]).numpy():.6f}\n"
-        
+
         # 📊 ДОВЕРИТЕЛЬНЫЕ ИНТЕРВАЛЫ И ИХ КАЛИБРОВКА
         train_coverage = tf.reduce_mean([m['coverage_ratio'] for m in train_metrics]).numpy()
         train_target_coverage = tf.reduce_mean([m['target_coverage'] for m in train_metrics]).numpy()
         train_calibration_error = tf.reduce_mean([m['calibration_error'] for m in train_metrics]).numpy()
         train_ci_width_vs_stddev = tf.reduce_mean([m['ci_width_vs_stddev'] for m in train_metrics]).numpy()
-        
+
         report += "\n📊 КАЛИБРОВКА ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ:\n"
         report += f"   • Фактическое покрытие ДИ: {train_coverage:.2%}\n"
         report += f"   • Целевое покрытие ДИ: {train_target_coverage:.2%}\n"
         report += f"   • Ошибка калибровки: {train_calibration_error:.4f}\n"
         report += f"   • Средняя ширина ДИ / stddev: {train_ci_width_vs_stddev:.2f}x\n"
         report += f"   • Статус: {'✅ Оптимально' if train_calibration_error < 0.05 else '⚠️ Требует настройки'}\n"
-        
+
         # 🔍 ДИАГНОСТИКА ПОКРЫТИЯ ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ (НОВЫЙ БЛОК)
         if hasattr(self, 'all_ci_lowers') and hasattr(self, 'all_ci_uppers') and hasattr(self, 'all_actuals') and len(self.all_actuals) > 0:
             try:
@@ -4566,14 +4385,14 @@ class LSTMIMMUKF(tf.Module):
                     np.array(self.all_ci_uppers),
                     np.array(self.all_actuals)
                 )
-                
+
                 report += "\n🔍 ГЛУБОКАЯ ДИАГНОСТИКА ПОКРЫТИЯ ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ:\n"
                 report += f"   • Фактическое покрытие: {coverage_results['coverage']:.2%}\n"
                 report += f"   • Средняя ширина ДИ: {coverage_results['ci_width']:.4f}\n"
                 report += f"   • Отношение ширины к stddev: {coverage_results['width_ratio']:.2f}\n"
                 report += f"   • Количество попаданий: {int(coverage_results['coverage'] * len(self.all_actuals))}/{len(self.all_actuals)}\n"
                 report += f"   • Статус: {'✅ Хорошо' if coverage_results['is_valid'] else '❌ Требует настройки'}\n"
-                
+
                 # Очищаем сохраненные данные для следующей эпохи
                 self.all_forecasts = []
                 self.all_ci_lowers = []
@@ -4582,7 +4401,7 @@ class LSTMIMMUKF(tf.Module):
                 self.all_target_coverages = []
             except Exception as e:
                 report += f"\n⚠️ ОШИБКА ДИАГНОСТИКИ ПОКРЫТИЯ: {str(e)}\n"
-        
+
         # Режимы волатильности
         regime_weights = [
             tf.reduce_mean([m['regime_low_weight'] for m in train_metrics]).numpy(),
@@ -4590,40 +4409,40 @@ class LSTMIMMUKF(tf.Module):
             tf.reduce_mean([m['regime_high_weight'] for m in train_metrics]).numpy()
         ]
         avg_entropy = tf.reduce_mean([m['regime_entropy'] for m in train_metrics]).numpy()
-        
+
         report += "\n🧠 РЕЖИМЫ ВОЛАТИЛЬНОСТИ (TRAIN):\n"
         report += f"   • LOW: {regime_weights[0]:.1%}, MID: {regime_weights[1]:.1%}, HIGH: {regime_weights[2]:.1%}\n"
         report += f"   • Энтропия распределения: {avg_entropy:.3f} (чем ближе к 1.1, тем равномернее распределение)\n"
-        
+
         # Q/R мониторинг
         avg_qr = tf.reduce_mean([m['qr_ratio'] for m in train_metrics]).numpy()
         avg_q = tf.reduce_mean([m['q_value'] for m in train_metrics]).numpy()
         avg_r = tf.reduce_mean([m['r_value'] for m in train_metrics]).numpy()
-        
+
         qr_status = "доверяет измерениям (низкий)" if avg_qr < 0.5 else "доверяет прогнозу (высокий)"
-        
+
         report += "\n⚙️  Q/R МОНИТОРИНГ:\n"
         report += f"   • Q/R ratio: {avg_qr:.3f} (Q={avg_q:.6f}, R={avg_r:.6f})\n"
         report += f"   • Интерпретация: {qr_status}\n"
-        
+
         # Adaptive inflation
         avg_inflation = np.mean([m['avg_inflation'] for m in train_metrics])
         inflation_anomalies = np.mean([m['inflation_anomaly_ratio'] for m in train_metrics])
-        
+
         report += "\n💦 ADAPTIVE INFLATION:\n"
         report += f"   • Средний inflation factor: {avg_inflation:.3f}\n"
         report += f"   • Доля аномальных инфляций: {inflation_anomalies:.1%}\n"
-    
+
         if self.debug_mode:
             print("\n" + "="*70)
             print("DEBUG: ПРОВЕРКА АГРЕГАЦИИ МЕТРИК")
             print("="*70)
-            
+
             # Показать все значения
             for i, m in enumerate(train_metrics):
                 ratio = m['inflation_anomaly_ratio']
                 print(f"Batch {i}: inflation_anomaly_ratio = {ratio:.4f} ({ratio*100:.1f}%)")
-            
+
             # Показать результат
             inflation_ratios_array = np.array([m['inflation_anomaly_ratio'] for m in train_metrics])
             print(f"\nВсе значения: {inflation_ratios_array}")
@@ -4631,19 +4450,19 @@ class LSTMIMMUKF(tf.Module):
             print(f"Max: {inflation_ratios_array.max():.4f}")
             print(f"Mean: {inflation_ratios_array.mean():.4f} ({inflation_ratios_array.mean()*100:.1f}%)")
             print("="*70 + "\n")
-    
-        
+
+
         # Спектральная стабильность UKF
         min_eig = tf.reduce_mean([m['ukf_min_eigenvalue'] for m in train_metrics]).numpy()
         report += "\n🔬 UKF СПЕКТРАЛЬНАЯ СТАБИЛЬНОСТЬ:\n"
         report += f"   • Минимальное собственное значение: {min_eig:.6f}\n"
-    
+
         # ДОБАВЛЕНО: анализ распределения нормализованных инноваций
         if all_normalized_innov is not None and len(all_normalized_innov) > 0:
             # Удаляем бесконечности и NaN для корректной гистограммы
             valid_innov = all_normalized_innov[np.isfinite(all_normalized_innov)]
             valid_innov = valid_innov[valid_innov <= 10.0]  # ограничиваем максимум для читаемости
-            
+
             if len(valid_innov) > 0:
                 # Нормализация для плотности
                 normalized_innov_hist, bin_edges = np.histogram(
@@ -4652,16 +4471,16 @@ class LSTMIMMUKF(tf.Module):
                     range=(0, 10),
                     density=True
                 )
-                
+
                 report += f"\n📊 РАСПРЕДЕЛЕНИЕ НОРМАЛИЗОВАННЫХ ИННОВАЦИЙ (последние 10 шагов):"
                 report += f"\n   • Всего значений: {len(valid_innov)}"
                 report += f"\n   • Среднее: {np.mean(valid_innov):.3f}, Медиана: {np.median(valid_innov):.3f}"
                 report += f"\n   • 95-й перцентиль: {np.percentile(valid_innov, 95):.3f}"
-                
+
                 # Добавляем детальную гистограмму
                 for i in range(len(bin_edges)-1):
                     report += f"\n   [{bin_edges[i]:.1f}-{bin_edges[i+1]:.1f}]: {normalized_innov_hist[i]:.4f}"
-                
+
                 # Добавляем рекомендации по анализу распределения
                 if np.mean(valid_innov) > 3.0:
                     report += f"\n   ⚠️ ВЫСОКАЯ СРЕДНЯЯ ИННОВАЦИЯ: требуется анализ детектора аномалий"
@@ -4669,7 +4488,7 @@ class LSTMIMMUKF(tf.Module):
                     report += f"\n   ⚠️ ЧАСТЫЕ КРУПНЫЕ ОШИБКИ: требуется настройка параметров УКФ"
                 else:
                     report += f"\n   ✅ НОРМАЛЬНОЕ РАСПРЕДЕЛЕНИЕ ИННОВАЦИЙ"
-        
+
         # Валидация
         if val_metrics:
             report += "\n📉 ВАЛИДАЦИЯ:\n"
@@ -4677,34 +4496,34 @@ class LSTMIMMUKF(tf.Module):
             val_calibration_error = tf.reduce_mean([m['calibration_error'] for m in val_metrics]).numpy()
             report += f"   • Покрытие ДИ: {val_coverage:.2%}\n"
             report += f"   • Ошибка калибровки: {val_calibration_error:.4f}\n"
-        
+
         report += f"\n{'='*80}"
         return report
-    
+
     def inverse_transform_target(self, scaled_values: np.ndarray) -> np.ndarray:
         """
         ✅ Восстановление целевого значения из масштабированного пространства
-        
+
         Пример:
             scaled_pred = np.array([-0.15])  # Прогноз модели (масштабированный)
             original_pred = model.inverse_transform_target(scaled_pred)
             # Результат: [99.2] - восстановленное значение в исходном пространстве
         """
-        
+
         if self.feature_scalers is None or 'Y' not in self.feature_scalers:
             raise ValueError("Скейлеры не загружены!")
-        
+
         # Преобразуем в NumPy если нужно
         if isinstance(scaled_values, tf.Tensor):
             scaled_values = scaled_values.numpy()
-        
+
         # Преобразуем в 2D для sklearn [n_samples, 1]
         if scaled_values.ndim == 1:
             scaled_values = scaled_values.reshape(-1, 1)
-        
+
         # Обратное преобразование
         original_values = self.feature_scalers['Y'].inverse_transform(scaled_values)
-        
+
         return original_values.flatten()
 
     def save(self, path: str):
@@ -4713,15 +4532,15 @@ class LSTMIMMUKF(tf.Module):
         import pickle
         import io
         import joblib
-        
+
         # === 1. ВАЛИДАЦИЯ И ПОДГОТОВКА ПУТИ ===
         if not path:
             raise ValueError("Path не может быть пустым")
-        
+
         # Разделяем директорию и имя файла
         dir_path = os.path.dirname(path)
         filename = os.path.basename(path)
-        
+
         # Если директория не указана, используем save_dir
         if not dir_path:
             dir_path = self.save_dir if hasattr(self, 'save_dir') else './model_checkpoints'
@@ -4730,15 +4549,15 @@ class LSTMIMMUKF(tf.Module):
         else:
             os.makedirs(dir_path, exist_ok=True)
             full_path = path
-        
+
         print(f"📁 Полный путь для сохранения: {os.path.abspath(full_path)}")
-        
+
         # === 2. СОХРАНЕНИЕ LSTM МОДЕЛИ ===
         if self.model is not None:
             lstm_keras_path = f"{full_path}_lstm.keras"
             self.model.save(lstm_keras_path)
             print(f"✅ LSTM модель сохранена: {lstm_keras_path}")
-        
+
         # === 3. СОХРАНЕНИЕ МЕТАДАННЫХ ===
         metadata = {
             'version': '1.0.0',  # Версионирование для совместимости
@@ -4759,7 +4578,7 @@ class LSTMIMMUKF(tf.Module):
         with open(metadata_path, 'wb') as f:
             pickle.dump(metadata, f)
         print(f"✅ Метаданные сохранены: {metadata_path}")
-        
+
         # === 4. БЕЗОПАСНАЯ СЕРИАЛИЗАЦИЯ СОСТОЯНИЯ ===
         model_state = {
             # UKF состояние
@@ -4768,7 +4587,7 @@ class LSTMIMMUKF(tf.Module):
             '_state_initialized': self._state_initialized.numpy(),
             '_step_counter': self._step_counter.numpy(),
             '_last_anomaly_time': self._last_anomaly_time.numpy(),
-            
+
             # Обучаемые параметры для волатильности
             'base_q_logit': self.base_q_logit.numpy(),
             'base_r_logit': self.base_r_logit.numpy(),
@@ -4780,23 +4599,23 @@ class LSTMIMMUKF(tf.Module):
             'inflation_decay_rate': self.inflation_decay_rate.numpy(),
             'confidence_base': self.confidence_base.numpy(),
             'confidence_vol_sensitivity': self.confidence_vol_sensitivity.numpy(),
-            
+
             # Параметры трекинга лучших весов
             'best_val_loss': self.best_val_loss,
             'best_epoch': self.best_epoch,
             'patience_counter': self.patience_counter,
-            
+
             # Флаги
             'use_diff_ukf': self.use_diff_ukf,
             'num_modes': self.num_modes
         }
-        
+
         # === 5. БЕЗОПАСНАЯ СЕРИАЛИЗАЦИЯ СКЕЙЛЕРОВ ===
         def _safe_serialize_scaler(scaler):
             """Безопасная сериализация скейлера с резервными вариантами"""
             if scaler is None:
                 return None
-            
+
             try:
                 # Попытка стандартной сериализации через joblib (более надежно для sklearn)
                 buffer = io.BytesIO()
@@ -4808,7 +4627,7 @@ class LSTMIMMUKF(tf.Module):
                 }
             except Exception as e:
                 print(f"   ⚠️ Ошибка joblib для скейлера {scaler.__class__.__name__}: {str(e)}")
-                
+
                 # Резервный вариант: сохраняем только ключевые параметры
                 params = {}
                 for attr in ['scale_', 'mean_', 'var_', 'n_samples_seen_', 'center_', 'scale', 'quantile_range']:
@@ -4818,13 +4637,13 @@ class LSTMIMMUKF(tf.Module):
                             params[attr] = value.tolist()
                         else:
                             params[attr] = value
-                
+
                 return {
                     'type': 'manual',
                     'class_name': scaler.__class__.__name__,
                     'params': params
                 }
-        
+
         # Сохраняем скейлеры с безопасной сериализацией
         if hasattr(self, 'feature_scalers') and self.feature_scalers is not None:
             model_state['feature_scalers'] = {
@@ -4834,23 +4653,23 @@ class LSTMIMMUKF(tf.Module):
                 'Y': _safe_serialize_scaler(self.feature_scalers.get('Y'))
             }
             print("✅ Скейлеры признаков сохранены безопасно")
-        
+
         # Cохранение структуры групп признаков
         if hasattr(self, 'scale_groups') and self.scale_groups is not None:
             model_state['scale_groups'] = self.scale_groups
             print("✅ scale_groups сохранены")
-        
+
         # Сохраняем лучшие скейлеры отдельно
         if hasattr(self, 'best_scalers') and self.best_scalers is not None:
             model_state['best_scalers'] = self.best_scalers
             print("✅ Скейлеры лучших весов сохранены")
-        
+
         # === 6. СОХРАНЕНИЕ СОСТОЯНИЯ ===
         state_path = f"{full_path}_state.pkl"
         with open(state_path, 'wb') as f:
             pickle.dump(model_state, f)
         print(f"✅ Состояние модели сохранено: {state_path}")
-        
+
         # === 7. СОХРАНЕНИЕ СОСТОЯНИЯ ДИФФЕРЕНЦИРУЕМОГО UKF ===
         if self.use_diff_ukf and hasattr(self, 'diff_ukf_component'):
             ukf_state = {
@@ -4860,7 +4679,7 @@ class LSTMIMMUKF(tf.Module):
             with open(ukf_path, 'wb') as f:
                 pickle.dump(ukf_state, f)
             print(f"✅ Состояние дифференцируемого UKF сохранено: {ukf_path}")
-        
+
         # === 8. СОХРАНЕНИЕ ПАРАМЕТРОВ VOLATILITY REGIME SELECTOR ===
         if hasattr(self, 'regime_selector') and self.regime_selector is not None:
             selector_state = {
@@ -4870,48 +4689,48 @@ class LSTMIMMUKF(tf.Module):
             }
             if hasattr(self.regime_selector, 'center_logits'):
                 selector_state['center_logits'] = self.regime_selector.center_logits.numpy()
-            
+
             selector_path = f"{full_path}_regime_selector.pkl"
             with open(selector_path, 'wb') as f:
                 pickle.dump(selector_state, f)
             print(f"✅ Состояние Volatility Regime Selector сохранено: {selector_path}")
-        
+
         print("\n" + "=" * 60)
         print(f"✅ МОДЕЛЬ ПОЛНОСТЬЮ СОХРАНЕНА: {full_path}")
         print(f"   Версия: {metadata['version']}")
         print(f"   Лучшая эпоха: {self.best_epoch}, Val Loss: {self.best_val_loss:.6f}")
         print(f"   Режим UKF: {'DIFFERENTIABLE' if self.use_diff_ukf else 'STANDARD'}")
         print("=" * 60)
-    
+
     def load(self, path: str):
         """Загрузка модели с полным восстановлением состояния и параметров"""
         import os
         import pickle
         import joblib
         import io
-        
+
         print("\n" + "=" * 60)
         print("📥 ЗАГРУЗКА LSTM-UKF МОДЕЛИ С КОНТЕКСТНОЙ ВОЛАТИЛЬНОСТЬЮ")
         print("=" * 60)
-        
+
         # === 1. ЗАГРУЗКА МЕТАДАННЫХ ===
         metadata_path = f"{path}_metadata.pkl"
         if not os.path.exists(metadata_path):
             raise FileNotFoundError(f"❌ Метаданные не найдены: {metadata_path}")
-        
+
         with open(metadata_path, 'rb') as f:
             metadata = pickle.load(f)
-        
+
         print(f"✅ Версия модели: {metadata.get('version', 'N/A')}")
-        
+
         # === 2. ВОССТАНОВЛЕНИЕ БАЗОВЫХ ПАРАМЕТРОВ ===
         print("🔧 Восстановление базовых параметров из метаданных...")
-        
+
         # Сохраняем текущие GPU/CPU настройки
         current_device = self.device
         current_seed = 42
         gpu_available = self._gpu_available
-        
+
         # Обновляем параметры текущей модели вместо пересоздания
         for param_name, default_value in [
             ('seq_len', 72),
@@ -4930,25 +4749,25 @@ class LSTMIMMUKF(tf.Module):
             else:
                 setattr(self, param_name, default_value)
                 print(f"   ⚠️ {param_name} не найден в метаданных, установлено значение по умолчанию: {default_value}")
-        
+
         # Восстанавливаем feature_columns
         if 'feature_columns' in metadata:
             self.feature_columns = metadata['feature_columns']
         else:
             self.feature_columns = self._default_feature_columns()
-        
+
         print("✅ Параметры восстановлены из метаданных")
-        
+
         # === 3. ЗАГРУЗКА LSTM МОДЕЛИ ===
         keras_path = f"{path}_lstm.keras"
         if not os.path.exists(keras_path):
             raise FileNotFoundError(f"❌ Файл LSTM модели не найден: {keras_path}")
-        
+
         # Загрузка модели с поддержкой кастомных слоев
         custom_objects = {
             'MultiHeadAttention': tf.keras.layers.MultiHeadAttention
         }
-        
+
         # Загружаем модель ТОЛЬКО если она не существует
         if self.model is None:
             print("🔧 Загрузка LSTM модели...")
@@ -4956,23 +4775,23 @@ class LSTMIMMUKF(tf.Module):
             print(f"✅ LSTM модель загружена: {keras_path}")
         else:
             print("✅ LSTM модель уже инициализирована, пропускаем загрузку")
-        
+
         # === 4. ЗАГРУЗКА СОСТОЯНИЯ ===
         state_path = f"{path}_state.pkl"
         if not os.path.exists(state_path):
             raise FileNotFoundError(f"❌ Файл состояния не найден: {state_path}")
-        
+
         with open(state_path, 'rb') as f:
             model_state = pickle.load(f)
         print("✅ Состояние модели загружено")
-        
+
         # === 5. БЕЗОПАСНОЕ ВОССТАНОВЛЕНИЕ UKF СОСТОЯНИЯ ===
         def _safe_assign_variable(var, value, var_name):
             """Безопасное присваивание значения переменной с проверкой размерностей"""
             if value is None:
                 print(f"   ⚠️ {var_name}: значение None, пропускаем")
                 return
-            
+
             try:
                 # Проверяем совместимость размерностей
                 if hasattr(var, 'shape') and hasattr(value, 'shape'):
@@ -4991,27 +4810,27 @@ class LSTMIMMUKF(tf.Module):
                 print(f"   ✅ {var_name}: восстановлено")
             except Exception as e:
                 print(f"   ❌ {var_name}: ошибка при восстановлении - {str(e)}")
-        
+
         print("🔧 Восстановление UKF состояния...")
-        
+
         # Восстановление UKF состояния
         if '_last_state' in model_state and model_state['_last_state'] is not None:
             _safe_assign_variable(self._last_state, model_state['_last_state'], '_last_state')
-        
+
         if '_last_P' in model_state and model_state['_last_P'] is not None:
             _safe_assign_variable(self._last_P, model_state['_last_P'], '_last_P')
-        
+
         if '_state_initialized' in model_state:
             _safe_assign_variable(self._state_initialized, model_state['_state_initialized'], '_state_initialized')
-        
+
         if '_step_counter' in model_state:
             _safe_assign_variable(self._step_counter, model_state['_step_counter'], '_step_counter')
-        
+
         if '_last_anomaly_time' in model_state:
             _safe_assign_variable(self._last_anomaly_time, model_state['_last_anomaly_time'], '_last_anomaly_time')
-        
+
         print("✅ Состояние UKF восстановлено")
-        
+
         # === 6. ВОССТАНОВЛЕНИЕ ОБУЧАЕМЫХ ПАРАМЕТРОВ ===
         trainable_params = [
             ('base_q_logit', 'base_q_logit'),
@@ -5025,7 +4844,7 @@ class LSTMIMMUKF(tf.Module):
             ('confidence_base', 'confidence_base'),
             ('confidence_vol_sensitivity', 'confidence_vol_sensitivity')
         ]
-        
+
         print("🔧 Восстановление обучаемых параметров...")
         for param_name, state_key in trainable_params:
             if state_key in model_state and hasattr(self, param_name):
@@ -5037,7 +4856,7 @@ class LSTMIMMUKF(tf.Module):
                         print(f"   ✅ {param_name} восстановлен")
                     except Exception as e:
                         print(f"   ⚠️ {param_name}: ошибка при восстановлении - {str(e)}")
-        
+
         # === 7. ВОССТАНОВЛЕНИЕ ПАРАМЕТРОВ ТРЕКИНГА ЛУЧШИХ ВЕСОВ ===
         if 'best_val_loss' in model_state:
             self.best_val_loss = model_state['best_val_loss']
@@ -5045,15 +4864,15 @@ class LSTMIMMUKF(tf.Module):
             self.best_epoch = model_state['best_epoch']
         if 'patience_counter' in model_state:
             self.patience_counter = model_state['patience_counter']
-        
+
         # === 8. ВОССТАНОВЛЕНИЕ СКЕЙЛЕРОВ ===
         print("🔧 Восстановление скейлеров...")
-        
+
         def _safe_deserialize_scaler(scaler_data):
             """Безопасная десериализация скейлера"""
             if scaler_data is None:
                 return None
-            
+
             try:
                 if scaler_data.get('type') == 'joblib':
                     buffer = io.BytesIO(scaler_data['data'])
@@ -5061,7 +4880,7 @@ class LSTMIMMUKF(tf.Module):
                 elif scaler_data.get('type') == 'manual':
                     class_name = scaler_data.get('class_name', 'StandardScaler')
                     params = scaler_data.get('params', {})
-                    
+
                     # Создаем экземпляр в зависимости от класса
                     if class_name == 'RobustScaler':
                         from sklearn.preprocessing import RobustScaler
@@ -5079,7 +4898,7 @@ class LSTMIMMUKF(tf.Module):
                         print(f"   ⚠️ Неизвестный класс скейлера: {class_name}, создаем StandardScaler")
                         from sklearn.preprocessing import StandardScaler
                         scaler = StandardScaler()
-                    
+
                     # Устанавливаем параметры
                     for param_name, param_value in params.items():
                         if hasattr(scaler, param_name):
@@ -5087,16 +4906,16 @@ class LSTMIMMUKF(tf.Module):
                                 setattr(scaler, param_name, np.array(param_value))
                             else:
                                 setattr(scaler, param_name, param_value)
-                    
+
                     # Помечаем как fitted
                     if hasattr(scaler, 'n_features_in_'):
                         scaler.n_features_in_ = 1
-                    
+
                     return scaler
             except Exception as e:
                 print(f"   ⚠️ Ошибка при десериализации скейлера: {str(e)}")
                 return None
-        
+
         if 'feature_scalers' in model_state:
             self.feature_scalers = {
                 'robust': _safe_deserialize_scaler(model_state['feature_scalers'].get('robust')),
@@ -5105,7 +4924,7 @@ class LSTMIMMUKF(tf.Module):
                 'Y': _safe_deserialize_scaler(model_state['feature_scalers'].get('Y'))
             }
             print("✅ Скейлеры признаков восстановлены")
-        
+
         # === 9. ВОССТАНОВЛЕНИЕ СТРУКТУРЫ ГРУПП ПРИЗНАКОВ ===
         if 'scale_groups' in model_state:
             self.scale_groups = model_state['scale_groups']
@@ -5120,12 +4939,12 @@ class LSTMIMMUKF(tf.Module):
                 'none': ['asymmetry_ratio', 'percentile_pos_fisher', 'skew']
             }
             print("⚠️ scale_groups не найдены, восстановлены значения по умолчанию")
-        
+
         # === 10. ВОССТАНОВЛЕНИЕ ЛУЧШИХ СКЕЙЛЕРОВ ===
         if 'best_scalers' in model_state:
             self.best_scalers = model_state['best_scalers']
             print("✅ Лучшие скейлеры восстановлены")
-        
+
         # === 11. ЗАГРУЗКА СОСТОЯНИЯ ДИФФЕРЕНЦИРУЕМОГО UKF ===
         ukf_path = f"{path}_diff_ukf_state.pkl"
         if os.path.exists(ukf_path) and self.use_diff_ukf and hasattr(self, 'diff_ukf_component'):
@@ -5137,13 +4956,13 @@ class LSTMIMMUKF(tf.Module):
                     print("✅ Состояние дифференцируемого UKF восстановлено")
                 except Exception as e:
                     print(f"   ⚠️ Ошибка при восстановлении d_raw: {str(e)}")
-        
+
         # === 12. ЗАГРУЗКА СОСТОЯНИЯ VOLATILITY REGIME SELECTOR ===
         selector_path = f"{path}_regime_selector.pkl"
         if os.path.exists(selector_path) and hasattr(self, 'regime_selector') and self.regime_selector is not None:
             with open(selector_path, 'rb') as f:
                 selector_state = pickle.load(f)
-            
+
             if 'regime_scales' in selector_state:
                 self.regime_selector.regime_scales.assign(selector_state['regime_scales'])
             if 'temperature' in selector_state:
@@ -5152,9 +4971,9 @@ class LSTMIMMUKF(tf.Module):
                 self.regime_selector._vol_history.assign(selector_state['history'])
             if hasattr(self.regime_selector, 'center_logits') and 'center_logits' in selector_state:
                 self.regime_selector.center_logits.assign(selector_state['center_logits'])
-            
+
             print("✅ Состояние Volatility Regime Selector восстановлено")
-        
+
         # === 13. ИНИЦИАЛИЗАЦИЯ ОПТИМИЗАТОРА ===
         if self._optimizer is None:
             base_lr = 5e-4
@@ -5166,12 +4985,12 @@ class LSTMIMMUKF(tf.Module):
             else:
                 self._optimizer = base_optimizer
                 print("✅ Стандартный оптимизатор инициализирован")
-        
+
         # === 14. ВОССТАНОВЛЕНИЕ GPU/CPU НАСТРОЕК ===
         self._gpu_available = gpu_available
         self.device = current_device
         print(f"✅ Восстановлены GPU/CPU настройки. Устройство: {self.device}")
-        
+
         print("\n" + "=" * 60)
         print("✅ МОДЕЛЬ УСПЕШНО ЗАГРУЖЕНА")
         print(f"   Версия: {metadata.get('version', 'N/A')}")
@@ -5180,17 +4999,17 @@ class LSTMIMMUKF(tf.Module):
         print(f"   Состояние: {'Инициализировано' if self._state_initialized.numpy() else 'Не инициализировано'}")
         print(f"   Режим UKF: {'DIFFERENTIABLE' if self.use_diff_ukf else 'STANDARD'}")
         print("=" * 60)
-        
+
         return self
 
-    
+
     def get_current_weights(self):
         """Сохранение полного состояния модели в памяти для ранней остановки"""
         # Используем логику из save(), но без записи на диск
         state_dict = {
             # LSTM веса
             'lstm_weights': self.model.get_weights() if self.model else None,
-            
+
             # UKF состояние
             '_last_state': self._last_state.numpy(),
             '_last_P': self._last_P.numpy(),
@@ -5201,7 +5020,7 @@ class LSTMIMMUKF(tf.Module):
             # ✅ СОСТОЯНИЕ БУФЕРА АНОМАЛИЙ ДЛЯ СОХРАНЕНИЯ МЕЖДУ ЭПОХАМИ
             'anomaly_buffer': self.anomaly_buffer.value().numpy() if hasattr(self, 'anomaly_buffer') else None,
             'buffer_index': self.buffer_index.numpy() if hasattr(self, 'buffer_index') else None,
-            
+
             # Обучаемые параметры для волатильности
             'base_q_logit': self.base_q_logit.numpy(),
             'base_r_logit': self.base_r_logit.numpy(),
@@ -5213,21 +5032,21 @@ class LSTMIMMUKF(tf.Module):
             'inflation_decay_rate': self.inflation_decay_rate.numpy(),
             'confidence_base': self.confidence_base.numpy(),
             'confidence_vol_sensitivity': self.confidence_vol_sensitivity.numpy(),
-            
+
             # Скейлеры
             'feature_scalers': self.feature_scalers if hasattr(self, 'feature_scalers') else None,
             'best_scalers': self.best_scalers if hasattr(self, 'best_scalers') else None,
-            
+
             # Дифференцируемый UKF
             'diff_ukf_state': {},
             'best_val_loss': self.best_val_loss,
             'best_epoch': self.best_epoch
         }
-        
+
         # Добавляем состояние diff_ukf если используется
         if self.use_diff_ukf and hasattr(self, 'diff_ukf_component'):
             state_dict['diff_ukf_state']['d_raw'] = self.diff_ukf_component.spec_param.d_raw.numpy()
-        
+
         return state_dict
 
     def load_best_weights(self):
@@ -5235,12 +5054,12 @@ class LSTMIMMUKF(tf.Module):
         if self.best_weights_dict is None:
             print("⚠️  Нет лучших весов для загрузки")
             return False
-        
+
         try:
             print("\n" + "=" * 60)
             print("📥 ЗАГРУЗКА ЛУЧШИХ ВЕСОВ")
             print("=" * 60)
-            
+
             # === 1. БЕЗОПАСНОЕ ОПРЕДЕЛЕНИЕ РАЗМЕРА БАТЧА ===
             current_batch_size = None
             if hasattr(self, '_last_state') and self._last_state is not None:
@@ -5252,12 +5071,12 @@ class LSTMIMMUKF(tf.Module):
                         print(f"   ⚠️ _last_state не инициализирован, используем размер из сохраненных данных")
                 except Exception as e:
                     print(f"   ⚠️ Ошибка при получении размера _last_state: {str(e)}")
-            
+
             # Если не удалось определить размер, используем размер из сохраненных данных
             if current_batch_size is None and '_last_state' in self.best_weights_dict:
                 current_batch_size = self.best_weights_dict['_last_state'].shape[0]
                 print(f"   ✅ Размер батча определен из сохраненных данных: {current_batch_size}")
-            
+
             # === 2. ЗАГРУЗКА LSTM ВЕСОВ ===
             if self.best_weights_dict['lstm_weights'] is not None and self.model is not None:
                 try:
@@ -5265,22 +5084,22 @@ class LSTMIMMUKF(tf.Module):
                     print("✅ LSTM веса загружены")
                 except Exception as e:
                     print(f"   ⚠️ Ошибка при загрузке LSTM весов: {str(e)}")
-            
+
             # === 3. ВОССТАНОВЛЕНИЕ UKF СОСТОЯНИЯ С ПРОВЕРКОЙ РАЗМЕРНОСТЕЙ ===
             print("🔧 Восстановление UKF состояния...")
             ukf_vars = ['_last_state', '_last_P', '_state_initialized', '_step_counter', '_last_anomaly_time']
-            
+
             for attr in ukf_vars:
                 if attr in self.best_weights_dict and hasattr(self, attr):
                     saved_value = self.best_weights_dict[attr]
                     current_var = getattr(self, attr)
-                    
+
                     # Проверка размерностей для _last_state и _last_P
                     if attr in ['_last_state', '_last_P'] and current_batch_size is not None:
                         saved_size = saved_value.shape[0]
                         if saved_size != current_batch_size:
                             print(f"⚠️  Размерность {attr} изменилась при загрузке: {saved_size} → {current_batch_size}")
-                            
+
                             if attr == '_last_state':
                                 # Создаем новое состояние с правильным размером
                                 if saved_value.ndim > 1:
@@ -5294,15 +5113,15 @@ class LSTMIMMUKF(tf.Module):
                                 new_value = np.eye(self.state_dim, dtype=np.float32)[np.newaxis, :, :] * base_q.numpy()
                                 new_value = np.tile(new_value, [current_batch_size, 1, 1])
                                 print(f"   ✅ Создана новая ковариационная матрица размером {current_batch_size}×{self.state_dim}×{self.state_dim}")
-                            
+
                             saved_value = new_value
-                    
+
                     try:
                         current_var.assign(saved_value)
                         print(f"   ✅ {attr} восстановлен")
                     except Exception as e:
                         print(f"   ⚠️ Ошибка при восстановлении {attr}: {str(e)}")
-            
+
             # ✅ ВОССТАНОВЛЕНИЕ СОСТОЯНИЯ БУФЕРА АНОМАЛИЙ МЕЖДУ ЭПОХАМИ
             print("🔧 Восстановление состояния детектора аномалий...")
             if hasattr(self, 'anomaly_buffer') and 'anomaly_buffer' in self.best_weights_dict:
@@ -5313,13 +5132,13 @@ class LSTMIMMUKF(tf.Module):
                 if self.best_weights_dict['buffer_index'] is not None:
                     self.buffer_index.assign(self.best_weights_dict['buffer_index'])
                     print("   ✅ buffer_index восстановлен")
-            
+
             # ✅ ЭКСТРАПОЛЯЦИЯ СОСТОЯНИЯ МЕЖДУ ЭПОХАМИ
             print("🔮 Экстраполяция состояния для продолжения тренда...")
             if hasattr(self, 'anomaly_buffer') and hasattr(self, 'buffer_index'):
                 if not hasattr(self, 'anomaly_buffer_size'):
                     self.anomaly_buffer_size = 100  # Значение по умолчанию
-                    
+
                 buffer_threshold = tf.cast(self.anomaly_buffer_size * 0.8, tf.int32)
                 if self.buffer_index > buffer_threshold:
                     print("   📈 Буфер заполнен на 80%+, выполняем экстраполяцию тренда")
@@ -5341,7 +5160,7 @@ class LSTMIMMUKF(tf.Module):
                     print("   ⚠️ Буфер заполнен менее чем на 80%, пропускаем экстраполяцию")
             else:
                 print("   ⚠️ Нет данных для экстраполяции (отсутствуют anomaly_buffer или buffer_index)")
-            
+
             # === 4. ВОССТАНОВЛЕНИЕ ОБУЧАЕМЫХ ПАРАМЕТРОВ ===
             print("🔧 Восстановление обучаемых параметров...")
             trainable_params = [
@@ -5350,7 +5169,7 @@ class LSTMIMMUKF(tf.Module):
                 'inflation_base_factor', 'inflation_vol_sensitivity', 'inflation_decay_rate',
                 'confidence_base', 'confidence_vol_sensitivity'
             ]
-            
+
             for param in trainable_params:
                 if param in self.best_weights_dict and hasattr(self, param):
                     try:
@@ -5358,16 +5177,16 @@ class LSTMIMMUKF(tf.Module):
                         print(f"   ✅ {param} восстановлен")
                     except Exception as e:
                         print(f"   ⚠️ Ошибка при восстановлении {param}: {str(e)}")
-            
+
             # === 5. ВОССТАНОВЛЕНИЕ СКЕЙЛЕРОВ ===
             if 'feature_scalers' in self.best_weights_dict:
                 self.feature_scalers = self.best_weights_dict['feature_scalers']
                 print("✅ Скейлеры признаков восстановлены")
-            
+
             if 'best_scalers' in self.best_weights_dict:
                 self.best_scalers = self.best_weights_dict['best_scalers']
                 print("✅ Лучшие скейлеры восстановлены")
-            
+
             # === 6. ВОССТАНОВЛЕНИЕ ДИФФЕРЕНЦИРУЕМОГО UKF ===
             if self.use_diff_ukf and 'diff_ukf_state' in self.best_weights_dict:
                 if hasattr(self, 'diff_ukf_component') and 'd_raw' in self.best_weights_dict['diff_ukf_state']:
@@ -5376,7 +5195,7 @@ class LSTMIMMUKF(tf.Module):
                         print("✅ Состояние дифференцируемого UKF восстановлено")
                     except Exception as e:
                         print(f"   ⚠️ Ошибка при восстановлении d_raw: {str(e)}")
-            
+
             # === 7. ВОССТАНОВЛЕНИЕ VOLATILITY REGIME SELECTOR ===
             if hasattr(self, 'regime_selector') and 'regime_selector_state' in self.best_weights_dict:
                 selector_state = self.best_weights_dict['regime_selector_state']
@@ -5392,38 +5211,38 @@ class LSTMIMMUKF(tf.Module):
                     print("✅ Состояние Volatility Regime Selector восстановлено")
                 except Exception as e:
                     print(f"   ⚠️ Ошибка при восстановлении Regime Selector: {str(e)}")
-            
+
             # === 8. ОБНОВЛЕНИЕ МЕТРИК ===
             self.best_val_loss = self.best_weights_dict['best_val_loss']
             self.best_epoch = self.best_weights_dict['best_epoch']
-            
+
             print("\n" + "=" * 60)
             print(f"✅ ПОЛНОЕ СОСТОЯНИЕ ЗАГРУЖЕНО ИЗ ЛУЧШИХ ВЕСОВ")
             print(f"   Эпоха: {self.best_epoch}, Val Loss: {self.best_val_loss:.6f}")
             print(f"   Размер батча: {current_batch_size}")
             print("=" * 60)
-            
+
             return True
-        
+
         except Exception as e:
             print(f"❌ КРИТИЧЕСКАЯ ОШИБКА при загрузке лучших весов: {str(e)}")
             import traceback
             traceback.print_exc()
             return False
-    
+
     def reset_best_weights_tracking(self):
         """Сброс отслеживания лучших весов"""
         self.best_val_loss = float('inf')
         self.best_epoch = 0
         self.best_weights_dict = None
         self.patience_counter = 0
-        
+
         # === ДОБАВЛЕНО: СБРОС СОСТОЯНИЯ БУФЕРА АНОМАЛИЙ ===
         if hasattr(self, 'anomaly_buffer'):
             self.anomaly_buffer.assign(tf.zeros(self.anomaly_buffer.shape))
         if hasattr(self, 'buffer_index'):
             self.buffer_index.assign(0)
-        
+
         print("✓ Отслеживание лучших весов сброшено")
 
     def evaluate(self, df: pd.DataFrame, plot: bool = False, N: int = 300) -> Dict[str, float]:
@@ -5434,21 +5253,21 @@ class LSTMIMMUKF(tf.Module):
         print("\n" + "=" * 80)
         print("🔍 НАЧАЛО ОЦЕНКИ МОДЕЛИ С КОНТЕКСТНОЙ ВОЛАТИЛЬНОСТЬЮ")
         print("=" * 80)
-        
+
         # Проверка входных данных
         required_cols = ['Open', 'High', 'Low', 'Close']
         missing_cols = [col for col in required_cols if col not in df.columns]
         if missing_cols:
             raise ValueError(f"❌ Отсутствуют обязательные колонки в данных: {missing_cols}")
-        
+
         if len(df) < self.seq_len + 1:
             raise ValueError(f"❌ Недостаточно данных для оценки. Требуется минимум {self.seq_len + 1} точек, получено {len(df)}")
-        
+
         # Определение минимального окна для расчета признаков
         min_required_window = self.min_history_for_features
         if len(df) < min_required_window + 1:
             raise ValueError(f"❌ Недостаточно данных для оценки. Требуется минимум {min_required_window + 1} точек, получено {len(df)}")
-        
+
         # Инициализация массивов для хранения результатов
         timestamps = []
         true_values = []
@@ -5458,16 +5277,16 @@ class LSTMIMMUKF(tf.Module):
         volatility_levels = []
         inflation_factors = []
         confidences = []
-        
+
         # Цикл скользящего окна
         total_steps = len(df) - min_required_window - 1  # -1 для ground truth
         print(f"📊 Обработка {total_steps} окон для оценки...")
-        
+
         for i in tqdm(range(total_steps), desc="Оценка модели", unit="окно"):
             try:
                 # Извлекаем данные для текущего окна
                 window_data = df.iloc[i:i+min_required_window+1]
-                
+
                 # Прогнозирование
                 result = self.online_predict(
                     window_data,
@@ -5475,7 +5294,7 @@ class LSTMIMMUKF(tf.Module):
                     ground_truth_available=True,
                     reset_state=(i == 0)  # Сбрасываем состояние ТОЛЬКО для первого окна
                 )
-                
+
                 # Сохранение результатов
                 timestamps.append(result['timestamp'])
                 true_values.append(result['ground_truth_level'])
@@ -5485,7 +5304,7 @@ class LSTMIMMUKF(tf.Module):
                 volatility_levels.append(result['volatility_level'])
                 inflation_factors.append(result['inflation_factor'])
                 confidences.append(result['confidence'])
-                
+
             except Exception as e:
                 print(f"\n❌ КРИТИЧЕСКАЯ ОШИБКА на шаге {i}: {str(e)}")
                 print("🛑 ОЦЕНКА ПРЕРВАНА ИЗ-ЗА ОШИБКИ")
@@ -5494,9 +5313,9 @@ class LSTMIMMUKF(tf.Module):
                 else:
                     print(f"⚠️ Оценка выполнена только для {len(true_values)} из {total_steps} окон")
                     break
-        
+
         print(f"\n✅ Успешно обработано {len(true_values)} окон из {total_steps}")
-        
+
         # Преобразование списков в numpy массивы
         true_values = np.array(true_values)
         pred_values = np.array(pred_values)
@@ -5506,52 +5325,52 @@ class LSTMIMMUKF(tf.Module):
         inflation_factors = np.array(inflation_factors)
         confidences = np.array(confidences)
         timestamps = np.array(timestamps)
-        
+
         # Расчет ошибок
         errors = pred_values - true_values
-        
+
         # Расчет метрик
         metrics = {}
-        
+
         # Базовые метрики
         metrics['MAE'] = float(np.mean(np.abs(errors)))
         metrics['RMSE'] = float(np.sqrt(np.mean(errors ** 2)))
         metrics['MAPE'] = float(np.mean(np.abs(errors / (np.abs(true_values) + 1e-8))))
         metrics['MAPE_median'] = float(np.median(np.abs(errors / (np.abs(true_values) + 1e-8))))
-        
+
         # R2 коэффициент
         ss_res = np.sum(errors ** 2)
         ss_tot = np.sum((true_values - np.mean(true_values)) ** 2)
         metrics['R2'] = float(1 - ss_res / (ss_tot + 1e-8))
-        
+
         # Метрики доверительных интервалов (90% уровень доверия)
         valid_coverage = (true_values >= pi_lower) & (true_values <= pi_upper)
         metrics['CoverageRatio'] = float(np.mean(valid_coverage))
         metrics['CoverageCount'] = int(np.sum(valid_coverage))
         metrics['TotalCount'] = len(true_values)
-        
+
         # Ширина доверительных интервалов
         pi_widths = pi_upper - pi_lower
         metrics['MeanPIWidth'] = float(np.mean(pi_widths))
         metrics['MedianPIWidth'] = float(np.median(pi_widths))
-        
+
         # Статистика по волатильности
         metrics['VolatilityMean'] = float(np.nanmean(volatility_levels))
         metrics['VolatilityStd'] = float(np.nanstd(volatility_levels))
         metrics['VolatilityMax'] = float(np.nanmax(volatility_levels))
-        
+
         # Статистика по адаптивному inflation
         metrics['InflationMean'] = float(np.nanmean(inflation_factors))
         metrics['InflationStd'] = float(np.nanstd(inflation_factors))
         metrics['InflationMax'] = float(np.nanmax(inflation_factors))
-        
+
         # Статистика по уровню уверенности
         metrics['ConfidenceMean'] = float(np.nanmean(confidences))
         metrics['ConfidenceStd'] = float(np.nanstd(confidences))
-        
+
         # Дополнительные метрики
         metrics['CalibrationError'] = abs(metrics['CoverageRatio'] - 0.90)  # для 90% доверительного интервала
-        
+
         # Вывод метрик
         print("\n" + "=" * 60)
         print("📊 РЕЗУЛЬТАТЫ ОЦЕНКИ МОДЕЛИ С КОНТЕКСТНОЙ ВОЛАТИЛЬНОСТЬЮ")
@@ -5570,7 +5389,7 @@ class LSTMIMMUKF(tf.Module):
         print(f"   💦 Максимальный adaptive inflation: {metrics['InflationMax']:.4f}")
         print(f"   ⚖️ Ошибка калибровки: {metrics['CalibrationError']:.4f}")
         print("=" * 60)
-        
+
         # Отрисовка графиков при необходимости
         if plot:
             print("\n📈 ПОСТРОЕНИЕ ГРАФИКОВ РЕЗУЛЬТАТОВ ОЦЕНКИ...")
@@ -5588,7 +5407,7 @@ class LSTMIMMUKF(tf.Module):
                 N=min(N, len(true_values)),
                 figsize=(14, 12)
             )
-        
+
         return metrics
 
     @tf.function(jit_compile=False)
@@ -5602,14 +5421,14 @@ class LSTMIMMUKF(tf.Module):
     ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, Dict[str, tf.Tensor]]:
         """
         Онлайн предсказание на новом временном шаге с сохранением состояния фильтра
-        
+
         Аргументы:
         X_new: [B, n_features] - новые признаки для текущего шага
         last_state: [B, 1] - последнее состояние фильтра
         last_covariance: [B, 1, 1] - последняя ковариационная матрица
         last_inflation_state: Dict[str, tf.Tensor] - состояние инфляции от предыдущего шага
         last_volatility: [B] - последняя волатильность
-        
+
         Возвращает:
         forecast: [B] - прогноз на следующий шаг
         std_dev: [B] - стандартное отклонение прогноза
@@ -5618,17 +5437,17 @@ class LSTMIMMUKF(tf.Module):
         new_inflation_state: Dict[str, tf.Tensor] - обновленное состояние инфляции
         """
         B = tf.shape(X_new)[0]
-        
+
         # === 1. ПОЛУЧЕНИЕ LSTM ЭМБЕДДИНГОВ ===
         # Используем текущие признаки для получения эмбеддингов
         lstm_embeddings = self.get_embeddings(X_new)  # [B, embedding_dim]
-        
+
         # === 2. ГЕНЕРАЦИЯ АДАПТИВНЫХ ПАРАМЕТРОВ UKF ===
         # Получаем все параметры от LSTM для текущего шага
         vol_context_t, ukf_params_t, inflation_config_t, student_t_config_t = self.process_lstm_output(
             lstm_embeddings, is_training=False
         )
-        
+
         # ✅ ЯВНОЕ ИЗВЛЕЧЕНИЕ КОНКРЕТНЫХ ПАРАМЕТРОВ ДЛЯ ТЕКУЩЕГО ШАГА
         # --- Параметры из vol_context ---
         leverage_strength_t = vol_context_t['leverage_effect_strength']  # [B, 1]
@@ -5638,7 +5457,7 @@ class LSTMIMMUKF(tf.Module):
         entropy_weight_t = vol_context_t['entropy_weight']  # [B, 1]
         accel_weight_t = vol_context_t['accel_weight']  # [B, 1]
         memory_factor_t = vol_context_t['memory_factor']  # [B, 1]
-        
+
         # --- Параметры из ukf_params ---
         q_base_t = ukf_params_t['q_base']  # [B, 1]
         q_sensitivity_t = ukf_params_t['q_sensitivity']  # [B, 1]
@@ -5652,7 +5471,7 @@ class LSTMIMMUKF(tf.Module):
         alpha_sensitivity_t = ukf_params_t['alpha_sensitivity']  # [B, 1]
         kappa_base_t = ukf_params_t['kappa_base']  # [B, 1]
         kappa_sensitivity_t = ukf_params_t['kappa_sensitivity']  # [B, 1]
-        
+
         # --- Параметры из inflation_config ---
         base_inflation_t = inflation_config_t['base_inflation']  # [B, 1]
         vol_sensitivity_t = inflation_config_t['vol_sensitivity']  # [B, 1]
@@ -5663,29 +5482,29 @@ class LSTMIMMUKF(tf.Module):
         asymmetry_factor_t = inflation_config_t['asymmetry_factor']  # [B, 1]
         memory_decay_t = inflation_config_t['memory_decay']  # [B, 1]
         inflation_limit_t = inflation_config_t['inflation_limit']  # [B, 1]
-        
+
         # --- Параметры из student_t_config ---
         dof_base_t = student_t_config_t['dof_base']  # [B, 1]
         dof_sensitivity_t = student_t_config_t['dof_sensitivity']  # [B, 1]
         asymmetry_pos_t = student_t_config_t['asymmetry_pos']  # [B, 1]
         asymmetry_neg_t = student_t_config_t['asymmetry_neg']  # [B, 1]
-        
+
         # === 3. ОБНОВЛЕНИЕ ВОЛАТИЛЬНОСТИ ===
         # Извлекаем необходимые признаки для расчета волатильности
         vol_short_idx = self.feature_to_idx.get('log_vol_short', 2)
         rel_vol_short_long_idx = self.feature_to_idx.get('rel_vol_short_long', 18)
         vol_accel_idx = self.feature_to_idx.get('vol_accel_rel', 19)
         rel_entropy_idx = self.feature_to_idx.get('rel_entropy', 20)
-        
+
         log_vol_short = tf.gather(X_new, vol_short_idx, axis=1)  # [B]
         rel_vol_short_long = tf.gather(X_new, rel_vol_short_long_idx, axis=1)  # [B]
         vol_accel = tf.gather(X_new, vol_accel_idx, axis=1)  # [B]
         rel_entropy = tf.gather(X_new, rel_entropy_idx, axis=1)  # [B]
-        
+
         # Оценки волатильности из разных источников
         vol_medium_est = tf.abs(tf.gather(X_new, self.feature_to_idx.get('yz', 8), axis=1))  # [B]
         vol_long_est = tf.abs(tf.gather(X_new, self.feature_to_idx.get('ht', 12), axis=1))  # [B]
-        
+
         # Компоненты волатильности
         vol_components = tf.stack([
             sensitivity_short_t[:, 0] * rel_vol_short_long,
@@ -5694,18 +5513,18 @@ class LSTMIMMUKF(tf.Module):
             entropy_weight_t[:, 0] * tf.abs(rel_entropy),
             accel_weight_t[:, 0] * tf.abs(vol_accel)
         ], axis=1)  # [B, 5]
-        
+
         raw_volatility = tf.reduce_mean(vol_components, axis=1)  # [B]
-        
+
         # Экспоненциальное сглаживание
         memory_factor_val = memory_factor_t[:, 0]  # [B]
         new_volatility = memory_factor_val * last_volatility + (1.0 - memory_factor_val) * raw_volatility  # [B]
         volatility_level = tf.nn.sigmoid(new_volatility)  # [B]
-        
+
         # === 4. ПОЛУЧЕНИЕ АДАПТИВНЫХ Q и R ===
         # Используем нулевую предыдущую инновацию для первого шага
         innov_prev = tf.zeros([B], dtype=tf.float32)
-        
+
         Q_t, R_t, _ = self.compute_adaptive_Q_R_with_leverage(
             innov_prev,
             leverage_strength_t,
@@ -5713,17 +5532,17 @@ class LSTMIMMUKF(tf.Module):
             r_base_t, r_sensitivity_t, r_floor_t,
             new_volatility
         )
-        
+
         # === 5. АДАПТИВНЫЕ ПАРАМЕТРЫ UKF ===
         relax_factor = relax_base_t * (1.0 + relax_sensitivity_t * volatility_level)  # [B, 1]
         alpha_t = alpha_base_t * (1.0 + alpha_sensitivity_t * volatility_level)  # [B, 1]
         kappa_t = kappa_base_t * (1.0 + kappa_sensitivity_t * volatility_level)  # [B, 1]
-        
+
         # ✅ ПРЕОБРАЗОВАНИЕ В ПРАВИЛЬНУЮ ФОРМУ
         relax_factor = tf.reshape(relax_factor, [B])  # [B]
         alpha_t = tf.reshape(alpha_t, [B])  # [B]
         kappa_t = tf.reshape(kappa_t, [B])  # [B]
-        
+
         # === 6. UKF ПРЕДСКАЗАНИЕ (PREDICT) ===
         x_pred, P_pred = self.diff_ukf_component.predict(
             last_state,
@@ -5732,18 +5551,18 @@ class LSTMIMMUKF(tf.Module):
             alpha_t=alpha_t,
             kappa_t=kappa_t
         )
-        
+
         # === 7. АДАПТИВНАЯ ИНФЛЯЦИЯ ===
         # Извлекаем состояние инфляции из предыдущего шага
         inf_factor_prev = tf.reshape(last_inflation_state['factor'], [B, 1])  # [B, 1]
         rem_steps_prev = tf.cast(last_inflation_state['remaining_steps'], tf.int32)  # [B]
         last_anom_time_prev = tf.cast(last_inflation_state['last_anomaly_time'], tf.int32)  # [B]
         high_infl_steps_prev = tf.cast(last_inflation_state.get('high_inflation_steps', tf.zeros([B], dtype=tf.int32)), tf.int32)  # [B]
-        
+
         # Резервная коррекция для пропущенных скачков
         # Создаем "предыдущее" состояние для сравнения
         x_pred_prev = last_state  # [B, 1]
-        
+
         fallback_multiplier, is_missed_jump_flag = self._fallback_inflation_correction(
             tf.constant(0, dtype=tf.int32),  # t=0 для online режима
             x_pred_prev,           # [B, 1] - предыдущее состояние
@@ -5761,7 +5580,7 @@ class LSTMIMMUKF(tf.Module):
             inflation_limit_t,     # [B, 1]
             new_volatility         # [B]
         )
-        
+
         # Вычисляем базовый фактор инфляции
         base_factor = base_inflation_t * (1.0 + vol_sensitivity_t * volatility_level)  # [B, 1]
         asymmetry_factor = tf.where(
@@ -5769,9 +5588,9 @@ class LSTMIMMUKF(tf.Module):
             asymmetry_factor_t,
             1.0 / (asymmetry_factor_t + 1e-8)
         )
-        
+
         new_factor = base_factor * asymmetry_factor * fallback_multiplier  # [B, 1]
-        
+
         # Применяем ограничения на инфляцию
         inflation_threshold_val = inflation_limit_t * 0.8  # [B, 1]
         inflation_factor_flat, updated_high_inflation_steps = self._apply_inflation_limits(
@@ -5780,18 +5599,18 @@ class LSTMIMMUKF(tf.Module):
             max_threshold=tf.squeeze(inflation_threshold_val, axis=-1),  # [B]
             max_steps=5
         )
-        
+
         # Формируем правильную размерность для инфляции
         inflation_factor_for_R = tf.reshape(inflation_factor_flat, [B, 1, 1])  # [B, 1, 1]
-        
+
         # === 8. UKF ОБНОВЛЕНИЕ (UPDATE) ===
         # Вместо использования фильтрованного состояния, используем UKF prediction
         # Это лучше отражает динамику процесса для следующего шага
-        
+
         # Адаптивные параметры Student-t
         dof_adaptive = dof_base_t - dof_sensitivity_t * tf.nn.relu((new_volatility - tf.reduce_mean(new_volatility)) / (tf.math.reduce_std(new_volatility) + 1e-6))  # [B, 1]
         dof_adaptive = tf.clip_by_value(dof_adaptive, 3.0, 11.0)  # [B, 1]
-        
+
         # Обновление состояния с использованием ПРЕДСКАЗАННОГО значения как pseudo-observation
         x_upd, P_upd, innov, K = self._student_t_update(
             x_pred, P_pred,
@@ -5802,7 +5621,7 @@ class LSTMIMMUKF(tf.Module):
             asymmetry_pos_t,  # [B, 1]
             asymmetry_neg_t   # [B, 1]
         )
-        
+
         # === 9. ЯВНЫЙ PREDICT НА СЛЕДУЮЩИЙ ШАГ ===
         forecast, std_dev = self._explicit_predict_next_step(
             x_upd,                 # [B, 1]
@@ -5814,7 +5633,7 @@ class LSTMIMMUKF(tf.Module):
             alpha_base_t, alpha_sensitivity_t,
             kappa_base_t, kappa_sensitivity_t
         )
-        
+
         # === 10. ФОРМИРОВАНИЕ НОВОГО СОСТОЯНИЯ ИНФЛЯЦИИ ===
         new_inflation_state = {
             'factor': tf.reshape(inflation_factor_flat, [B]),  # [B]
@@ -5844,7 +5663,7 @@ class LSTMIMMUKF(tf.Module):
             ax.set_xticklabels(tick_labels, fontsize=9)
             ax.set_xlabel('Индекс наблюдения', fontsize=10)
         ax.tick_params(axis='both', which='major', labelsize=9)
-    
+
     def _plot_evaluation_results(
         self,
         true_vals: np.ndarray,
@@ -5866,11 +5685,11 @@ class LSTMIMMUKF(tf.Module):
         # Автоматическое определение типа индекса
         sample_idx = timestamps[0] if len(timestamps) > 0 else None
         is_time_index = isinstance(sample_idx, (pd.Timestamp, datetime.datetime, np.datetime64, datetime.date))
-        
+
         # Подготовка данных для отображения последних N точек
         start_idx = max(0, len(true_vals) - N)
         plot_indices = np.arange(len(timestamps))[start_idx:]  # Всегда числовые индексы для оси X
-        
+
         # Данные для графиков
         true_plot = true_vals[start_idx:]
         pred_plot = pred_vals[start_idx:]
@@ -5880,18 +5699,18 @@ class LSTMIMMUKF(tf.Module):
         inflation_plot = inflation_vals[start_idx:]
         confidence_plot = confidence_vals[start_idx:]
         errors_plot = errors[start_idx:]
-        
+
         # Создание фигуры и сетки графиков
         fig = plt.figure(figsize=figsize)
         gs = fig.add_gridspec(4, 2, hspace=0.35, wspace=0.2)
-        
+
         # 1. Основной график: Истинные значения и прогнозы
         ax1 = fig.add_subplot(gs[0, :])
         ax1.plot(plot_indices, true_plot, 'b-', linewidth=2.5, label='Истинное значение', alpha=0.9)
         ax1.plot(plot_indices, pred_plot, 'r--', linewidth=2.5, label='Прогноз', alpha=0.9)
         ax1.fill_between(plot_indices, pi_lower_plot, pi_upper_plot, color='gold', alpha=0.4,
                         label=f"90% доверительный интервал (ширина: {metrics['MeanPIWidth']:.4f})")
-        
+
         # Настройка оси X для основного графика
         if is_time_index:
             # Получаем оригинальные временные метки для подписей
@@ -5909,12 +5728,12 @@ class LSTMIMMUKF(tf.Module):
             ax1.set_xticks(plot_indices[tick_positions])
             ax1.set_xticklabels(tick_labels)
             ax1.set_xlabel('Индекс наблюдения', fontsize=12)
-        
+
         ax1.set_ylabel('Значение', fontsize=12)
         ax1.set_title('Прогноз vs Истинные значения с доверительным интервалом', fontsize=14, fontweight='bold')
         ax1.legend(loc='best', fontsize=10)
         ax1.grid(True, linestyle='--', alpha=0.7)
-        
+
         # 2. График ошибок
         ax2 = fig.add_subplot(gs[1, 0])
         ax2.plot(plot_indices, errors_plot, 'g-', linewidth=1.5, alpha=0.9)
@@ -5923,7 +5742,7 @@ class LSTMIMMUKF(tf.Module):
                         where=(errors_plot > 0), color='red', alpha=0.3, label='Завышенный прогноз')
         ax2.fill_between(plot_indices, np.zeros_like(errors_plot), errors_plot,
                         where=(errors_plot < 0), color='blue', alpha=0.3, label='Заниженный прогноз')
-        
+
         # Настройка оси X для графика ошибок
         self._setup_xaxis(ax2, plot_indices, timestamps[start_idx:], is_time_index)
         ax2.set_ylabel('Ошибка прогноза', fontsize=12)
@@ -5931,17 +5750,17 @@ class LSTMIMMUKF(tf.Module):
                      fontsize=13, fontweight='bold')
         ax2.legend(loc='best', fontsize=9)
         ax2.grid(True, linestyle='--', alpha=0.7)
-        
+
         # 3. График уровня волатильности
         ax3 = fig.add_subplot(gs[1, 1])
         ax3.plot(plot_indices, volatility_plot, 'b-', linewidth=2, label='Уровень волатильности', alpha=0.9)
-        
+
         # Горизонтальные линии для зон волатильности
         ax3.axhline(y=0.3, color='g', linestyle='--', alpha=0.5, label='Низкая волатильность (<0.3)')
         ax3.axhline(y=0.7, color='y', linestyle='--', alpha=0.5, label='Высокая волатильность (>0.7)')
         ax3.fill_between(plot_indices, 0, 0.3, color='green', alpha=0.15)
         ax3.fill_between(plot_indices, 0.7, 1.0, color='yellow', alpha=0.15)
-        
+
         # Настройка оси X
         self._setup_xaxis(ax3, plot_indices, timestamps[start_idx:], is_time_index)
         ax3.set_ylim(0, 1.05)
@@ -5950,12 +5769,12 @@ class LSTMIMMUKF(tf.Module):
                      fontsize=13, fontweight='bold')
         ax3.legend(loc='best', fontsize=9)
         ax3.grid(True, linestyle='--', alpha=0.7)
-        
+
         # 4. График adaptive inflation
         ax4 = fig.add_subplot(gs[2, 0])
         ax4.plot(plot_indices, inflation_plot, 'm-', linewidth=2, label='Adaptive inflation factor', alpha=0.9)
         ax4.axhline(y=1.0, color='r', linestyle='--', alpha=0.7, label='Базовый уровень (1.0)')
-        
+
         # Настройка оси X
         self._setup_xaxis(ax4, plot_indices, timestamps[start_idx:], is_time_index)
         ax4.set_ylim(0.95, max(1.5, np.max(inflation_plot) * 1.1))
@@ -5964,7 +5783,7 @@ class LSTMIMMUKF(tf.Module):
                      fontsize=13, fontweight='bold')
         ax4.legend(loc='best', fontsize=9)
         ax4.grid(True, linestyle='--', alpha=0.7)
-        
+
         # 5. График покрытия доверительного интервала
         ax5 = fig.add_subplot(gs[2, 1])
         coverage = (true_vals[start_idx:] >= pi_lower_plot) & (true_vals[start_idx:] <= pi_upper_plot)
@@ -5973,7 +5792,7 @@ class LSTMIMMUKF(tf.Module):
         ax5.axhline(y=0.9, color='r', linestyle='--', alpha=0.7, label='Целевое покрытие (90%)')
         ax5.axhline(y=metrics['CoverageRatio'], color='g', linestyle='-', alpha=0.7,
                    label=f'Фактическое покрытие ({metrics["CoverageRatio"]:.2%})')
-        
+
         # Настройка оси X
         self._setup_xaxis(ax5, plot_indices, timestamps[start_idx:], is_time_index)
         ax5.set_ylim(0, 1.05)
@@ -5982,13 +5801,13 @@ class LSTMIMMUKF(tf.Module):
                      fontsize=13, fontweight='bold')
         ax5.legend(loc='best', fontsize=9)
         ax5.grid(True, linestyle='--', alpha=0.7)
-        
+
         # 6. График уровня уверенности
         ax6 = fig.add_subplot(gs[3, 0])
         ax6.plot(plot_indices, confidence_plot, 'orange', linewidth=2, label='Уровень уверенности', alpha=0.9)
         ax6.axhline(y=np.mean(confidence_plot), color='b', linestyle='--', alpha=0.7,
                    label=f'Среднее: {np.mean(confidence_plot):.4f}')
-        
+
         # Настройка оси X
         self._setup_xaxis(ax6, plot_indices, timestamps[start_idx:], is_time_index)
         ax6.set_ylim(0, 1.05)
@@ -5997,11 +5816,11 @@ class LSTMIMMUKF(tf.Module):
                      fontsize=13, fontweight='bold')
         ax6.legend(loc='best', fontsize=9)
         ax6.grid(True, linestyle='--', alpha=0.7)
-        
+
         # 7. Текстовая информация с метриками
         ax7 = fig.add_subplot(gs[3, 1])
         ax7.axis('off')
-        
+
         # Форматирование метрик для отображения
         metrics_text = (
             f"ОСНОВНЫЕ МЕТРИКИ МОДЕЛИ (последние {N} точек):\n\n"
@@ -6023,16 +5842,16 @@ class LSTMIMMUKF(tf.Module):
                 bbox=dict(facecolor='lightyellow', alpha=0.8, edgecolor='gray'),
                 verticalalignment='top', horizontalalignment='left',
                 transform=ax7.transAxes)
-        
+
         # Общий заголовок
         plt.suptitle(f'Результаты оценки модели LSTM-UKF с контекстной волатильностью | '
                     f'{datetime.datetime.now().strftime("%Y-%m-%d %H:%M")}',
                     fontsize=16, fontweight='bold', y=0.98)
-        
+
         # Сохранение графика
         timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f'evaluation_results_{timestamp_str}.png'
         plt.savefig(filename, dpi=300, bbox_inches='tight')
         print(f"\nГрафик результатов оценки сохранен: {filename}")
         plt.show()
-    
+        
