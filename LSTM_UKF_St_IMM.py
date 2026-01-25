@@ -130,11 +130,15 @@ class VolatilityRegimeSelector(tf.Module):
 
         # Learnable параметры для каждого режима
         # regime_scales[i] = масштаб CI для режима i
+        # ИСПРАВЛЕНО: Целевые значения для режимов волатильности
+        # LOW: 1.2 × (-ln(1-0.85)) = 1.2 × 1.895 = 2.27
+        # MID: 1.8 × 1.895 = 3.41
+        # HIGH: 2.5 × 1.895 = 4.74
         self.regime_scales = tf.Variable(
-            tf.constant([0.75, 1.0, 1.45], dtype=tf.float32),  # LOW, MID, HIGH - более выраженные различия
+            tf.constant([2.27, 3.41, 4.74], dtype=tf.float32),  # LOW, MID, HIGH
             trainable=True,
             name='regime_scales',
-            constraint=lambda x: tf.clip_by_value(x, 0.5, 2.0)
+            constraint=lambda x: tf.clip_by_value(x, 1.0, 6.0)  # Расширенный диапазон для адаптации
         )
         # Learnable центроиды для мягкого распределения
         if self.learnable_centers:
@@ -151,12 +155,12 @@ class VolatilityRegimeSelector(tf.Module):
         else:
             self.centers = tf.constant([0.1, 0.3, 0.6], dtype=tf.float32)
         # Температура для softmax (управляет "остротой" распределения)
-        # Начальное значение 0.7 для более резкого начального распределения
+        # ИСПРАВЛЕНО: Начальное значение 0.4 для более резкого начального распределения
         self.temperature = tf.Variable(
-            0.7,
+            0.4,
             trainable=True,
             name='regime_temperature',
-            constraint=lambda x: tf.clip_by_value(x, 0.1, 2.0)  # сужаем диапазон до 2.0
+            constraint=lambda x: tf.clip_by_value(x, 0.1, 1.5)  # сужаем диапазон
         )
 
         # История волатильности для расчета статистики
@@ -875,6 +879,15 @@ class LSTMIMMUKF(tf.Module):
                 dtype=tf.float32,
                 constraint=lambda x: tf.clip_by_value(x, 0.0, 0.3),
                 name='confidence_vol_sensitivity'
+            )
+            
+            # === ДОБАВЛЕНО: ПАРАМЕТР ДЛЯ МАКСИМАЛЬНОЙ ШИРИНЫ ДОВЕРИТЕЛЬНОГО ИНТЕРВАЛА ===
+            self.max_width_factor_logit = tf.Variable(
+                tf.math.log(1.5),  # exp(ln(1.5)) + 1.0 = 2.5
+                trainable=True,
+                dtype=tf.float32,
+                constraint=lambda x: tf.clip_by_value(x, tf.math.log(0.5), tf.math.log(3.0)),
+                name='max_width_factor_logit'
             )
 
         # Инициализация оптимизатора
@@ -2155,86 +2168,127 @@ class LSTMIMMUKF(tf.Module):
     @tf.function
     def compute_loss(self, predictions, targets, volatility_levels, inflation_factors,
                      ukf_params, calibration_loss, entropy_loss=0.0):
-        """Функция потерь с регуляризацией всех параметров для адаптивной волатильности"""
-        # MSE loss
+        """
+        ✅ ИСПРАВЛЕННАЯ Функция потерь с правильными целями и штрафами
+        
+        Компоненты:
+        1. MSE: базовая ошибка прогноза
+        2. Calibration: покрытие CI, ширина, асимметрия
+        3. Smoothness: плавность изменения параметров
+        4. Stability: контроль инфляции
+        5. Spectral: спектральная регуляризация UKF
+        6. Additional: регуляризация всех обучаемых параметров
+        7. Entropy: качество разделения режимов волатильности
+        """
+        
+        # === 1. MSE LOSS ===
         mse_loss = tf.reduce_mean(tf.square(predictions - targets))
-
-        # Регуляризация плавности параметров
+        
+        # === 2. ПЛАВНОСТЬ ПАРАМЕТРОВ ===
         smoothness_loss = 0.0
-        if hasattr(self, 'last_ukf_params'):
-            smoothness_loss += tf.reduce_mean(tf.square(ukf_params - self.last_ukf_params))
-
-        # Стабильность: штраф за экстремальные значения инфляции
-        stability_penalty = tf.reduce_mean(tf.square(tf.clip_by_value(inflation_factors - 1.0, -5.0, 5.0)))
-
-        # Регуляризация спектральных параметров
+        if hasattr(self, 'last_ukf_params') and self.last_ukf_params is not None:
+            smoothness_loss = 0.001 * tf.reduce_mean(tf.square(ukf_params - self.last_ukf_params))
+        
+        # === 3. СТАБИЛЬНОСТЬ ИНФЛЯЦИИ ===
+        # Штраф за отклонение от базового значения 1.0
+        inflation_clipped = tf.clip_by_value(inflation_factors - 1.0, -5.0, 5.0)
+        stability_penalty = 0.05 * tf.reduce_mean(tf.square(inflation_clipped))
+        
+        # === 4. СПЕКТРАЛЬНАЯ РЕГУЛЯРИЗАЦИЯ ===
         spectral_reg = 0.0
-        if hasattr(self, 'diff_ukf_component'):
+        if hasattr(self, 'diff_ukf_component') and self.diff_ukf_component is not None:
             spectrum = self.diff_ukf_component.get_spectrum_info()
             min_eig = spectrum['min_eigenvalue']
-            spectral_reg += tf.reduce_mean(tf.nn.relu(1e-4 - min_eig))
-
-        # === КРИТИЧЕСКИ ВАЖНО: РЕГУЛЯРИЗАЦИЯ ВСЕХ ОБУЧАЕМЫХ ПАРАМЕТРОВ ===
-        additional_reg = 0.0
-        # Для параметров ковариации
-        additional_reg += 1e-4 * tf.square(self.base_q_logit)
-        additional_reg += 1e-4 * tf.square(self.base_r_logit)
-        # Для параметров волатильности
-        additional_reg += 1e-4 * tf.square(self.volatility_sensitivity)
-        # Для параметров Student-t распределения
-        additional_reg += 1e-4 * tf.square(self.student_t_base_dof)
-        additional_reg += 1e-4 * tf.square(self.student_t_vol_sensitivity)
-        # Для параметров adaptive inflation
-        additional_reg += 1e-4 * tf.square(self.inflation_base_factor)
-        additional_reg += 1e-4 * tf.square(self.inflation_vol_sensitivity)
-        additional_reg += 1e-4 * tf.square(self.inflation_decay_rate)
-        # Для параметров доверительных интервалов
-        additional_reg += 1e-4 * tf.square(self.confidence_base)
-        additional_reg += 1e-4 * tf.square(self.confidence_vol_sensitivity)
-
-        # === ДОБАВЛЕНО: РЕГУЛЯРИЗАЦИЯ ПАРАМЕТРОВ VOLATILITY REGIME SELECTOR И КОВАРИАЦИИ ===
+            # Штраф если собственное значение слишком близко к 0
+            spectral_reg = 0.01 * tf.reduce_mean(tf.nn.relu(1e-4 - min_eig))
+        
+        # === 5. РЕГУЛЯРИЗАЦИЯ БАЗОВЫХ ПАРАМЕТРОВ ===
+        additional_reg = (
+            1e-4 * (tf.square(self.base_q_logit) + tf.square(self.base_r_logit)) +
+            1e-4 * tf.square(self.volatility_sensitivity - 0.5) +
+            1e-4 * tf.square(self.student_t_base_dof - tf.math.log(4.0)) +
+            1e-4 * tf.square(self.student_t_vol_sensitivity) +
+            1e-4 * tf.square(self.inflation_base_factor) +
+            1e-4 * tf.square(self.inflation_vol_sensitivity) +
+            1e-4 * tf.square(self.inflation_decay_rate - 0.95) +
+            1e-4 * tf.square(self.confidence_base - 0.85) +
+            1e-4 * tf.square(self.confidence_vol_sensitivity)
+        )
+        
+        # === НОВОЕ: ШТРАФ НА МАКСИМАЛЬНУЮ ШИРИНУ ===
+        # Удерживаем max_width_factor в целевом диапазоне 2.0-3.0
+        if hasattr(self, 'max_width_factor_logit'):
+            target_max_width = 2.5
+            max_width_factor_value = tf.nn.softplus(self.max_width_factor_logit) + 1.0
+            width_factor_penalty = 1.0 * tf.square(max_width_factor_value - target_max_width)
+            additional_reg += width_factor_penalty
+        else:
+            width_factor_penalty = 0.0
+        
+        # === 6. ✅ ИСПРАВЛЕННАЯ РЕГУЛЯРИЗАЦИЯ VOLATILITY REGIME SELECTOR ===
         selector_reg = 0.0
-        entropy_penalty = 0.0
         if hasattr(self, 'regime_selector') and self.regime_selector is not None:
-            # Регуляризация для regime_scales (стремимся к 1.0)
-            selector_reg += 1e-3 * tf.reduce_sum(tf.square(self.regime_selector.regime_scales - 1.0))
-            # Регуляризация для температуры (стремимся к 0.7 для более резкого распределения)
-            selector_reg += 1e-3 * tf.square(self.regime_selector.temperature - 0.7)
-            # Регуляризация для center_logits, если они обучаемые
-            if self.regime_selector.learnable_centers and hasattr(self.regime_selector, 'center_logits'):
-                selector_reg += 1e-3 * tf.reduce_sum(tf.square(self.regime_selector.center_logits))
-
-        # === НОВОЕ: РЕГУЛЯРИЗАЦИЯ ПАРАМЕТРОВ КОВАРИАЦИИ ===
-        cov_reg = 0.0
-        # Базовые регуляризаторы для Q и R
-        cov_reg += 1e-3 * tf.square(self.base_q_logit - tf.math.log(0.3))
-        cov_reg += 1e-3 * tf.square(self.base_r_logit - tf.math.log(0.8))
-        # Регуляризация чувствительности к волатильности
-        cov_reg += 1e-4 * tf.square(self.volatility_sensitivity - 0.5)
-
-        # === КРИТИЧЕСКИ ВАЖНО: ШТРАФ ЗА ВЫСОКУЮ ЭНТРОПИЮ ===
-        # Идеальная энтропия для хорошо разделенных режимов: ~0.6-0.8
-        # Текущее значение 1.093 соответствует равномерному распределению (максимальная неопределенность)
-        target_entropy = 0.75
-        current_vol = tf.squeeze(volatility_levels[:, -1, :])  # [B]
+            # УДАЛЕНЫ штрафы на целевые значения regime_scales и temperature
+            # Они уже имеют constraints в инициализации и контролируют себя через механизм softmax
+            
+            # Оставляем только регуляризацию center_logits (если обучаемые)
+            if (self.regime_selector.learnable_centers and 
+                hasattr(self.regime_selector, 'center_logits')):
+                # Штраф на излишнее отклонение логитов от нуля
+                selector_reg = 0.001 * tf.reduce_sum(
+                    tf.square(self.regime_selector.center_logits)
+                )
+        
+        # === 7. ✅ ИСПРАВЛЕННАЯ ЭНТРОПИЙНАЯ РЕГУЛЯРИЗАЦИЯ ===
+        current_vol = tf.squeeze(volatility_levels[:, -1, :])  # [B] последний временной шаг
         regime_info = self.regime_selector.assign_soft_regimes(current_vol)
         current_entropy = tf.reduce_mean(regime_info['entropy'])
-        entropy_penalty = 0.5 * tf.square(current_entropy - target_entropy)
-
-        # Общая потеря с явным штрафом за энтропию
-        total_loss = mse_loss + 0.3 * calibration_loss + 0.1 * smoothness_loss + \
-        0.05 * stability_penalty + 0.01 * spectral_reg + additional_reg + selector_reg + entropy_penalty + \
-        self.lambda_entropy * entropy_loss * 2.0
-
-        # Специальный штраф при обнаружении равномерного ра* 2.0спределения (энтропия ≈ ln(3) = 1.0986)
-        is_uniform_distribution = tf.cast(tf.abs(current_entropy - tf.math.log(3.0)) < 0.05, tf.float32)
-        total_loss += is_uniform_distribution * 1.0  # сильный штраф для выхода из равномерного распределения
-
-        # Сохранение текущих параметров для следующей итерации
+        
+        # Максимальная энтропия для softmax(3 режимов)
+        max_entropy = tf.math.log(3.0)  # ln(3) = 1.0986
+        
+        # Нормализуем энтропию в диапазон [0, 1]
+        normalized_entropy = current_entropy / (max_entropy + 1e-8)
+        
+        # Целевая нормализованная энтропия = 0.75 (хороший баланс между спецификой и гибкостью)
+        target_entropy_normalized = 0.75
+        entropy_deviation = tf.abs(normalized_entropy - target_entropy_normalized)
+        entropy_penalty = 2.0 * tf.square(entropy_deviation)  # Повышенный штраф
+        
+        # Дополнительный штраф за РАВНОМЕРНОЕ распределение (максимальная неопределенность)
+        is_uniform_distribution = tf.cast(
+            tf.abs(current_entropy - max_entropy) < 0.05,
+            tf.float32
+        )
+        entropy_penalty += is_uniform_distribution * 1.0
+        
+        # Штраф за СЛИШКОМ ОСТРОЕ распределение (потеря гибкости адаптации)
+        is_too_sharp = tf.cast(normalized_entropy < 0.3, tf.float32)
+        entropy_penalty += is_too_sharp * 0.5
+        
+        # === ИТОГОВАЯ ПОТЕРЯ ===
+        total_loss = (
+            mse_loss +                          # Основная ошибка прогноза
+            0.3 * calibration_loss +            # Контроль доверительных интервалов
+            0.1 * smoothness_loss +             # Плавность параметров
+            0.05 * stability_penalty +          # Стабильность инфляции
+            0.01 * spectral_reg +               # Спектральная регуляризация
+            additional_reg +                    # Регуляризация всех параметров
+            selector_reg +                      # ✅ Исправленная регуляризация режимов
+            entropy_penalty +                   # ✅ Исправленная энтропийная регуляризация
+            self.lambda_entropy * entropy_loss * 2.0  # Энтропия скрытых состояний LSTM
+        )
+        
+        # === ЗАЩИТА ОТ NaN/Inf ===
+        total_loss = tf.where(
+            tf.math.is_nan(total_loss),
+            tf.constant(1e6, dtype=tf.float32),
+            total_loss
+        )
+        
+        # === СОХРАНЕНИЕ СОСТОЯНИЯ ДЛЯ СЛЕДУЮЩЕЙ ИТЕРАЦИИ ===
         self.last_ukf_params = ukf_params
-
-        # Защита от NaN/Inf
-        total_loss = tf.where(tf.math.is_nan(total_loss), tf.constant(1e6, dtype=tf.float32), total_loss)
+        
         return total_loss
 
     @tf.function
@@ -2391,21 +2445,40 @@ class LSTMIMMUKF(tf.Module):
                 actual_coverage = tf.reduce_mean(covered)
                 target_coverage_mean = tf.reduce_mean(target_coverage)
 
-                # Базовая калибровочная потеря
-                calibration_loss = tf.square(actual_coverage - target_coverage_mean)
+                # === ИСПРАВЛЕННЫЙ РАСЧЕТ CALIBRATION LOSS В train_step ===
 
-                # ===== КРИТИЧЕСКИ ВАЖНО: УСИЛЕННЫЙ ШТРАФ ЗА ШИРОКИЕ ИНТЕРВАЛЫ =====
+                # 1. Расчет метрик интервалов
                 ci_width = ci_max - ci_min
                 avg_stddev = tf.reduce_mean(std_dev)
+
+                # 2. ОСНОВНОЙ ШТРАФ: недостаточное/избыточное покрытие
+                target_coverage = 0.85  # 85% покрытие - хороший баланс
+                coverage_diff = tf.abs(actual_coverage - target_coverage)
+                coverage_penalty = 2.0 * tf.square(coverage_diff)
+                # Если coverage = 0.95: penalty = 2.0 × (0.10)² = 0.02
+                # Если coverage = 0.70: penalty = 2.0 × (0.15)² = 0.045
+
+                # 3. ШТРАФ НА ШИРИНУ (адаптивная к std_dev) - БОЛЕЕ СТРОГИЙ
+                target_width_ratio = 1.0  # CI ширина = 1.0 x stddev
                 width_ratio = tf.reduce_mean(ci_width / (avg_stddev + 1e-8))
-                # Если интервалы слишком широкие (>1.5x stddev в среднем) - СИЛЬНЫЙ штраф
-                width_penalty = tf.cond(
-                    width_ratio > 2.0,  # Повысить порог
-                    lambda: 0.5 * tf.square(width_ratio - 2.0),  # Снизить коэффициент
-                    lambda: 0.0
-                )
-                calibration_loss = calibration_loss + width_penalty
-                # ===== КОНЕЦ =====
+                
+                # Целевой штраф: штрафуем как слишком широкие, так и слишком узкие интервалы
+                # Если width_ratio > 1.0: штраф за избыточную ширину
+                # Если width_ratio < 0.7: штраф за чрезмерно узкие интервалы (малое покрытие)
+                width_penalty = 2.0 * tf.square(tf.maximum(width_ratio - target_width_ratio, 0.0))  # Штраф за широкие
+                width_penalty += 1.0 * tf.square(tf.maximum(target_width_ratio * 0.7 - width_ratio, 0.0))  # Штраф за слишком узкие
+                # Если width_ratio = 2.0: penalty = 2.0 × (1.0)² = 2.0 (более строгий)
+                # Если width_ratio = 0.8: penalty = 2.0 × (0.0)² + 1.0 × (0.0)² = 0.0 (в порядке)
+                # Если width_ratio = 0.5: penalty = 0.0 + 1.0 × (0.2)² = 0.04 (штраф за слишком узкие)
+
+                # 4. ШТРАФ НА АСИММЕТРИЧНОСТЬ (левая vs правая граница)
+                asymmetry = (ci_max - forecast) / (forecast - ci_min + 1e-8)
+                asymmetry_log = tf.math.log(asymmetry + 1e-8)  # log(asymmetry)
+                asymmetry_penalty = 0.5 * tf.reduce_mean(tf.square(asymmetry_log))
+                # Идеально: asymmetry ≈ 1.0 → log(1.0) = 0 → penalty = 0
+                # Асимметрия 2.0: log(2.0) = 0.693 → penalty = 0.5 × 0.48 = 0.24
+
+                calibration_loss = coverage_penalty + width_penalty + asymmetry_penalty
 
                 # 7. РАСЧЕТ ПОТЕРИ
                 loss = self.compute_loss(
@@ -2690,7 +2763,14 @@ class LSTMIMMUKF(tf.Module):
         # ===== 7. ВЫЧИСЛЕНИЕ МАРЖ С УЧЕТОМ ШИРОКОГО ДИАПАЗОНА И ВЫСОКОЙ ВОЛАТИЛЬНОСТИ =====
         # Убираем дублирование с инфляцией, фокусируемся на реальном диапазоне данных
         regime_scale_factor = tf.maximum(1.2, regime_scale)
-        max_width_factor = 2.0 + 0.5 * regime_scale_factor
+        
+        # ИСПОЛЬЗУЕМ ОБУЧАЕМЫЙ max_width_factor из модели
+        if hasattr(self, 'max_width_factor_logit'):
+            max_width_factor_value = tf.nn.softplus(self.max_width_factor_logit) + 1.0
+            max_width_factor = max_width_factor_value * regime_scale_factor
+        else:
+            # Резервное значение, если параметр отсутствует
+            max_width_factor = 2.5  # Целевое значение около 2.5
 
         # Добавляем прямую коррекцию на основе stddev
         stddev_factor = 1.0 + 0.5 * (stddev / tf.reduce_mean(stddev + 1e-8))  # Учет относительной волатильности
@@ -3045,17 +3125,20 @@ class LSTMIMMUKF(tf.Module):
             # Базовая калибровочная потеря
             calibration_loss = 2.0 * tf.square(actual_coverage - target_coverage_mean)
 
-            # Дополнительный штраф за слишком широкие интервалы
+            # Дополнительный штраф за ширину интервалов - БОЛЕЕ СТРОГИЙ
             ci_width = ci_max - ci_min
             avg_stddev = tf.reduce_mean(std_dev)
             width_ratio = tf.reduce_mean(ci_width / (avg_stddev + 1e-8))
-
-            # Если интервалы слишком широкие (>2.5x stddev в среднем) - штрафуем
-            width_penalty = tf.cond(
-                width_ratio > 2.0,  # Повысить порог
-                lambda: 0.5 * tf.square(width_ratio - 2.0),  # Снизить коэффициент
-                lambda: 0.0
-            )
+            
+            # Целевой штраф: штрафуем как слишком широкие, так и слишком узкие интервалы
+            # Если width_ratio > 1.0: штраф за избыточную ширину
+            # Если width_ratio < 0.7: штраф за чрезмерно узкие интервалы (малое покрытие)
+            width_penalty = 2.0 * tf.square(tf.maximum(width_ratio - 1.0, 0.0))  # Штраф за широкие
+            width_penalty += 1.0 * tf.square(tf.maximum(1.0 * 0.7 - width_ratio, 0.0))  # Штраф за слишком узкие
+            # Если width_ratio = 2.0: penalty = 2.0 × (1.0)² = 2.0 (более строгий)
+            # Если width_ratio = 0.8: penalty = 2.0 × (0.0)² + 1.0 × (0.0)² = 0.0 (в порядке)
+            # Если width_ratio = 0.5: penalty = 0.0 + 1.0 × (0.2)² = 0.04 (штраф за слишком узкие)
+            
             calibration_loss = calibration_loss + width_penalty
 
             # 7. РАСЧЕТ ПОТЕРИ
