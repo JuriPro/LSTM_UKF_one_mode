@@ -2229,6 +2229,12 @@ class LSTMIMMUKF(tf.Module):
         # === 6. ✅ ИСПРАВЛЕННАЯ РЕГУЛЯРИЗАЦИЯ VOLATILITY REGIME SELECTOR ===
         selector_reg = 0.0
         if hasattr(self, 'regime_selector') and self.regime_selector is not None:
+            # ✅ ИСПРАВЛЕНО: Добавляем штраф за regime_scales
+            regime_scales_penalty = 0.02 * tf.reduce_mean(
+                tf.square(self.regime_selector.regime_scales - 2.5)  # 2.5 - целевое значение
+            )
+            selector_reg = regime_scales_penalty
+
             # УДАЛЕНЫ штрафы на целевые значения regime_scales и temperature
             # Они уже имеют constraints в инициализации и контролируют себя через механизм softmax
 
@@ -2236,7 +2242,7 @@ class LSTMIMMUKF(tf.Module):
             if (self.regime_selector.learnable_centers and
                 hasattr(self.regime_selector, 'center_logits')):
                 # Штраф на излишнее отклонение логитов от нуля
-                selector_reg = 0.001 * tf.reduce_sum(
+                selector_reg = selector_reg + 0.001 * tf.reduce_sum(
                     tf.square(self.regime_selector.center_logits)
                 )
 
@@ -2279,6 +2285,9 @@ class LSTMIMMUKF(tf.Module):
             entropy_penalty +                   # ✅ Исправленная энтропийная регуляризация
             self.lambda_entropy * entropy_loss * 2.0  # Энтропия скрытых состояний LSTM
         )
+
+        # ✅ ИСПРАВЛЕНО: Явно суммируем все компоненты
+        total_loss = total_loss + 0.5 * entropy_penalty
 
         # === ЗАЩИТА ОТ NaN/Inf ===
         total_loss = tf.where(
@@ -2439,18 +2448,22 @@ class LSTMIMMUKF(tf.Module):
                 ci_max = tf.maximum(ci_lower, ci_upper)
 
                 # Вычисление покрытия
-                covered = tf.cast(
-                    (y_target_batch >= ci_min) & (y_target_batch <= ci_max),
-                    tf.float32
-                )
+                # ✅ ИСПРАВЛЕНО: Приводим к одинаковым размерностям для сравнения
+                y_target_flat = tf.reshape(y_target_batch, [-1])
+                ci_min_flat = tf.reshape(ci_min, [-1])
+                ci_max_flat = tf.reshape(ci_max, [-1])
+
+                covered = tf.cast((y_target_flat >= ci_min_flat) & (y_target_flat <= ci_max_flat), tf.float32)
                 actual_coverage = tf.reduce_mean(covered)
                 target_coverage_mean = tf.reduce_mean(target_coverage)
 
                 # === ИСПРАВЛЕННЫЙ РАСЧЕТ CALIBRATION LOSS В train_step ===
 
                 # 1. Расчет метрик интервалов
-                ci_width = ci_max - ci_min
-                avg_stddev = tf.reduce_mean(std_dev)
+                # ✅ ИСПРАВЛЕНО: Используем правильные размерности для ширины
+                ci_width = tf.reshape(ci_max, [-1]) - tf.reshape(ci_min, [-1])
+                stddev_flat = tf.reshape(std_dev, [-1])
+                avg_stddev = tf.reduce_mean(stddev_flat)
 
                 # 2. ОСНОВНОЙ ШТРАФ: недостаточное/избыточное покрытие
                 target_coverage = 0.85  # 85% покрытие - хороший баланс
@@ -2468,8 +2481,9 @@ class LSTMIMMUKF(tf.Module):
                 # Если coverage = 0.70: penalty = 5.0 × (0.15)² = 0.1125 (усиленный штраф)
 
                 # 3. ШТРАФ НА ШИРИНУ (адаптивная к std_dev) - БОЛЕЕ СТРОГИЙ
-                target_width_ratio = 1.0  # CI ширина = 1.0 x stddev
-                width_ratio = tf.reduce_mean(ci_width / (avg_stddev + 1e-8))
+                # 80% coverage требует ~4x stddev для нормального распределения
+                target_width_ratio = 4.0  # Было 1.0
+                width_ratio = tf.reduce_mean(ci_width) / (avg_stddev + 1e-8)
 
                 # ИСПРАВЛЕНО: Усиленный штраф за слишком узкие интервалы (для компенсации низкого покрытия)
                 # Если width_ratio < 0.7: штраф за чрезмерно узкие интервалы (малое покрытие)
@@ -2498,6 +2512,11 @@ class LSTMIMMUKF(tf.Module):
                     calibration_loss,
                     entropy_loss
                 )
+
+                # ✅ ИСПРАВЛЕНО: Нормализуем лосс по размеру батча и времени
+                B = tf.cast(tf.shape(y_target_batch)[0], tf.float32)
+                T = tf.cast(tf.shape(y_for_filtering_batch)[1], tf.float32)
+                loss = loss / (B * T)
 
                 # 8. СБОР ВСЕХ ОБУЧАЕМЫХ ПЕРЕМЕННЫХ
                 trainable_vars = []
@@ -3159,6 +3178,11 @@ class LSTMIMMUKF(tf.Module):
                 calibration_loss,
                 entropy_loss
             )
+
+            # ✅ ИСПРАВЛЕНО: Нормализуем лосс по размеру батча и времени
+            B = tf.cast(tf.shape(y_target_batch)[0], tf.float32)
+            T = tf.cast(tf.shape(y_for_filtering_batch)[1], tf.float32)
+            loss = loss / (B * T)
 
             # 8. РАСЧЕТ МЕТРИК
             mse_loss = tf.reduce_mean(tf.square(forecast - y_target_batch))
