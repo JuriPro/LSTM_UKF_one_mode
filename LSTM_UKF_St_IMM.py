@@ -734,12 +734,12 @@ class LSTMIMMUKF(tf.Module):
             learnable_centers=True,
             name='volatility_regime_selector'
         )
-        # Синхронизированные параметры для целевого покрытия 85%
-        target_coverage = 0.85
-        confidence_factor = -np.log(1.0 - target_coverage)  # ≈ 1.89712
+        # Синхронизированные параметры для целевого покрытия 90% (с учетом улучшенного алгоритма)
+        target_coverage = 0.90
+        confidence_factor = -np.log(1.0 - target_coverage)  # ≈ 2.30259
         # ИСПРАВЛЕНО: Увеличиваем начальные значения regime_scales для компенсации низкого покрытия
         self.regime_selector.regime_scales.assign(tf.constant(
-            [1.56 * confidence_factor, 2.34 * confidence_factor, 3.25 * confidence_factor],  # Увеличены на ~30%
+            [1.2 * confidence_factor, 1.8 * confidence_factor, 2.5 * confidence_factor],  # Уменьшены, так как остальные параметры увеличили ширину
             dtype=tf.float32
         ))
         # Центроиды режимов адаптированы под реальную статистику волатильности
@@ -830,7 +830,7 @@ class LSTMIMMUKF(tf.Module):
 
             # Параметры для Student-t распределения
             self.student_t_base_dof = tf.Variable(
-                tf.math.log(4.0),  # меньше степеней свободы = толще хвосты
+                tf.math.log(2.5),  # еще меньше степеней свободы = толще хвосты
                 trainable=True,
                 dtype=tf.float32,
                 name='student_t_base_dof'
@@ -868,10 +868,10 @@ class LSTMIMMUKF(tf.Module):
 
             # Параметры для калибровки доверительных интервалов
             self.confidence_base = tf.Variable(
-                0.88,  # снижение целевого покрытия
+                0.90,  # повышение целевого покрытия
                 trainable=True,
                 dtype=tf.float32,
-                constraint=lambda x: tf.clip_by_value(x, 0.80, 0.92),
+                constraint=lambda x: tf.clip_by_value(x, 0.85, 0.95),
                 name='confidence_base'
             )
             self.confidence_vol_sensitivity = tf.Variable(
@@ -881,7 +881,7 @@ class LSTMIMMUKF(tf.Module):
                 constraint=lambda x: tf.clip_by_value(x, 0.0, 0.3),
                 name='confidence_vol_sensitivity'
             )
-            
+
             # === ДОБАВЛЕНО: ПАРАМЕТР ДЛЯ МАКСИМАЛЬНОЙ ШИРИНЫ ДОВЕРИТЕЛЬНОГО ИНТЕРВАЛА ===
             self.max_width_factor_logit = tf.Variable(
                 tf.math.log(2.5),  # exp(ln(2.5)) + 1.0 = 3.5 - увеличено для компенсации низкого покрытия
@@ -2171,7 +2171,7 @@ class LSTMIMMUKF(tf.Module):
                      ukf_params, calibration_loss, entropy_loss=0.0):
         """
         ✅ ИСПРАВЛЕННАЯ Функция потерь с правильными целями и штрафами
-        
+
         Компоненты:
         1. MSE: базовая ошибка прогноза
         2. Calibration: покрытие CI, ширина, асимметрия
@@ -2181,20 +2181,20 @@ class LSTMIMMUKF(tf.Module):
         6. Additional: регуляризация всех обучаемых параметров
         7. Entropy: качество разделения режимов волатильности
         """
-        
+
         # === 1. MSE LOSS ===
         mse_loss = tf.reduce_mean(tf.square(predictions - targets))
-        
+
         # === 2. ПЛАВНОСТЬ ПАРАМЕТРОВ ===
         smoothness_loss = 0.0
         if hasattr(self, 'last_ukf_params') and self.last_ukf_params is not None:
             smoothness_loss = 0.001 * tf.reduce_mean(tf.square(ukf_params - self.last_ukf_params))
-        
+
         # === 3. СТАБИЛЬНОСТЬ ИНФЛЯЦИИ ===
         # Штраф за отклонение от базового значения 1.0
         inflation_clipped = tf.clip_by_value(inflation_factors - 1.0, -5.0, 5.0)
         stability_penalty = 0.05 * tf.reduce_mean(tf.square(inflation_clipped))
-        
+
         # === 4. СПЕКТРАЛЬНАЯ РЕГУЛЯРИЗАЦИЯ ===
         spectral_reg = 0.0
         if hasattr(self, 'diff_ukf_component') and self.diff_ukf_component is not None:
@@ -2202,20 +2202,20 @@ class LSTMIMMUKF(tf.Module):
             min_eig = spectrum['min_eigenvalue']
             # Штраф если собственное значение слишком близко к 0
             spectral_reg = 0.01 * tf.reduce_mean(tf.nn.relu(1e-4 - min_eig))
-        
+
         # === 5. РЕГУЛЯРИЗАЦИЯ БАЗОВЫХ ПАРАМЕТРОВ ===
         additional_reg = (
             1e-4 * (tf.square(self.base_q_logit) + tf.square(self.base_r_logit)) +
             1e-4 * tf.square(self.volatility_sensitivity - 0.5) +
-            1e-4 * tf.square(self.student_t_base_dof - tf.math.log(4.0)) +
+            1e-4 * tf.square(self.student_t_base_dof - tf.math.log(2.5)) +
             1e-4 * tf.square(self.student_t_vol_sensitivity) +
             1e-4 * tf.square(self.inflation_base_factor) +
             1e-4 * tf.square(self.inflation_vol_sensitivity) +
             1e-4 * tf.square(self.inflation_decay_rate - 0.95) +
-            1e-4 * tf.square(self.confidence_base - 0.85) +
+            1e-4 * tf.square(self.confidence_base - 0.90) +
             1e-4 * tf.square(self.confidence_vol_sensitivity)
         )
-        
+
         # === НОВОЕ: ШТРАФ НА МАКСИМАЛЬНУЮ ШИРИНУ ===
         # Удерживаем max_width_factor в целевом диапазоне 2.0-3.0
         if hasattr(self, 'max_width_factor_logit'):
@@ -2225,48 +2225,48 @@ class LSTMIMMUKF(tf.Module):
             additional_reg += width_factor_penalty
         else:
             width_factor_penalty = 0.0
-        
+
         # === 6. ✅ ИСПРАВЛЕННАЯ РЕГУЛЯРИЗАЦИЯ VOLATILITY REGIME SELECTOR ===
         selector_reg = 0.0
         if hasattr(self, 'regime_selector') and self.regime_selector is not None:
             # УДАЛЕНЫ штрафы на целевые значения regime_scales и temperature
             # Они уже имеют constraints в инициализации и контролируют себя через механизм softmax
-            
+
             # Оставляем только регуляризацию center_logits (если обучаемые)
-            if (self.regime_selector.learnable_centers and 
+            if (self.regime_selector.learnable_centers and
                 hasattr(self.regime_selector, 'center_logits')):
                 # Штраф на излишнее отклонение логитов от нуля
                 selector_reg = 0.001 * tf.reduce_sum(
                     tf.square(self.regime_selector.center_logits)
                 )
-        
+
         # === 7. ✅ ИСПРАВЛЕННАЯ ЭНТРОПИЙНАЯ РЕГУЛЯРИЗАЦИЯ ===
         current_vol = tf.squeeze(volatility_levels[:, -1, :])  # [B] последний временной шаг
         regime_info = self.regime_selector.assign_soft_regimes(current_vol)
         current_entropy = tf.reduce_mean(regime_info['entropy'])
-        
+
         # Максимальная энтропия для softmax(3 режимов)
         max_entropy = tf.math.log(3.0)  # ln(3) = 1.0986
-        
+
         # Нормализуем энтропию в диапазон [0, 1]
         normalized_entropy = current_entropy / (max_entropy + 1e-8)
-        
+
         # Целевая нормализованная энтропия = 0.75 (хороший баланс между спецификой и гибкостью)
         target_entropy_normalized = 0.75
         entropy_deviation = tf.abs(normalized_entropy - target_entropy_normalized)
         entropy_penalty = 2.0 * tf.square(entropy_deviation)  # Повышенный штраф
-        
+
         # Дополнительный штраф за РАВНОМЕРНОЕ распределение (максимальная неопределенность)
         is_uniform_distribution = tf.cast(
             tf.abs(current_entropy - max_entropy) < 0.05,
             tf.float32
         )
         entropy_penalty += is_uniform_distribution * 1.0
-        
+
         # Штраф за СЛИШКОМ ОСТРОЕ распределение (потеря гибкости адаптации)
         is_too_sharp = tf.cast(normalized_entropy < 0.3, tf.float32)
         entropy_penalty += is_too_sharp * 0.5
-        
+
         # === ИТОГОВАЯ ПОТЕРЯ ===
         total_loss = (
             mse_loss +                          # Основная ошибка прогноза
@@ -2279,17 +2279,17 @@ class LSTMIMMUKF(tf.Module):
             entropy_penalty +                   # ✅ Исправленная энтропийная регуляризация
             self.lambda_entropy * entropy_loss * 2.0  # Энтропия скрытых состояний LSTM
         )
-        
+
         # === ЗАЩИТА ОТ NaN/Inf ===
         total_loss = tf.where(
             tf.math.is_nan(total_loss),
             tf.constant(1e6, dtype=tf.float32),
             total_loss
         )
-        
+
         # === СОХРАНЕНИЕ СОСТОЯНИЯ ДЛЯ СЛЕДУЮЩЕЙ ИТЕРАЦИИ ===
         self.last_ukf_params = ukf_params
-        
+
         return total_loss
 
     @tf.function
@@ -2455,7 +2455,7 @@ class LSTMIMMUKF(tf.Module):
                 # 2. ОСНОВНОЙ ШТРАФ: недостаточное/избыточное покрытие
                 target_coverage = 0.85  # 85% покрытие - хороший баланс
                 coverage_diff = tf.abs(actual_coverage - target_coverage)
-                
+
                 # ИСПРАВЛЕНО: Усиленный штраф для случаев низкого покрытия
                 # Если покрытие ниже целевого, штраф увеличивается агрессивнее
                 undercoverage_penalty = tf.cond(
@@ -2470,7 +2470,7 @@ class LSTMIMMUKF(tf.Module):
                 # 3. ШТРАФ НА ШИРИНУ (адаптивная к std_dev) - БОЛЕЕ СТРОГИЙ
                 target_width_ratio = 1.0  # CI ширина = 1.0 x stddev
                 width_ratio = tf.reduce_mean(ci_width / (avg_stddev + 1e-8))
-                
+
                 # ИСПРАВЛЕНО: Усиленный штраф за слишком узкие интервалы (для компенсации низкого покрытия)
                 # Если width_ratio < 0.7: штраф за чрезмерно узкие интервалы (малое покрытие)
                 width_penalty = 2.0 * tf.square(tf.maximum(width_ratio - target_width_ratio, 0.0))  # Штраф за широкие
@@ -2686,13 +2686,13 @@ class LSTMIMMUKF(tf.Module):
         stddev = tf.maximum(stddev, 1e-8)
 
         # ===== 2. АДАПТИРОВАННЫЙ ПОД ШИРОКИЙ ДИАПАЗОН УРОВЕНЬ ДОВЕРИЯ =====
-        base_confidence_ceil = 0.92  # Снижаем целевое покрытие из-за высокой волатильности
-        base_confidence_floor = 0.75  # Уменьшаем минимум для более широких интервалов
+        base_confidence_ceil = 0.95  # Повышаем целевое покрытие для компенсации низкой точности
+        base_confidence_floor = 0.80  # Увеличиваем минимум для более широких интервалов
         # Адаптивное изменение в зависимости от волатильности
-        confidence_range = 0.17  # Диапазон покрытия 0.75-0.92
+        confidence_range = 0.15  # Диапазон покрытия 0.80-0.95
         # Используем более агрессивную адаптацию в HIGH режиме
-        vol_adjustment = 0.10 * volatility_level  # Увеличиваем максимальную корректировку до 10%
-        target_coverage = base_confidence_ceil - confidence_range + vol_adjustment
+        vol_adjustment = 0.05 * volatility_level  # Умеренная корректировка в зависимости от волатильности
+        target_coverage = base_confidence_floor + confidence_range * vol_adjustment
         target_coverage = tf.clip_by_value(target_coverage, base_confidence_floor, base_confidence_ceil)  # [B]
 
         # ===== 3. БЕЗОПАСНОЕ ИЗВЛЕЧЕНИЕ ПАРАМЕТРОВ Student-t =====
@@ -2704,16 +2704,16 @@ class LSTMIMMUKF(tf.Module):
             return tf.squeeze(param)
 
         # Используем параметры с толстыми хвостами для сигналов с широким диапазоном
-        dof_base = safe_get_param(student_t_config, 'dof_base', 2.5)  # Меньше степеней свободы для толстых хвостов
-        dof_sensitivity = safe_get_param(student_t_config, 'dof_sensitivity', 0.5)
-        tail_weight_pos = safe_get_param(student_t_config, 'tail_weight_pos', 0.4)  # Меньше вес для позитивных хвостов
-        tail_weight_neg = safe_get_param(student_t_config, 'tail_weight_neg', 2.0)  # Больше вес для негативных хвостов
+        dof_base = safe_get_param(student_t_config, 'dof_base', 2.0)  # Еще меньше степеней свободы для толстых хвостов
+        dof_sensitivity = safe_get_param(student_t_config, 'dof_sensitivity', 0.8)
+        tail_weight_pos = safe_get_param(student_t_config, 'tail_weight_pos', 1.0)  # Более сбалансированные веса
+        tail_weight_neg = safe_get_param(student_t_config, 'tail_weight_neg', 1.0)  # Более сбалансированные веса
         regime_scale = safe_get_param(student_t_config, 'regime_scale', 1.0)
 
         # ===== 4. АДАПТИВНОЕ ВЫЧИСЛЕНИЕ СТЕПЕНЕЙ СВОБОДЫ =====
         # Уменьшаем степени свободы для толстых хвостов
-        dof_adjusted = dof_base + 1.0 * (1.0 - volatility_level) * dof_sensitivity
-        dof_adjusted = tf.clip_by_value(dof_adjusted, 1.5, 10.0)  # [B] - снижаем минимальное значение
+        dof_adjusted = dof_base + 2.0 * (1.0 - volatility_level) * dof_sensitivity
+        dof_adjusted = tf.clip_by_value(dof_adjusted, 1.0, 8.0)  # [B] - еще более низкое минимальное значение
 
         # ===== 5. ВЫЧИСЛЕНИЕ Z-КВАНТИЛЕЙ ДЛЯ t-РАСПРЕДЕЛЕНИЯ =====
         # Используем аппроксимацию: t_α ≈ sqrt((df-1)/(df*(1-α)^2 - 1))
@@ -2726,7 +2726,7 @@ class LSTMIMMUKF(tf.Module):
         denominator_lower = tf.maximum(denominator_lower, 0.01)  # Численная стабильность
 
         z_lower_raw = -tf.sqrt((dof_adjusted - 1.0) / denominator_lower)
-        z_lower = tf.clip_by_value(z_lower_raw, -7.0, -0.1)  # Расширяем диапазон для экстремальных значений
+        z_lower = tf.clip_by_value(z_lower_raw, -8.0, -0.1)  # Расширяем диапазон для экстремальных значений
 
         # Верхний квантиль (для верхней границы)
         prob_upper = (1.0 - target_coverage) / 2.0  # [B]
@@ -2736,7 +2736,7 @@ class LSTMIMMUKF(tf.Module):
         denominator_upper = tf.maximum(denominator_upper, 0.01)
 
         z_upper_raw = tf.sqrt((dof_adjusted - 1.0) / denominator_upper)
-        z_upper = tf.clip_by_value(z_upper_raw, 0.1, 7.0)   # Расширяем диапазон для экстремальных значений
+        z_upper = tf.clip_by_value(z_upper_raw, 0.1, 8.0)   # Расширяем диапазон для экстремальных значений
 
         # ===== 6. АНАЛИЗ АСИММЕТРИИ ИННОВАЦИЙ (если доступны) =====
         center_shift = tf.zeros([batch_size], dtype=tf.float32)  # [B]
@@ -2769,40 +2769,33 @@ class LSTMIMMUKF(tf.Module):
                 )  # [B]
 
         # ===== 7. ВЫЧИСЛЕНИЕ МАРЖ С УЧЕТОМ ШИРОКОГО ДИАПАЗОНА И ВЫСОКОЙ ВОЛАТИЛЬНОСТИ =====
-        # Убираем дублирование с инфляцией, фокусируемся на реальном диапазоне данных
-        regime_scale_factor = tf.maximum(1.2, regime_scale)
-        
-        # ИСПОЛЬЗУЕМ ОБУЧАЕМЫЙ max_width_factor из модели
-        if hasattr(self, 'max_width_factor_logit'):
-            max_width_factor_value = tf.nn.softplus(self.max_width_factor_logit) + 1.0
-            max_width_factor = max_width_factor_value * regime_scale_factor
-        else:
-            # Резервное значение, если параметр отсутствует
-            max_width_factor = 2.5  # Целевое значение около 2.5
+        # Увеличиваем базовые множители для компенсации низкого покрытия
+        regime_scale_factor = tf.maximum(1.5, regime_scale)  # Увеличиваем минимальный масштаб
+        max_width_factor = 15.0 + 10.0 * regime_scale_factor  # Значительно увеличиваем базовую ширину
 
         # Добавляем прямую коррекцию на основе stddev
-        stddev_factor = 1.0 + 0.5 * (stddev / tf.reduce_mean(stddev + 1e-8))  # Учет относительной волатильности
+        stddev_factor = 2.0 + 1.0 * (stddev / tf.reduce_mean(stddev + 1e-8))  # Учет относительной волатильности
         max_width_factor = max_width_factor * stddev_factor
 
-        # Убираем ограничение на минимальную ширину, так как сигнал имеет широкий диапазон
+        # Увеличиваем минимальные значения марж для компенсации низкого покрытия
         margin_lower = stddev * tf.clip_by_value(
             tf.abs(z_lower) * tail_weight_neg * regime_scale,
-            1.0,  # Увеличиваем минимум с 0.5 до 1.0 для компенсации низкого покрытия
+            2.0,  # Увеличиваем минимум с 1.0 до 2.0 для компенсации низкого покрытия
             max_width_factor
         )
         margin_upper = stddev * tf.clip_by_value(
             tf.abs(z_upper) * tail_weight_pos * regime_scale,
-            1.0,  # Увеличиваем минимум с 0.5 до 1.0 для компенсации низкого покрытия
+            2.0,  # Увеличиваем минимум с 1.0 до 2.0 для компенсации низкого покрытия
             max_width_factor
         )
 
         # ===== 8. УЛУЧШЕНИЕ АСИММЕТРИИ ДЛЯ ЭКСТРЕМАЛЬНЫХ ЗНАЧЕНИЙ =====
         # Увеличиваем чувствительность к экстремальным значениям
-        extreme_vol_threshold = 0.6  # Снижаем порог для более ранней активации
+        extreme_vol_threshold = 0.4  # Снижаем порог для более ранней активации
         extreme_vol_mask = tf.cast(volatility_level > extreme_vol_threshold, tf.float32)
         # Усиливаем асимметрию для широкого диапазона данных
-        lower_expansion_factor = 1.0 + 5.0 * extreme_vol_mask * volatility_level  # Было 2.5
-        upper_expansion_factor = 1.0 + 2.5 * extreme_vol_mask * volatility_level  # Было 1.0
+        lower_expansion_factor = 1.0 + 8.0 * extreme_vol_mask * volatility_level  # Увеличиваем с 5.0 до 8.0
+        upper_expansion_factor = 1.0 + 5.0 * extreme_vol_mask * volatility_level  # Увеличиваем с 2.5 до 5.0
 
         # Добавляем прямую коррекцию на основе анализа инноваций
         if innovations is not None:
@@ -2819,10 +2812,10 @@ class LSTMIMMUKF(tf.Module):
                     # Усиливаем асимметрию для сигналов с широким диапазоном
                     asymmetry_factor = tf.where(
                         asymmetry_ratio > 1.5,
-                        1.0 + 0.8 * (asymmetry_ratio - 1.5),
+                        1.0 + 1.2 * (asymmetry_ratio - 1.5),  # Увеличиваем с 0.8 до 1.2
                         tf.where(
                             asymmetry_ratio < 0.67,
-                            1.0 + 0.8 * (1.5 - 1.0/asymmetry_ratio),
+                            1.0 + 1.2 * (1.5 - 1.0/asymmetry_ratio),  # Увеличиваем с 0.8 до 1.2
                             1.0
                         )
                     )
@@ -2844,17 +2837,17 @@ class LSTMIMMUKF(tf.Module):
             coverage_error = target_coverage_mean - current_coverage
             # Увеличиваем агрессивность корректировки для сигналов с высокой волатильностью
             adjustment_factor = tf.where(
-                coverage_error > 0.20,  # Увеличиваем порог для более агрессивной коррекции
-                1.0 + 8.0 * coverage_error,  # Было 3.0
+                coverage_error > 0.10,  # Уменьшаем порог для более частой коррекции
+                1.0 + 15.0 * coverage_error,  # Увеличиваем с 8.0 до 15.0
                 tf.where(
-                    coverage_error > 0.10,  # Увеличиваем диапазон агрессивной коррекции
-                    1.0 + 5.0 * coverage_error,  # Было 1.5
-                    1.0 - 0.8 * tf.abs(coverage_error)
+                    coverage_error > 0.05,  # Уменьшаем порог для более частой коррекции
+                    1.0 + 10.0 * coverage_error,  # Увеличиваем с 5.0 до 10.0
+                    1.0 + 0.5 * coverage_error  # Увеличиваем минимальную коррекцию
                 )
             )
 
             # Дополнительная коррекция для сигналов с высокой волатильностью
-            volatility_correction = 1.0 + 1.5 * volatility_level  # Усиливаем коррекцию при высокой волатильности
+            volatility_correction = 1.0 + 3.0 * volatility_level  # Увеличиваем с 1.5 до 3.0
             adjustment_factor = adjustment_factor * volatility_correction
 
             # Применяем корректировку с учетом асимметрии
@@ -2862,8 +2855,8 @@ class LSTMIMMUKF(tf.Module):
             margin_upper = margin_upper * adjustment_factor
 
             # Дополнительная асимметричная коррекция
-            if coverage_error > 0.15:
-                asymmetry_factor = 1.0 + 1.5 * coverage_error * volatility_level
+            if coverage_error > 0.05:  # Уменьшаем порог для более частой коррекции
+                asymmetry_factor = 1.0 + 2.5 * coverage_error * volatility_level  # Увеличиваем с 1.5 до 2.5
                 margin_lower = margin_lower * asymmetry_factor  # Больше расширяем нижнюю границу
 
         # ===== 10. ВЫЧИСЛЕНИЕ ГРАНИЦ =====
@@ -2877,10 +2870,10 @@ class LSTMIMMUKF(tf.Module):
         # ===== УЛУЧШЕННАЯ КОРРЕКЦИЯ ДЛЯ ЭКСТРЕМАЛЬНЫХ ЗНАЧЕНИЙ =====
         # Учитываем широкий диапазон данных
         current_volatility_level = tf.squeeze(volatility_level)
-        expansion_factor = 1.0 + 1.0 * current_volatility_level  # Увеличиваем влияние волатильности
+        expansion_factor = 1.0 + 2.0 * current_volatility_level  # Увеличиваем влияние волатильности
 
         # Для сигналов с широким диапазоном увеличиваем базовую ширину
-        base_expansion = 2.5 + 1.5 * (stddev / tf.reduce_mean(stddev + 1e-8))  # Адаптация к относительной волатильности
+        base_expansion = 5.0 + 3.0 * (stddev / tf.reduce_mean(stddev + 1e-8))  # Адаптация к относительной волатильности
         expansion_factor = expansion_factor * base_expansion
 
         needs_expansion = tf.logical_or(
@@ -2889,7 +2882,7 @@ class LSTMIMMUKF(tf.Module):
         )
 
         # Увеличиваем минимальную ширину интервалов
-        min_width = 2.0 * stddev  # Увеличиваем базовую ширину
+        min_width = 5.0 * stddev  # Увеличиваем базовую ширину
         current_width = ci_max - ci_min
         needs_widening = current_width < min_width
 
@@ -2907,8 +2900,8 @@ class LSTMIMMUKF(tf.Module):
             )
             if tf.reduce_any(extreme_value_mask):
                 # Увеличиваем ширину для экстремальных значений
-                ci_min = tf.where(extreme_value_mask, forecast - stddev * 4.0, ci_min)
-                ci_max = tf.where(extreme_value_mask, forecast + stddev * 4.0, ci_max)
+                ci_min = tf.where(extreme_value_mask, forecast - stddev * 8.0, ci_min)
+                ci_max = tf.where(extreme_value_mask, forecast + stddev * 8.0, ci_max)
 
         return ci_min, ci_max, target_coverage
 
@@ -3132,7 +3125,7 @@ class LSTMIMMUKF(tf.Module):
 
             # Базовая калибровочная потеря с усиленным штрафом за недостаточное покрытие
             coverage_diff = tf.abs(actual_coverage - target_coverage_mean)
-            
+
             # ИСПРАВЛЕНО: Усиленный штраф для случаев низкого покрытия (валидация)
             undercoverage_penalty = tf.cond(
                 actual_coverage < target_coverage_mean,
@@ -3145,7 +3138,7 @@ class LSTMIMMUKF(tf.Module):
             ci_width = ci_max - ci_min
             avg_stddev = tf.reduce_mean(std_dev)
             width_ratio = tf.reduce_mean(ci_width / (avg_stddev + 1e-8))
-            
+
             # ИСПРАВЛЕНО: Усиленный штраф за слишком узкие интервалы (валидация)
             # Если width_ratio < 0.7: штраф за чрезмерно узкие интервалы (малое покрытие)
             width_penalty = 2.0 * tf.square(tf.maximum(width_ratio - 1.0, 0.0))  # Штраф за широкие
@@ -3153,7 +3146,7 @@ class LSTMIMMUKF(tf.Module):
             # Если width_ratio = 2.0: penalty = 2.0 × (1.0)² = 2.0 (более строгий)
             # Если width_ratio = 0.8: penalty = 2.0 × (0.0)² + 3.0 × (0.0)² = 0.0 (в порядке)
             # Если width_ratio = 0.5: penalty = 0.0 + 3.0 × (0.2)² = 0.12 (усиленный штраф за слишком узкие)
-            
+
             calibration_loss = calibration_loss + width_penalty
 
             # 7. РАСЧЕТ ПОТЕРИ
@@ -5952,4 +5945,3 @@ class LSTMIMMUKF(tf.Module):
         plt.savefig(filename, dpi=300, bbox_inches='tight')
         print(f"\nГрафик результатов оценки сохранен: {filename}")
         plt.show()
-        
