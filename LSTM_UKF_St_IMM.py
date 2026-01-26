@@ -2586,7 +2586,6 @@ class LSTMIMMUKF(tf.Module):
                     'total_loss': loss,
                     'mse_loss': mse_loss,
                     'entropy_loss': entropy_loss,
-                    'coverage_ratio': actual_coverage,
                     'avg_volatility': avg_volatility,
                     'avg_inflation': avg_inflation,
                     'global_norm': global_norm,
@@ -2601,7 +2600,6 @@ class LSTMIMMUKF(tf.Module):
                     'inflation_anomaly_ratio': inflation_anomaly_ratio,
                     'ukf_min_eigenvalue': min_eigenvalue,
                     'target_coverage': target_coverage_mean,
-                    'ci_width_vs_stddev': width_ratio,
                     'calibration_error': tf.abs(actual_coverage - target_coverage_mean),
                 }
 
@@ -4236,7 +4234,6 @@ class LSTMIMMUKF(tf.Module):
                     # Агрегация метрик
                     epoch_losses.append(loss)
                     epoch_mse_losses.append(metrics['mse_loss'])
-                    epoch_coverage_ratios.append(metrics['coverage_ratio'])
                     epoch_volatility_levels.append(metrics['avg_volatility'])
                     train_metrics.append(metrics)  # Сохраняем все метрики для детального анализа
 
@@ -4264,14 +4261,13 @@ class LSTMIMMUKF(tf.Module):
                 # Средние метрики по эпохе
                 train_loss_avg = tf.reduce_mean(epoch_losses)
                 train_mse_avg = tf.reduce_mean(epoch_mse_losses)
-                train_coverage_avg = tf.reduce_mean(tf.stack(epoch_coverage_ratios))
                 train_volatility_avg = tf.reduce_mean(tf.stack(epoch_volatility_levels))
 
                 # ===== ВАЛИДАЦИЯ =====
                 print("\n📉 ВАЛИДАЦИЯ...")
                 val_losses = []
                 val_mse_losses = []
-                val_coverage_ratios = []
+                self.all_val_covered = []
                 val_volatility_levels = []
                 val_metrics = []  # Список для хранения всех метрик по шагам валидации
                 for batch_idx, (X_val_batch, y_val_for_filtering_batch, y_val_target_batch) in enumerate(val_ds):
@@ -4327,7 +4323,14 @@ class LSTMIMMUKF(tf.Module):
                     # Агрегация метрик
                     val_losses.append(val_loss)
                     val_mse_losses.append(metrics_val['mse_loss'])
-                    val_coverage_ratios.append(metrics_val['coverage_ratio'])
+
+                    # Накопляем флаги покрытия для корректного усреднения по всем точкам
+                    y_target_flat = tf.reshape(y_val_target_batch, [-1])
+                    ci_min_flat = tf.reshape(ci_lower_val, [-1])
+                    ci_max_flat = tf.reshape(ci_upper_val, [-1])
+                    covered_flat = tf.cast((y_target_flat >= ci_min_flat) & (y_target_flat <= ci_max_flat), tf.float32)
+                    self.all_val_covered.extend(covered_flat.numpy().flatten())
+
                     val_volatility_levels.append(metrics_val['avg_volatility'])
                     val_metrics.append(metrics_val)  # Сохраняем все метрики для детального анализа
 
@@ -4342,7 +4345,6 @@ class LSTMIMMUKF(tf.Module):
                 # Средние метрики валидации
                 val_loss_avg = tf.reduce_mean(val_losses)
                 val_mse_avg = tf.reduce_mean(val_mse_losses)
-                val_coverage_avg = tf.reduce_mean(tf.stack(val_coverage_ratios))
                 val_volatility_avg = tf.reduce_mean(tf.stack(val_volatility_levels))
 
                 # ===== ОБРАБОТКА РЕЗУЛЬТАТОВ =====
@@ -4374,6 +4376,10 @@ class LSTMIMMUKF(tf.Module):
                         self.patience_counter += 1
                 else:
                     self.patience_counter += 1
+
+                # Очищаем накопитель для следующей эпохи
+                if hasattr(self, 'all_val_covered'):
+                    self.all_val_covered = []
 
                 # Проверка условий ранней остановки
                 should_stop = False
@@ -4480,13 +4486,23 @@ class LSTMIMMUKF(tf.Module):
         report += f"   • Entropy Loss: {tf.reduce_mean([m['entropy_loss'] for m in train_metrics]).numpy():.6f}\n"
 
         # 📊 ДОВЕРИТЕЛЬНЫЕ ИНТЕРВАЛЫ И ИХ КАЛИБРОВКА
-        train_coverage = tf.reduce_mean([m['coverage_ratio'] for m in train_metrics]).numpy()
         train_target_coverage = tf.reduce_mean([m['target_coverage'] for m in train_metrics]).numpy()
         train_calibration_error = tf.reduce_mean([m['calibration_error'] for m in train_metrics]).numpy()
-        train_ci_width_vs_stddev = tf.reduce_mean([m['ci_width_vs_stddev'] for m in train_metrics]).numpy()
-
+        
+        # ИСПРАВЛЕНО: Используем корректное вычисление отношения ширины ДИ к stddev по всем данным
+        if hasattr(self, 'all_actuals') and len(self.all_actuals) > 0:
+            ci_widths = np.array(self.all_ci_uppers) - np.array(self.all_ci_lowers)
+            y_std = np.std(np.array(self.all_actuals)) + 1e-8
+            train_ci_width_vs_stddev = np.mean(ci_widths) / y_std
+        else:
+            # Fallback для совместимости
+            train_ci_width_vs_stddev = tf.reduce_mean([m['ci_width_vs_stddev'] for m in train_metrics]).numpy()
+        
+        # Поскольку мы удалили per-batch coverage_ratio, используем косвенную оценку на основе calibration error
+        # Фактическое покрытие приблизительно равно target_coverage - calibration_error (если calibration_error > 0)
+        approx_train_coverage = train_target_coverage - train_calibration_error if train_calibration_error > 0 else train_target_coverage + train_calibration_error
         report += "\n📊 КАЛИБРОВКА ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ:\n"
-        report += f"   • Фактическое покрытие ДИ: {train_coverage:.2%}\n"
+        report += f"   • Приблизительное фактическое покрытие ДИ: {approx_train_coverage:.2%}\n"
         report += f"   • Целевое покрытие ДИ: {train_target_coverage:.2%}\n"
         report += f"   • Ошибка калибровки: {train_calibration_error:.4f}\n"
         report += f"   • Средняя ширина ДИ / stddev: {train_ci_width_vs_stddev:.2f}x\n"
@@ -4606,11 +4622,35 @@ class LSTMIMMUKF(tf.Module):
 
         # Валидация
         if val_metrics:
-            report += "\n📉 ВАЛИДАЦИЯ:\n"
-            val_coverage = tf.reduce_mean([m['coverage_ratio'] for m in val_metrics]).numpy()
+            report += "\n📊 КАЛИБРОВКА ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ:\n"
+
+            # Используем правильный расчет покрытия по всем точкам вместо per-batch average
+            if hasattr(self, 'all_val_covered') and len(self.all_val_covered) > 0:
+                val_coverage = np.mean(self.all_val_covered)
+            else:
+                # Fallback для совместимости
+                val_coverage = tf.reduce_mean([m['coverage_ratio'] for m in val_metrics]).numpy()
+
             val_calibration_error = tf.reduce_mean([m['calibration_error'] for m in val_metrics]).numpy()
-            report += f"   • Покрытие ДИ: {val_coverage:.2%}\n"
+            report += f"   • Фактическое покрытие ДИ: {val_coverage:.2%}\n"
+            report += f"   • Целевое покрытие ДИ: {tf.reduce_mean([m['target_coverage'] for m in val_metrics]).numpy():.2%}\n"
             report += f"   • Ошибка калибровки: {val_calibration_error:.4f}\n"
+            report += f"   • Средняя ширина ДИ / stddev: {tf.reduce_mean([m['ci_width_vs_stddev'] for m in val_metrics]).numpy():.2f}x\n"
+
+            # Также добавляем глубокую диагностику покрытия, если доступны данные
+            if hasattr(self, 'all_ci_lowers') and hasattr(self, 'all_ci_uppers') and hasattr(self, 'all_actuals') and len(self.all_actuals) > 0:
+                try:
+                    coverage_results = self.evaluate_coverage(
+                        np.array(self.all_ci_lowers),
+                        np.array(self.all_ci_uppers),
+                        np.array(self.all_actuals)
+                    )
+                    report += f"\n🔍 ГЛУБОКАЯ ДИАГНОСТИКА ПОКРЫТИЯ:\n"
+                    report += f"   • Покрытие: {coverage_results['coverage']:.2%}\n"
+                    report += f"   • Количество попаданий: {int(coverage_results['coverage'] * len(self.all_actuals))}/{len(self.all_actuals)}\n"
+                    report += f"   • Отношение ширины ДИ к std: {coverage_results['width_ratio']:.2f}\n"
+                except Exception as e:
+                    report += f"\n⚠️ ОШИБКА ГЛУБОКОЙ ДИАГНОСТИКИ: {str(e)}\n"
 
         report += f"\n{'='*80}"
         return report
