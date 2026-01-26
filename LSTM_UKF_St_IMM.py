@@ -4434,46 +4434,91 @@ class LSTMIMMUKF(tf.Module):
 
         return history
 
-    def evaluate_coverage(self, ci_lower, ci_upper, y_actual):
+    def evaluate_coverage(self, ci_lower, ci_upper, y_actual, std_dev_forecast=None):
+        """
+        Оценка качества калибровки доверительных интервалов.
+        
+        ВАЖНО: Отношение ширины ДИ к стандартному отклонению должно рассчитываться
+        относительно стандартного отклонения ПРОГНОЗА (std_dev_forecast), а не
+        относительно стандартного отклонения целевой переменной (std(y_actual)).
+        """
         covered = (y_actual >= ci_lower) & (y_actual <= ci_upper)
         coverage = np.mean(covered)
-
-        # ===== ДОБАВИТЬ: Диагностические проверки =====
+        ci_width = np.mean(ci_upper - ci_lower)
+        
+        # ===== КОРРЕКТНЫЙ РАСЧЁТ width_ratio ТОЛЬКО ЧЕРЕЗ std_dev_forecast =====
+        if std_dev_forecast is not None and len(std_dev_forecast) > 0:
+            avg_stddev_forecast = np.mean(np.abs(std_dev_forecast)) + 1e-8
+            width_ratio = ci_width / avg_stddev_forecast
+            
+            # Интерпретация для 90% ДИ с нормальным распределением: ~3.29
+            # Для асимметричных интервалов с толстыми хвостами: 3.0-5.0
+            if width_ratio < 2.5:
+                width_status = "⚠️ СЛИШКОМ УЗКИЕ интервалы (недостаточное покрытие)"
+            elif width_ratio > 5.5:
+                width_status = "⚠️ СЛИШКОМ ШИРОКИЕ интервалы (избыточная неопределённость)"
+            else:
+                width_status = "✅ Оптимальная ширина интервалов"
+        else:
+            width_ratio = None
+            width_status = "ℹ️ Недостаточно данных для расчёта width_ratio"
+            avg_stddev_forecast = None
+        
+        # ===== ДИАГНОСТИЧЕСКИЙ ВЫВОД =====
         print(f"\n{'='*50}")
         print(f"📊 АНАЛИЗ ПОКРЫТИЯ ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ")
         print(f"{'='*50}")
-
+        
+        # Покрытие
         if coverage >= 0.99:
             print(f"🚨 КРИТИЧНО: Покрытие = {coverage:.1%} (слишком высокое!)")
-            print(f"   → Проверьте adaptive_ukf_filter (ограничение P)")
-            print(f"   → Проверьте _student_t_update (ограничение tail_weight)")
+            print(f"   → Проверьте ограничения на ковариацию в UKF")
+            print(f"   → Проверьте параметры калибровки ДИ (слишком широкие интервалы)")
         elif coverage < 0.70:
             print(f"⚠️ ПРЕДУПРЕЖДЕНИЕ: Покрытие = {coverage:.1%} (слишком низкое!)")
-
-        ci_width = np.mean(ci_upper - ci_lower)
-        y_std = np.std(y_actual)
-        width_ratio = ci_width / (y_std + 1e-8)
-
-        status_indicator = '⚠️' if width_ratio > 3.0 or width_ratio < 0.5 else '✅'
-        print(f"{status_indicator} Отношение ширины ДИ к std: {width_ratio:.2f}")
-        if width_ratio > 3.0:
-            print(f"   → СЛИШКОМ ШИРОКИЕ интервалы (width_ratio > 3.0)")
-        elif width_ratio < 0.5:
-            print(f"   → СЛИШКОМ УЗКИЕ интервалы (width_ratio < 0.5)")
-
-        print(f"📈 Покрытие: {coverage:.2%}")
+            print(f"   → Проверьте параметры калибровки ДИ (слишком узкие интервалы)")
+            print(f"   → Проверьте работу детектора аномалий (слишком агрессивная инфляция)")
+        else:
+            print(f"✅ Покрытие: {coverage:.2%} (целевой диапазон: 80-95%)")
+        
         print(f"   Количество попаданий: {np.sum(covered)} / {len(covered)}")
-        status = '✅ ХОРОШО' if 0.80 <= coverage <= 0.95 else '❌ ПРОБЛЕМА'
-        print(f"🎯 Качество калибровки: {status}")
+        
+        # Ширина интервалов
+        print(f"\n📏 Ширина доверительных интервалов:")
+        print(f"   • Средняя ширина ДИ: {ci_width:.4f}")
+        if width_ratio is not None:
+            print(f"   • Отношение ширины ДИ к std_dev прогноза: {width_ratio:.2f}x")
+            print(f"   • {width_status}")
+            print(f"   • Среднее std_dev прогноза: {avg_stddev_forecast:.4f}")
+        else:
+            print(f"   • Отношение ширины ДИ к std(y_actual): {ci_width / (np.std(y_actual) + 1e-8):.2f}x ⚠️ (некорректная метрика!)")
+            print(f"   ⚠️  ВНИМАНИЕ: Для корректной оценки ширины ДИ требуется std_dev_forecast!")
+        
+        # Итоговая оценка калибровки
+        calibration_quality = (
+            "✅ ОТЛИЧНО" if 0.85 <= coverage <= 0.95 else
+            "⚠️ УДОВЛЕТВОРИТЕЛЬНО" if 0.80 <= coverage <= 0.97 else
+            "❌ ПЛОХО"
+        )
+        print(f"\n🎯 Качество калибровки: {calibration_quality}")
         print(f"{'='*50}\n")
-        # ===== КОНЕЦ =====
-
-        return {
+        
+        # ===== ВОЗВРАТ РЕЗУЛЬТАТОВ =====
+        result = {
             'coverage': coverage,
             'ci_width': ci_width,
-            'width_ratio': width_ratio,
-            'is_valid': (0.80 <= coverage <= 0.95)
+            'is_valid': (0.80 <= coverage <= 0.95),
+            'calibration_quality': calibration_quality
         }
+        
+        if width_ratio is not None:
+            result.update({
+                'width_ratio': width_ratio,
+                'avg_stddev_forecast': avg_stddev_forecast,
+                'width_status': width_status
+            })
+        
+        return result
 
     def generate_epoch_report(self, epoch, train_metrics, val_metrics, all_normalized_innov=None):
         """Генерация детального отчета по результатам эпохи"""
