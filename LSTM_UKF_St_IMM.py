@@ -4428,7 +4428,6 @@ class LSTMIMMUKF(tf.Module):
         # 📊 КАЛИБРОВКА ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ (обучение)
         train_target_coverage = tf.reduce_mean([m['target_coverage'] for m in train_metrics]).numpy()
         train_calibration_error = tf.reduce_mean([m['calibration_error'] for m in train_metrics]).numpy()
-        train_ci_width_vs_stddev = tf.reduce_mean([m['ci_width_vs_stddev'] for m in train_metrics]).numpy()
     
         # Поскольку мы удалили per-batch coverage_ratio, используем косвенную оценку на основе calibration error
         approx_train_coverage = train_target_coverage - train_calibration_error if train_calibration_error > 0 else train_target_coverage + train_calibration_error
@@ -4437,7 +4436,6 @@ class LSTMIMMUKF(tf.Module):
         report += f"   • Приблизительное фактическое покрытие ДИ: {approx_train_coverage:.2%}\n"
         report += f"   • Целевое покрытие ДИ: {train_target_coverage:.2%}\n"
         report += f"   • Ошибка калибровки: {train_calibration_error:.4f}\n"
-        report += f"   • Средняя ширина ДИ / волатильность данных: {train_ci_width_vs_stddev:.2f}x\n"
         report += f"   • Статус: {'✅ Оптимально' if train_calibration_error < 0.05 else '⚠️ Требует настройки'}\n"
     
         # 🔍 ГЛУБОКАЯ ДИАГНОСТИКА ПОКРЫТИЯ (на основе накопленных данных за эпоху)
