@@ -2306,14 +2306,14 @@ class LSTMIMMUKF(tf.Module):
                   initial_state, initial_covariance):
         """
         Шаг обучения для адаптивной UKF с контекстной волатильностью
-
+    
         Args:
             X_batch: [B, T=72, n_features=20] - Технические признаки за 72 дня
             y_for_filtering_batch: [B, T=72] - Уровни для фильтрации дней 0-71
             y_target_batch: [B] - Целевой уровень на день 72 (t+1 после окна)
             initial_state: [B, state_dim=1] - Начальное состояние UKF
             initial_covariance: [B, state_dim=1, state_dim=1] - Начальная ковариация UKF
-
+    
         Returns:
             loss: скаляр - Total loss (MSE + calibration + entropy)
             metrics: dict - Словарь с метриками обучения
@@ -2325,7 +2325,8 @@ class LSTMIMMUKF(tf.Module):
             regime_info: dict - Информация о распределении по режимам волатильности
             final_volatility: [B] - Финальный уровень волатильности
             entropy_stats: dict - Статистика энтропии скрытых состояний LSTM
-
+            normalized_innovations: [B, 10, 1] - Нормализованные инновации последних 10 шагов
+    
         Физический смысл:
             - Фильтруем дни 0-71, используя y_for_filtering_batch
             - Прогнозируем день 72 (t+1)
@@ -2338,15 +2339,15 @@ class LSTMIMMUKF(tf.Module):
                 lstm_outputs = self.model(X_batch, training=True)
                 params_output = lstm_outputs['params']  # [B, T, 37]
                 h_lstm2 = lstm_outputs['h_lstm2']       # [B, T, 128]
-
+    
                 # 2. ЭНТРОПИЙНАЯ РЕГУЛЯРИЗАЦИЯ
                 entropy_loss = self.entropy_regularizer.compute_entropy_loss(h_lstm2)
-
+    
                 # 3. ОБРАБОТКА ВЫХОДОВ LSTM
                 vol_context, ukf_params, inflation_config, student_t_config = self.process_lstm_output(params_output)
                 initial_state = tf.reshape(initial_state, [B, self.state_dim])
                 initial_covariance = tf.reshape(initial_covariance, [B, self.state_dim, self.state_dim])
-
+    
                 # 4. АДАПТИВНАЯ ФИЛЬТРАЦИЯ UKF
                 results = self.adaptive_ukf_filter(
                     X_batch,
@@ -2358,7 +2359,7 @@ class LSTMIMMUKF(tf.Module):
                     initial_state,
                     initial_covariance
                 )
-
+    
                 # Распаковка результатов
                 x_filtered = results[0]        # [B, T, 1]
                 innovations = results[1]       # [B, T, 1]
@@ -2366,14 +2367,14 @@ class LSTMIMMUKF(tf.Module):
                 inflation_factors = results[3] # [B, T, 1]
                 final_state = results[4]       # [B, 1]
                 final_covariance = results[5]  # [B, 1, 1]
-
-                # ДОБАВЛЕНО: сбор нормализованных инноваций для анализа
+    
+                # Сбор нормализованных инноваций для анализа
                 normalized_innovations = tf.abs(innovations[:, -10:, :])  # последние 10 шагов
-
-                # 5. ЯВНЫЙ PREDICT НА СЛЕДУЮЩИЙ ШАГ - ИЗВЛЕЧЕНИЕ ПАРАМЕТРОВ ПОСЛЕДНЕГО ШАГА
+    
+                # 5. ЯВНЫЙ PREDICT НА СЛЕДУЮЩИЙ ШАГ
                 final_volatility = tf.squeeze(volatility_levels[:, -1, :])  # [B, T, 1] → [B]
                 t_last = tf.shape(ukf_params['q_base'])[1] - 1
-
+    
                 # Явное извлечение параметров последнего шага
                 q_base_final = tf.gather(ukf_params['q_base'], t_last, axis=1)  # [B, 1]
                 q_sensitivity_final = tf.gather(ukf_params['q_sensitivity'], t_last, axis=1)  # [B, 1]
@@ -2388,121 +2389,91 @@ class LSTMIMMUKF(tf.Module):
                 kappa_base_final = tf.gather(ukf_params['kappa_base'], t_last, axis=1)  # [B, 1]
                 kappa_sensitivity_final = tf.gather(ukf_params['kappa_sensitivity'], t_last, axis=1)  # [B, 1]
                 inf_factor_final = tf.gather(inflation_factors[:, -1, :], t_last, axis=1)
-
-                # === КРИТИЧЕСКИ ВАЖНО: ВЫЧИСЛИТЬ regime_info СРАЗУ ПОСЛЕ ПОЛУЧЕНИЯ final_volatility ===
+    
+                # Вычисление распределения по режимам волатильности
                 regime_info = self.regime_selector.assign_soft_regimes(final_volatility)
-
+    
                 forecast, std_dev = self._explicit_predict_next_step(
                     final_state,
                     final_covariance,
                     final_volatility,
                     q_base_final, q_sensitivity_final, q_floor_final,
-                    inf_factor_final,  # ← ДОБАВЛЕНО
+                    inf_factor_final,
                     relax_base_final, relax_sensitivity_final,
                     alpha_base_final, alpha_sensitivity_final,
                     kappa_base_final, kappa_sensitivity_final
                 )
-
-                # 6. РАСЧЕТ CALIBRATION LOSS С АСИММЕТРИЧНЫМИ ГРАНИЦАМИ
-                # Снижаем целевое покрытие для более практичных интервалов
-                base_confidence = 0.88  # Снизить с 0.90 для более узких интервалов
-                confidence_range = 0.15  # Диапазон изменения (0.92-0.75)
-
-                # Целевое покрытие зависит от уровня волатильности
-                confidence_ceil = tf.fill(tf.shape(final_volatility), base_confidence + confidence_range/2)  # 0.92
-                confidence_floor = tf.fill(tf.shape(final_volatility), base_confidence - confidence_range/2)  # 0.75
-                target_coverage = confidence_ceil - (confidence_ceil - confidence_floor) * final_volatility
-
-                batch_shape = (B,)
+    
+                # 6. РАСЧЕТ АДАПТИВНЫХ ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ
+                # Параметры калибровки ДИ (85-95% покрытие в зависимости от волатильности)
+                base_confidence = 0.88
+                confidence_range = 0.15
+                confidence_ceil = tf.fill(tf.shape(final_volatility), base_confidence + confidence_range/2)  # 0.955
+                confidence_floor = tf.fill(tf.shape(final_volatility), base_confidence - confidence_range/2)  # 0.805
+                target_coverage_adaptive = confidence_ceil - (confidence_ceil - confidence_floor) * final_volatility
+    
+                # Настройка параметров Student-t для асимметричной калибровки
+                batch_shape = tf.shape(final_volatility)
                 student_t_config_final = {
                     'confidence_ceil': tf.fill(batch_shape, 0.95),
                     'confidence_floor': tf.fill(batch_shape, 0.70),
                     'dof_base': tf.fill(batch_shape, 6.0),
                     'dof_sensitivity': tf.fill(batch_shape, 0.5),
-                    'asymmetry_pos': tf.fill(batch_shape, 0.7),   # ← убрать [:, tf.newaxis]
-                    'asymmetry_neg': tf.fill(batch_shape, 1.3),   # ← убрать [:, tf.newaxis]
+                    'asymmetry_pos': tf.fill(batch_shape, 0.7)[:, tf.newaxis],
+                    'asymmetry_neg': tf.fill(batch_shape, 1.3)[:, tf.newaxis],
                     'calibration_sensitivity': tf.fill(batch_shape, 1.0),
-                    'tail_weight_pos': tf.fill(batch_shape, 1.0),
-                    'tail_weight_neg': tf.fill(batch_shape, 1.0),
+                    'tail_weight_pos': tf.fill(batch_shape, 0.8)[:, tf.newaxis],
+                    'tail_weight_neg': tf.fill(batch_shape, 1.2)[:, tf.newaxis],
                     'confidence_base': tf.fill(batch_shape, 0.85),
                 }
-
-                # Настройка параметров Student-t для асимметричной калибровки - ✅ КОРРЕКТНЫЕ РАЗМЕРНОСТИ [B, 1]
-                batch_shape = tf.shape(final_volatility)
-                tail_weight_pos = tf.fill(batch_shape, 0.8)[:, tf.newaxis]  # [B] -> [B, 1]
-                tail_weight_neg = tf.fill(batch_shape, 1.2)[:, tf.newaxis]  # [B] -> [B, 1]
-                student_t_config_final['tail_weight_pos'] = tail_weight_pos
-                student_t_config_final['tail_weight_neg'] = tail_weight_neg
-                student_t_config_final['asymmetry_pos'] = tf.fill(batch_shape, 0.7)[:, tf.newaxis]  # [B] -> [B, 1]
-                student_t_config_final['asymmetry_neg'] = tf.fill(batch_shape, 1.3)[:, tf.newaxis]  # [B] -> [B, 1]
-
-                # Адаптивные АСИММЕТРИЧНЫЕ границы доверительного интервала
+    
+                # Адаптивные асимметричные границы доверительного интервала
                 ci_lower, ci_upper, target_coverage = self._calibrate_confidence_interval(
                     forecast, std_dev, final_volatility, student_t_config_final,
                     innovations=innovations[:, -10:, :] if innovations is not None else None,
                     regime_assignment=regime_info['regime_assignment']
                 )
-
-                # Проверка валидности границ (защита от аномалий)
+    
+                # Проверка валидности границ
                 ci_min = tf.minimum(ci_lower, ci_upper)
                 ci_max = tf.maximum(ci_lower, ci_upper)
-
-                # Вычисление покрытия
-                # ✅ ИСПРАВЛЕНО: Приводим к одинаковым размерностям для сравнения
+    
+                # Вычисление фактического покрытия
                 y_target_flat = tf.reshape(y_target_batch, [-1])
                 ci_min_flat = tf.reshape(ci_min, [-1])
                 ci_max_flat = tf.reshape(ci_max, [-1])
-
                 covered = tf.cast((y_target_flat >= ci_min_flat) & (y_target_flat <= ci_max_flat), tf.float32)
                 actual_coverage = tf.reduce_mean(covered)
-                target_coverage_mean = tf.reduce_mean(target_coverage)
-
-                # === ИСПРАВЛЕННЫЙ РАСЧЕТ CALIBRATION LOSS В train_step ===
-
-                # 1. Расчет метрик интервалов
-                # ✅ ИСПРАВЛЕНО: Используем правильные размерности для ширины
-                ci_width = tf.reshape(ci_max, [-1]) - tf.reshape(ci_min, [-1])
-                stddev_flat = tf.reshape(std_dev, [-1])
-                avg_stddev = tf.reduce_mean(stddev_flat)
-
-                # 2. ОСНОВНОЙ ШТРАФ: недостаточное/избыточное покрытие
-                target_coverage = 0.85  # 85% покрытие - хороший баланс
-                coverage_diff = tf.abs(actual_coverage - target_coverage)
-
-                # ИСПРАВЛЕНО: Усиленный штраф для случаев низкого покрытия
-                # Если покрытие ниже целевого, штраф увеличивается агрессивнее
+                target_coverage_mean = tf.reduce_mean(target_coverage)  # ЕДИНСТВЕННЫЙ источник истины
+    
+                # === ЕДИНСТВЕННЫЙ СОГЛАСОВАННЫЙ РАСЧЕТ ШИРИНЫ ДИ ===
+                # Используем ВОЛАТИЛЬНОСТЬ ДАННЫХ (не неопределенность модели!) как объективную шкалу
+                ci_width = ci_max - ci_min
+                y_std_batch = tf.math.reduce_std(y_target_batch) + 1e-8  # Волатильность ДАННЫХ
+                width_ratio = tf.reduce_mean(ci_width) / y_std_batch      # ЕДИНСТВЕННЫЙ расчет
+    
+                # === ШТРАФ ЗА НЕДОСТАТОЧНОЕ/ИЗБЫТОЧНОЕ ПОКРЫТИЕ ===
+                # Используем ТО ЖЕ покрытие, что и для калибровки ДИ (согласованность!)
+                coverage_diff = tf.abs(actual_coverage - target_coverage_mean)
                 undercoverage_penalty = tf.cond(
-                    actual_coverage < target_coverage,
-                    lambda: 5.0 * tf.square(target_coverage - actual_coverage),  # Усиленный штраф за недостаточное покрытие
-                    lambda: 2.0 * tf.square(actual_coverage - target_coverage)   # Стандартный штраф за избыточное покрытие
+                    actual_coverage < target_coverage_mean,
+                    lambda: 5.0 * tf.square(target_coverage_mean - actual_coverage),  # Усиленный штраф за недостаточное покрытие
+                    lambda: 2.0 * tf.square(actual_coverage - target_coverage_mean)   # Стандартный штраф за избыточное покрытие
                 )
-                coverage_penalty = undercoverage_penalty
-                # Если coverage = 0.95: penalty = 2.0 × (0.10)² = 0.02
-                # Если coverage = 0.70: penalty = 5.0 × (0.15)² = 0.1125 (усиленный штраф)
-
-                # 3. ШТРАФ НА ШИРИНУ (адаптивная к std_dev) - БОЛЕЕ СТРОГИЙ
-                # 80% coverage требует ~4x stddev для нормального распределения
-                target_width_ratio = 4.0  # Было 1.0
-                width_ratio = tf.reduce_mean(ci_width) / (avg_stddev + 1e-8)
-
-                # ИСПРАВЛЕНО: Усиленный штраф за слишком узкие интервалы (для компенсации низкого покрытия)
-                # Если width_ratio < 0.7: штраф за чрезмерно узкие интервалы (малое покрытие)
-                width_penalty = 2.0 * tf.square(tf.maximum(width_ratio - target_width_ratio, 0.0))  # Штраф за широкие
-                width_penalty += 3.0 * tf.square(tf.maximum(target_width_ratio * 0.7 - width_ratio, 0.0))  # Усиленный штраф за слишком узкие
-                # Если width_ratio = 2.0: penalty = 2.0 × (1.0)² = 2.0 (более строгий)
-                # Если width_ratio = 0.8: penalty = 2.0 × (0.0)² + 3.0 × (0.0)² = 0.0 (в порядке)
-                # Если width_ratio = 0.5: penalty = 0.0 + 3.0 × (0.2)² = 0.12 (усиленный штраф за слишком узкие)
-
-                # 4. ШТРАФ НА АСИММЕТРИЧНОСТЬ (левая vs правая граница)
+    
+                # === ШТРАФ ЗА ШИРИНУ ИНТЕРВАЛОВ ===
+                # Целевая ширина для 85-90% ДИ при нормальном распределении
+                target_width_ratio = 3.5
+                width_penalty = 2.0 * tf.square(tf.maximum(width_ratio - target_width_ratio, 0.0))
+                width_penalty += 3.0 * tf.square(tf.maximum(target_width_ratio * 0.7 - width_ratio, 0.0))
+    
+                # === ШТРАФ ЗА АСИММЕТРИЧНОСТЬ ===
                 asymmetry = (ci_max - forecast) / (forecast - ci_min + 1e-8)
-                asymmetry_log = tf.math.log(asymmetry + 1e-8)  # log(asymmetry)
-                asymmetry_penalty = 0.5 * tf.reduce_mean(tf.square(asymmetry_log))
-                # Идеально: asymmetry ≈ 1.0 → log(1.0) = 0 → penalty = 0
-                # Асимметрия 2.0: log(2.0) = 0.693 → penalty = 0.5 × 0.48 = 0.24
-
-                calibration_loss = coverage_penalty + width_penalty + asymmetry_penalty
-
-                # 7. РАСЧЕТ ПОТЕРИ
+                asymmetry_penalty = 0.5 * tf.reduce_mean(tf.square(tf.math.log(asymmetry + 1e-8)))
+    
+                calibration_loss = undercoverage_penalty + width_penalty + asymmetry_penalty
+    
+                # 7. РАСЧЕТ ИТОГОВОЙ ПОТЕРИ
                 loss = self.compute_loss(
                     forecast,
                     y_target_batch,
@@ -2512,19 +2483,19 @@ class LSTMIMMUKF(tf.Module):
                     calibration_loss,
                     entropy_loss
                 )
-
-                # ✅ ИСПРАВЛЕНО: Нормализуем лосс по размеру батча и времени
-                B = tf.cast(tf.shape(y_target_batch)[0], tf.float32)
-                T = tf.cast(tf.shape(y_for_filtering_batch)[1], tf.float32)
-                loss = loss / (B * T)
-
-                # 8. СБОР ВСЕХ ОБУЧАЕМЫХ ПЕРЕМЕННЫХ
+    
+                # Нормализация потери по размеру батча и времени
+                B_float = tf.cast(tf.shape(y_target_batch)[0], tf.float32)
+                T_float = tf.cast(tf.shape(y_for_filtering_batch)[1], tf.float32)
+                loss = loss / (B_float * T_float)
+    
+                # 8. СБОР ОБУЧАЕМЫХ ПЕРЕМЕННЫХ
                 trainable_vars = []
                 if self.model is not None:
                     trainable_vars.extend(self.model.trainable_variables)
                 if self.use_diff_ukf and hasattr(self, 'diff_ukf_component'):
                     trainable_vars.extend(self.diff_ukf_component.trainable_variables)
-
+    
                 additional_vars = [
                     self.base_q_logit, self.base_r_logit,
                     self.volatility_sensitivity,
@@ -2536,7 +2507,7 @@ class LSTMIMMUKF(tf.Module):
                 for var in additional_vars:
                     if var is not None and isinstance(var, tf.Variable):
                         trainable_vars.append(var)
-
+    
                 if hasattr(self, 'regime_selector') and self.regime_selector is not None:
                     trainable_vars.extend([
                         self.regime_selector.regime_scales,
@@ -2544,44 +2515,39 @@ class LSTMIMMUKF(tf.Module):
                     ])
                     if self.regime_selector.learnable_centers and hasattr(self.regime_selector, 'center_logits'):
                         trainable_vars.append(self.regime_selector.center_logits)
-
+    
                 # 9. ВЫЧИСЛЕНИЕ И ПРИМЕНЕНИЕ ГРАДИЕНТОВ
                 gradients = tape.gradient(loss, trainable_vars)
                 clipped_grads, global_norm = tf.clip_by_global_norm(gradients, 1.0)
                 self._optimizer.apply_gradients(zip(clipped_grads, trainable_vars))
-
+    
                 # 10. РАСЧЕТ МЕТРИК
                 mse_loss = tf.reduce_mean(tf.square(forecast - y_target_batch))
                 avg_volatility = tf.reduce_mean(final_volatility)
-
-                # ✅ regime_info уже вычислена выше, используем ее для сбора метрик
+    
+                # Статистика режимов волатильности
                 regime_soft_weights = tf.reduce_mean(regime_info['soft_weights'], axis=0)  # [3]
                 regime_entropy = tf.reduce_mean(regime_info['entropy'])  # скаляр
-
-                # Сбор Q/R ratio статистики
+    
+                # Q/R мониторинг
                 q_current = tf.reduce_mean(q_base_final)
                 r_current = tf.reduce_mean(r_base_final)
                 qr_ratio = q_current / (r_current + 1e-8)
-
-
-                # Сбор статистики по адаптивному inflation
+    
+                # Статистика адаптивного inflation
                 avg_inflation = tf.reduce_mean(inflation_factors[:, -1, :])
-
                 dynamic_threshold, inflation_anomaly_ratio = compute_adaptive_threshold(
-                    inflation_factors,          # [B, T, 1] ✓
-                    final_volatility,           # [B] ✓ (это то, что нужно)
-                    self.threshold_ema,         # tf.Variable ✓
-                    target_anomaly_ratio=0.35   # баланс между нормальными и аномальными состояниями
+                    inflation_factors,
+                    final_volatility,
+                    self.threshold_ema,
+                    target_anomaly_ratio=0.35
                 )
-                if self.debug_mode:
-                    tf.print("Dynamic threshold:", dynamic_threshold)
-                    tf.print("Inflation anomaly ratio:", inflation_anomaly_ratio)
-
-                # Сбор статистики по спектральным параметрам UKF
+    
+                # Спектральная стабильность UKF
                 spectrum_info = self.diff_ukf_component.get_spectrum_info()
                 min_eigenvalue = spectrum_info['min_eigenvalue']
-
-                # Сборка метрик
+    
+                # Сборка метрик (СОГЛАСОВАННАЯ МЕТРИКА ДЛЯ ОТЧЕТА)
                 metrics = {
                     'total_loss': loss,
                     'mse_loss': mse_loss,
@@ -2589,7 +2555,6 @@ class LSTMIMMUKF(tf.Module):
                     'avg_volatility': avg_volatility,
                     'avg_inflation': avg_inflation,
                     'global_norm': global_norm,
-                    # Новые метрики для детального отчета
                     'qr_ratio': qr_ratio,
                     'q_value': q_current,
                     'r_value': r_current,
@@ -2599,16 +2564,17 @@ class LSTMIMMUKF(tf.Module):
                     'regime_entropy': regime_entropy,
                     'inflation_anomaly_ratio': inflation_anomaly_ratio,
                     'ukf_min_eigenvalue': min_eigenvalue,
-                    'target_coverage': target_coverage_mean,
+                    'target_coverage': target_coverage_mean,  # Согласовано с калибровкой
+                    'ci_width_vs_stddev': width_ratio,        # Согласовано с штрафом (через волатильность данных)
                     'calibration_error': tf.abs(actual_coverage - target_coverage_mean),
                 }
-
-                # 11. ДОПОЛНИТЕЛЬНАЯ ИНФОРМАЦИЯ ОБ ЭНТРОПИИ ДЛЯ ЛОГИРОВАНИЯ
+    
+                # 11. ДОПОЛНИТЕЛЬНАЯ ИНФОРМАЦИЯ ОБ ЭНТРОПИИ
                 entropy_stats = self.entropy_regularizer.get_entropy_stats(h_lstm2)
-
-                # 12. ОБНОВЛЕНИЕ ИСТОРИИ ВОЛАТИЛЬНОСТИ (только после сбора всех метрик)
+    
+                # 12. ОБНОВЛЕНИЕ ИСТОРИИ ВОЛАТИЛЬНОСТИ
                 self.regime_selector.update_history(final_volatility)
-
+    
                 # 13. АДАПТАЦИЯ ПАРАМЕТРОВ РЕЖИМОВ ПРИ ВЫСОКОЙ ЭНТРОПИИ
                 entropy_val = tf.reduce_mean(regime_info['entropy'])
                 if entropy_val > 1.05:
@@ -2616,7 +2582,7 @@ class LSTMIMMUKF(tf.Module):
                     self.regime_selector.temperature.assign(new_temp)
                     regime_info = self.regime_selector.assign_soft_regimes(final_volatility)
                     entropy_val = tf.reduce_mean(regime_info['entropy'])
-
+    
                 # ВЕРНЁМ РЕЗУЛЬТАТЫ
                 return loss, metrics, final_state, final_covariance, forecast, std_dev, \
                        volatility_levels, regime_info, final_volatility, entropy_stats, normalized_innovations
@@ -2788,7 +2754,7 @@ class LSTMIMMUKF(tf.Module):
         # ===== 7. ВЫЧИСЛЕНИЕ МАРЖ С УЧЕТОМ ШИРОКОГО ДИАПАЗОНА И ВЫСОКОЙ ВОЛАТИЛЬНОСТИ =====
         # Увеличиваем базовые множители для компенсации низкого покрытия
         regime_scale_factor = tf.maximum(1.5, regime_scale)  # Увеличиваем минимальный масштаб
-        max_width_factor = 15.0 + 10.0 * regime_scale_factor  # Значительно увеличиваем базовую ширину
+        max_width_factor = 15.0 + 10.0 * regime_scale_factor  # Максимум ~8-10x вместо 30+
 
         # Добавляем прямую коррекцию на основе stddev
         stddev_factor = 2.0 + 1.0 * (stddev / tf.reduce_mean(stddev + 1e-8))  # Учет относительной волатильности
@@ -3011,15 +2977,15 @@ class LSTMIMMUKF(tf.Module):
             lstm_outputs = self.model(X_batch, training=False)
             params_output = lstm_outputs['params']  # [B, T, 37]
             h_lstm2 = lstm_outputs['h_lstm2']       # [B, T, 128]
-
+    
             # 2. ЭНТРОПИЙНАЯ РЕГУЛЯРИЗАЦИЯ
             entropy_loss = self.entropy_regularizer.compute_entropy_loss(h_lstm2)
-
+    
             # 3. Обработка выходов LSTM
             vol_context, ukf_params, inflation_config, student_t_config = self.process_lstm_output(params_output)
             initial_state = tf.reshape(initial_state, [B, self.state_dim])
             initial_covariance = tf.reshape(initial_covariance, [B, self.state_dim, self.state_dim])
-
+    
             # 4. Адаптивная UKF фильтрация
             results = self.adaptive_ukf_filter(
                 X_batch,
@@ -3031,7 +2997,7 @@ class LSTMIMMUKF(tf.Module):
                 initial_state,
                 initial_covariance
             )
-
+    
             # Распаковка результатов
             x_filtered = results[0]        # [B, T, 1]
             innovations = results[1]       # [B, T, 1]
@@ -3039,26 +3005,24 @@ class LSTMIMMUKF(tf.Module):
             inflation_factors = results[3] # [B, T, 1]
             raw_final_state = results[4]   # [B, 1]
             final_covariance = results[5]  # [B, 1, 1]
-
-            # === КРИТИЧЕСКИ ВАЖНО: ВЫЧИСЛИТЬ regime_info СРАЗУ ПОСЛЕ ПОЛУЧЕНИЯ final_volatility ===
+    
+            # Извлечение финальной волатильности (единственный расчет)
             final_volatility = tf.squeeze(volatility_levels[:, -1, :])  # [B]
+    
+            # === КРИТИЧЕСКИ ВАЖНО: ВЫЧИСЛИТЬ regime_info СРАЗУ ПОСЛЕ ПОЛУЧЕНИЯ final_volatility ===
             regime_info = self.regime_selector.assign_soft_regimes(final_volatility)
-
+    
             # === ЯВНАЯ ПРОВЕРКА СООТВЕТСТВИЯ FINAL STATE ===
             expected_final_state = x_filtered[:, -1, :]  # [B, 1]
             final_state = tf.reshape(expected_final_state, [B, 1])  # [B, 1]
-
+    
             if self.debug_mode:
                 state_diff = tf.reduce_mean(tf.abs(raw_final_state - final_state))
-                tf.print("Проверка соответствия final state:", state_diff)
-
-            final_state = final_state  # [B, 1]
-
+                tf.print("Проверка соответствия final state (val):", state_diff)
+    
             # 5. ЯВНЫЙ PREDICT-ШАГ НА СЛЕДУЮЩИЙ ШАГ
-            final_volatility = volatility_levels[:, -1, :]  # [B, T, 1] → [B, 1]
-            final_volatility = tf.squeeze(final_volatility, -1)  # [B, 1] → [B]
             t_last = tf.shape(ukf_params['q_base'])[1] - 1
-
+    
             # Явное извлечение параметров последнего шага
             q_base_final = tf.gather(ukf_params['q_base'], t_last, axis=1)  # [B, 1]
             q_sensitivity_final = tf.gather(ukf_params['q_sensitivity'], t_last, axis=1)  # [B, 1]
@@ -3073,100 +3037,80 @@ class LSTMIMMUKF(tf.Module):
             kappa_base_final = tf.gather(ukf_params['kappa_base'], t_last, axis=1)  # [B, 1]
             kappa_sensitivity_final = tf.gather(ukf_params['kappa_sensitivity'], t_last, axis=1)  # [B, 1]
             inf_factor_final = tf.gather(inflation_factors[:, -1, :], t_last, axis=1)
-
+    
             forecast, std_dev = self._explicit_predict_next_step(
                 final_state,
                 final_covariance,
                 final_volatility,
                 q_base_final, q_sensitivity_final, q_floor_final,
-                inf_factor_final,  # ← ДОБАВЛЕНО
+                inf_factor_final,
                 relax_base_final, relax_sensitivity_final,
                 alpha_base_final, alpha_sensitivity_final,
                 kappa_base_final, kappa_sensitivity_final
             )
-
-            # 6. РАСЧЕТ CALIBRATION LOSS С АСИММЕТРИЧНЫМИ ГРАНИЦАМИ
-            # Снижаем целевое покрытие для более практичных интервалов
-            base_confidence = 0.80  # Снизить с 0.90 для более узких интервалов
-            confidence_range = 0.10  # Диапазон изменения (0.92-0.75)
-
-            # Целевое покрытие зависит от уровня волатильности
+    
+            # 6. РАСЧЕТ КАЛИБРОВКИ ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ
+            # Адаптивное целевое покрытие (0.75-0.85 в зависимости от волатильности)
+            base_confidence = 0.80
+            confidence_range = 0.10
             confidence_ceil = tf.fill(tf.shape(final_volatility), base_confidence + confidence_range/2)  # 0.85
             confidence_floor = tf.fill(tf.shape(final_volatility), base_confidence - confidence_range/2)  # 0.75
             target_coverage = confidence_ceil - (confidence_ceil - confidence_floor) * final_volatility
-
-            batch_shape = (B,)
-            # Создание всех параметров с правильной формой (B,)
-            student_t_config_final = {
-                'confidence_ceil': tf.fill(batch_shape, 0.95),
-                'confidence_floor': tf.fill(batch_shape, 0.70),
-                'dof_base': tf.fill(batch_shape, 6.0),
-                'dof_sensitivity': tf.fill(batch_shape, 0.5),
-                'asymmetry_pos': tf.fill(batch_shape, 0.7),
-                'asymmetry_neg': tf.fill(batch_shape, 1.3),
-                'calibration_sensitivity': tf.fill(batch_shape, 1.0),
-                'tail_weight_pos': tf.fill(batch_shape, 1.0),
-                'tail_weight_neg': tf.fill(batch_shape, 1.0),
-                'confidence_base': tf.fill(batch_shape, 0.85),
-            }
-
+    
             # Настройка параметров Student-t для асимметричной калибровки
             batch_shape_tensor = tf.shape(final_volatility)
-            tail_weight_pos = tf.fill(batch_shape_tensor, 1.2)[:, tf.newaxis]  # Увеличено с 0.8
-            tail_weight_neg = tf.fill(batch_shape_tensor, 1.5)[:, tf.newaxis]  # Увеличено с 1.2
-            student_t_config_final['tail_weight_pos'] = tail_weight_pos
-            student_t_config_final['tail_weight_neg'] = tail_weight_neg
-            student_t_config_final['asymmetry_pos'] = tf.fill(batch_shape_tensor, 0.7)[:, tf.newaxis]  # [B] -> [B, 1]
-            student_t_config_final['asymmetry_neg'] = tf.fill(batch_shape_tensor, 1.3)[:, tf.newaxis]  # [B] -> [B, 1]
-
-            # Адаптивные АСИММЕТРИЧНЫЕ границы доверительного интервала
+            student_t_config_final = {
+                'confidence_ceil': tf.fill(batch_shape_tensor, 0.95),
+                'confidence_floor': tf.fill(batch_shape_tensor, 0.70),
+                'dof_base': tf.fill(batch_shape_tensor, 6.0),
+                'dof_sensitivity': tf.fill(batch_shape_tensor, 0.5),
+                'asymmetry_pos': tf.fill(batch_shape_tensor, 0.7)[:, tf.newaxis],
+                'asymmetry_neg': tf.fill(batch_shape_tensor, 1.3)[:, tf.newaxis],
+                'calibration_sensitivity': tf.fill(batch_shape_tensor, 1.0),
+                'tail_weight_pos': tf.fill(batch_shape_tensor, 1.2)[:, tf.newaxis],
+                'tail_weight_neg': tf.fill(batch_shape_tensor, 1.5)[:, tf.newaxis],
+                'confidence_base': tf.fill(batch_shape_tensor, 0.85),
+            }
+    
+            # Адаптивные асимметричные границы доверительного интервала
             ci_lower, ci_upper, target_coverage = self._calibrate_confidence_interval(
                 forecast, std_dev, final_volatility, student_t_config_final,
                 innovations=innovations[:, -10:, :] if innovations is not None else None,
                 regime_assignment=regime_info['regime_assignment']
             )
-
+    
             # Проверка валидности границ
             ci_min = tf.minimum(ci_lower, ci_upper)
             ci_max = tf.maximum(ci_lower, ci_upper)
-
-            # Вычисление покрытия
+    
+            # Вычисление фактического покрытия
             covered = tf.cast(
                 (y_target_batch >= ci_min) & (y_target_batch <= ci_max),
                 tf.float32
-            )  # [B]
-            actual_coverage = tf.reduce_mean(covered)  # Скаляр [0, 1]
-
-            # target_coverage уже адаптирован под каждый элемент батча
-            target_coverage_mean = tf.reduce_mean(target_coverage)  # [B] → скаляр [0, 1]
-
-            # Базовая калибровочная потеря с усиленным штрафом за недостаточное покрытие
-            coverage_diff = tf.abs(actual_coverage - target_coverage_mean)
-
-            # ИСПРАВЛЕНО: Усиленный штраф для случаев низкого покрытия (валидация)
+            )
+            actual_coverage = tf.reduce_mean(covered)
+            target_coverage_mean = tf.reduce_mean(target_coverage)
+    
+            # === ЕДИНЫЙ СОГЛАСОВАННЫЙ РАСЧЕТ ШИРИНЫ ДИ ОТНОСИТЕЛЬНО ВОЛАТИЛЬНОСТИ ДАННЫХ ===
+            ci_width = ci_max - ci_min
+            y_std_batch = tf.math.reduce_std(y_target_batch) + 1e-8  # Волатильность ДАННЫХ (не неопределенность модели!)
+            width_ratio = tf.reduce_mean(ci_width) / y_std_batch      # ЕДИНСТВЕННЫЙ расчет для штрафа и метрики
+    
+            # Штраф за недостаточное/избыточное покрытие
             undercoverage_penalty = tf.cond(
                 actual_coverage < target_coverage_mean,
-                lambda: 5.0 * tf.square(target_coverage_mean - actual_coverage),  # Усиленный штраф за недостаточное покрытие
-                lambda: 2.0 * tf.square(actual_coverage - target_coverage_mean)   # Стандартный штраф за избыточное покрытие
+                lambda: 5.0 * tf.square(target_coverage_mean - actual_coverage),
+                lambda: 2.0 * tf.square(actual_coverage - target_coverage_mean)
             )
-            calibration_loss = undercoverage_penalty
-
-            # Дополнительный штраф за ширину интервалов - БОЛЕЕ СТРОГИЙ
-            ci_width = ci_max - ci_min
-            avg_stddev = tf.reduce_mean(std_dev)
-            width_ratio = tf.reduce_mean(ci_width / (avg_stddev + 1e-8))
-
-            # ИСПРАВЛЕНО: Усиленный штраф за слишком узкие интервалы (валидация)
-            # Если width_ratio < 0.7: штраф за чрезмерно узкие интервалы (малое покрытие)
-            width_penalty = 2.0 * tf.square(tf.maximum(width_ratio - 1.0, 0.0))  # Штраф за широкие
-            width_penalty += 3.0 * tf.square(tf.maximum(1.0 * 0.7 - width_ratio, 0.0))  # Усиленный штраф за слишком узкие
-            # Если width_ratio = 2.0: penalty = 2.0 × (1.0)² = 2.0 (более строгий)
-            # Если width_ratio = 0.8: penalty = 2.0 × (0.0)² + 3.0 × (0.0)² = 0.0 (в порядке)
-            # Если width_ratio = 0.5: penalty = 0.0 + 3.0 × (0.2)² = 0.12 (усиленный штраф за слишком узкие)
-
-            calibration_loss = calibration_loss + width_penalty
-
-            # 7. РАСЧЕТ ПОТЕРИ
+    
+            # Штраф за ширину интервалов (адаптирован под волатильность данных)
+            target_width_ratio = 3.5  # Для 85% ДИ при нормальном распределении
+            width_penalty = 2.0 * tf.square(tf.maximum(width_ratio - target_width_ratio, 0.0))
+            width_penalty += 3.0 * tf.square(tf.maximum(target_width_ratio * 0.7 - width_ratio, 0.0))
+    
+            calibration_loss = undercoverage_penalty + width_penalty
+    
+            # 7. РАСЧЕТ ИТОГОВОЙ ПОТЕРИ
             loss = self.compute_loss(
                 forecast,
                 y_target_batch,
@@ -3176,46 +3120,43 @@ class LSTMIMMUKF(tf.Module):
                 calibration_loss,
                 entropy_loss
             )
-
-            # ✅ ИСПРАВЛЕНО: Нормализуем лосс по размеру батча и времени
+    
+            # Нормализация потери
             B = tf.cast(tf.shape(y_target_batch)[0], tf.float32)
             T = tf.cast(tf.shape(y_for_filtering_batch)[1], tf.float32)
             loss = loss / (B * T)
-
+    
             # 8. РАСЧЕТ МЕТРИК
             mse_loss = tf.reduce_mean(tf.square(forecast - y_target_batch))
             avg_volatility = tf.reduce_mean(final_volatility)
             avg_inflation = tf.reduce_mean(inflation_factors[:, -1, :])
             forecast_std = tf.reduce_mean(std_dev)
-
-            # ✅ regime_info уже вычислена выше, используем ее для сбора метрик
-            regime_soft_weights = tf.reduce_mean(regime_info['soft_weights'], axis=0)  # [3]
-            regime_entropy = tf.reduce_mean(regime_info['entropy'])  # скаляр
-
-            # Сбор Q/R ratio статистики (используем базовые параметры)
+    
+            # Статистика режимов волатильности
+            regime_soft_weights = tf.reduce_mean(regime_info['soft_weights'], axis=0)
+            regime_entropy = tf.reduce_mean(regime_info['entropy'])
+    
+            # Q/R мониторинг
             q_val = tf.reduce_mean(q_base_final)
             r_val = tf.reduce_mean(r_base_final)
             qr_ratio_val = q_val / (r_val + 1e-8)
-
-            # Сбор статистики по адаптивному inflation
-            avg_inflation = tf.reduce_mean(inflation_factors[:, -1, :])
-
+    
+            # Адаптивный inflation
             dynamic_threshold, inflation_anomaly_ratio = compute_adaptive_threshold(
-                inflation_factors,          # [B, T, 1] ✓
-                final_volatility,           # [B] ✓ (это то, что нужно)
-                self.threshold_ema,         # tf.Variable ✓
-                target_anomaly_ratio=0.35   # баланс между нормальными и аномальными состояниями
+                inflation_factors,
+                final_volatility,
+                self.threshold_ema,
+                target_anomaly_ratio=0.35
             )
-
-            # Сбор статистики по спектральным параметрам UKF
+    
+            # Спектральная стабильность UKF
             spectrum_info_val = self.diff_ukf_component.get_spectrum_info()
             min_eigenvalue_val = spectrum_info_val['min_eigenvalue']
-
-            # Вычисление дополнительных метрик для диагностики
-            ci_width_mean = tf.reduce_mean(ci_max - ci_min)
-            stddev_mean = tf.reduce_mean(std_dev)
-            ci_width_vs_stddev = ci_width_mean / (stddev_mean + 1e-8)
-
+    
+            # === СОГЛАСОВАННАЯ МЕТРИКА ДЛЯ ОТЧЕТА ===
+            # Используем ТОТ ЖЕ РАСЧЕТ, что и для штрафа (через волатильность данных)
+            ci_width_vs_stddev = width_ratio  # ← ЕДИНСТВЕННЫЙ источник истины
+    
             # Сборка метрик
             metrics = {
                 'total_loss': loss,
@@ -3226,8 +3167,7 @@ class LSTMIMMUKF(tf.Module):
                 'avg_inflation': avg_inflation,
                 'forecast_std': forecast_std,
                 'target_coverage': target_coverage_mean,
-                'ci_width_vs_stddev': ci_width_vs_stddev,
-                # Новые метрики для детального отчета
+                'ci_width_vs_stddev': ci_width_vs_stddev,  # ← СОГЛАСОВАНО С ШТРАФОМ И evaluate_coverage
                 'qr_ratio': qr_ratio_val,
                 'q_value': q_val,
                 'r_value': r_val,
@@ -3239,7 +3179,7 @@ class LSTMIMMUKF(tf.Module):
                 'ukf_min_eigenvalue': min_eigenvalue_val,
                 'calibration_error': tf.abs(actual_coverage - target_coverage_mean),
             }
-
+    
             return loss, metrics, final_state, final_covariance, forecast, std_dev, ci_min, ci_max, target_coverage
 
     def get_lr_scheduler(self, epoch, totalepochs=50, warmupepochs=8, baselr=1e-4, minlr=1e-5, warmup_type='exponential', gamma=2.0):
@@ -4434,141 +4374,97 @@ class LSTMIMMUKF(tf.Module):
 
         return history
 
-    def evaluate_coverage(self, ci_lower, ci_upper, y_actual, std_dev_forecast=None):
-        """
-        Оценка качества калибровки доверительных интервалов.
-        
-        ВАЖНО: Отношение ширины ДИ к стандартному отклонению должно рассчитываться
-        относительно стандартного отклонения ПРОГНОЗА (std_dev_forecast), а не
-        относительно стандартного отклонения целевой переменной (std(y_actual)).
-        """
+    def evaluate_coverage(self, ci_lower, ci_upper, y_actual):
         covered = (y_actual >= ci_lower) & (y_actual <= ci_upper)
         coverage = np.mean(covered)
-        ci_width = np.mean(ci_upper - ci_lower)
-        
-        # ===== КОРРЕКТНЫЙ РАСЧЁТ width_ratio ТОЛЬКО ЧЕРЕЗ std_dev_forecast =====
-        if std_dev_forecast is not None and len(std_dev_forecast) > 0:
-            avg_stddev_forecast = np.mean(np.abs(std_dev_forecast)) + 1e-8
-            width_ratio = ci_width / avg_stddev_forecast
-            
-            # Интерпретация для 90% ДИ с нормальным распределением: ~3.29
-            # Для асимметричных интервалов с толстыми хвостами: 3.0-5.0
-            if width_ratio < 2.5:
-                width_status = "⚠️ СЛИШКОМ УЗКИЕ интервалы (недостаточное покрытие)"
-            elif width_ratio > 5.5:
-                width_status = "⚠️ СЛИШКОМ ШИРОКИЕ интервалы (избыточная неопределённость)"
-            else:
-                width_status = "✅ Оптимальная ширина интервалов"
-        else:
-            width_ratio = None
-            width_status = "ℹ️ Недостаточно данных для расчёта width_ratio"
-            avg_stddev_forecast = None
-        
-        # ===== ДИАГНОСТИЧЕСКИЙ ВЫВОД =====
+
+        # ===== ДОБАВИТЬ: Диагностические проверки =====
         print(f"\n{'='*50}")
         print(f"📊 АНАЛИЗ ПОКРЫТИЯ ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ")
         print(f"{'='*50}")
-        
-        # Покрытие
+
         if coverage >= 0.99:
             print(f"🚨 КРИТИЧНО: Покрытие = {coverage:.1%} (слишком высокое!)")
-            print(f"   → Проверьте ограничения на ковариацию в UKF")
-            print(f"   → Проверьте параметры калибровки ДИ (слишком широкие интервалы)")
+            print(f"   → Проверьте adaptive_ukf_filter (ограничение P)")
+            print(f"   → Проверьте _student_t_update (ограничение tail_weight)")
         elif coverage < 0.70:
             print(f"⚠️ ПРЕДУПРЕЖДЕНИЕ: Покрытие = {coverage:.1%} (слишком низкое!)")
-            print(f"   → Проверьте параметры калибровки ДИ (слишком узкие интервалы)")
-            print(f"   → Проверьте работу детектора аномалий (слишком агрессивная инфляция)")
-        else:
-            print(f"✅ Покрытие: {coverage:.2%} (целевой диапазон: 80-95%)")
-        
+
+        ci_width = np.mean(ci_upper - ci_lower)
+        y_std = np.std(y_actual)
+        width_ratio = ci_width / (y_std + 1e-8)
+
+        status_indicator = '⚠️' if width_ratio > 3.0 or width_ratio < 0.5 else '✅'
+        print(f"{status_indicator} Отношение ширины ДИ к std: {width_ratio:.2f}")
+        if width_ratio > 3.0:
+            print(f"   → СЛИШКОМ ШИРОКИЕ интервалы (width_ratio > 3.0)")
+        elif width_ratio < 0.5:
+            print(f"   → СЛИШКОМ УЗКИЕ интервалы (width_ratio < 0.5)")
+
+        print(f"📈 Покрытие: {coverage:.2%}")
         print(f"   Количество попаданий: {np.sum(covered)} / {len(covered)}")
-        
-        # Ширина интервалов
-        print(f"\n📏 Ширина доверительных интервалов:")
-        print(f"   • Средняя ширина ДИ: {ci_width:.4f}")
-        if width_ratio is not None:
-            print(f"   • Отношение ширины ДИ к std_dev прогноза: {width_ratio:.2f}x")
-            print(f"   • {width_status}")
-            print(f"   • Среднее std_dev прогноза: {avg_stddev_forecast:.4f}")
-        else:
-            print(f"   • Отношение ширины ДИ к std(y_actual): {ci_width / (np.std(y_actual) + 1e-8):.2f}x ⚠️ (некорректная метрика!)")
-            print(f"   ⚠️  ВНИМАНИЕ: Для корректной оценки ширины ДИ требуется std_dev_forecast!")
-        
-        # Итоговая оценка калибровки
-        calibration_quality = (
-            "✅ ОТЛИЧНО" if 0.85 <= coverage <= 0.95 else
-            "⚠️ УДОВЛЕТВОРИТЕЛЬНО" if 0.80 <= coverage <= 0.97 else
-            "❌ ПЛОХО"
-        )
-        print(f"\n🎯 Качество калибровки: {calibration_quality}")
+        status = '✅ ХОРОШО' if 0.80 <= coverage <= 0.95 else '❌ ПРОБЛЕМА'
+        print(f"🎯 Качество калибровки: {status}")
         print(f"{'='*50}\n")
-        
-        # ===== ВОЗВРАТ РЕЗУЛЬТАТОВ =====
-        result = {
+        # ===== КОНЕЦ =====
+
+        return {
             'coverage': coverage,
             'ci_width': ci_width,
-            'is_valid': (0.80 <= coverage <= 0.95),
-            'calibration_quality': calibration_quality
+            'width_ratio': width_ratio,
+            'is_valid': (0.80 <= coverage <= 0.95)
         }
-        
-        if width_ratio is not None:
-            result.update({
-                'width_ratio': width_ratio,
-                'avg_stddev_forecast': avg_stddev_forecast,
-                'width_status': width_status
-            })
-        
-        return result
 
     def generate_epoch_report(self, epoch, train_metrics, val_metrics, all_normalized_innov=None):
         """Генерация детального отчета по результатам эпохи"""
         report = f"\n{'='*80}\n🔍 ДЕТАЛЬНЫЙ ОТЧЕТ ПО ЭПОХЕ {epoch+1}\n{'='*80}\n"
-
+    
         # Средние метрики по обучению
         report += "\n📈 ОБУЧЕНИЕ:\n"
         report += f"   • Total Loss: {tf.reduce_mean([m['total_loss'] for m in train_metrics]).numpy():.6f}\n"
         report += f"   • MSE Loss: {tf.reduce_mean([m['mse_loss'] for m in train_metrics]).numpy():.6f}\n"
         report += f"   • Entropy Loss: {tf.reduce_mean([m['entropy_loss'] for m in train_metrics]).numpy():.6f}\n"
-
-        # 📊 ДОВЕРИТЕЛЬНЫЕ ИНТЕРВАЛЫ И ИХ КАЛИБРОВКА
+    
+        # 📊 КАЛИБРОВКА ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ (обучение)
         train_target_coverage = tf.reduce_mean([m['target_coverage'] for m in train_metrics]).numpy()
         train_calibration_error = tf.reduce_mean([m['calibration_error'] for m in train_metrics]).numpy()
-        
-        # ИСПРАВЛЕНО: Используем корректное вычисление отношения ширины ДИ к stddev по всем данным
-        if hasattr(self, 'all_actuals') and len(self.all_actuals) > 0:
-            ci_widths = np.array(self.all_ci_uppers) - np.array(self.all_ci_lowers)
-            y_std = np.std(np.array(self.all_actuals)) + 1e-8
-            train_ci_width_vs_stddev = np.mean(ci_widths) / y_std
-        else:
-            # Fallback для совместимости
-            train_ci_width_vs_stddev = tf.reduce_mean([m['ci_width_vs_stddev'] for m in train_metrics]).numpy()
-        
+        train_ci_width_vs_stddev = tf.reduce_mean([m['ci_width_vs_stddev'] for m in train_metrics]).numpy()
+    
         # Поскольку мы удалили per-batch coverage_ratio, используем косвенную оценку на основе calibration error
-        # Фактическое покрытие приблизительно равно target_coverage - calibration_error (если calibration_error > 0)
         approx_train_coverage = train_target_coverage - train_calibration_error if train_calibration_error > 0 else train_target_coverage + train_calibration_error
-        report += "\n📊 КАЛИБРОВКА ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ:\n"
+    
+        report += "\n📊 КАЛИБРОВКА ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ (TRAIN):\n"
         report += f"   • Приблизительное фактическое покрытие ДИ: {approx_train_coverage:.2%}\n"
         report += f"   • Целевое покрытие ДИ: {train_target_coverage:.2%}\n"
         report += f"   • Ошибка калибровки: {train_calibration_error:.4f}\n"
-        report += f"   • Средняя ширина ДИ / stddev: {train_ci_width_vs_stddev:.2f}x\n"
+        report += f"   • Средняя ширина ДИ / волатильность данных: {train_ci_width_vs_stddev:.2f}x\n"
         report += f"   • Статус: {'✅ Оптимально' if train_calibration_error < 0.05 else '⚠️ Требует настройки'}\n"
-
-        # 🔍 ДИАГНОСТИКА ПОКРЫТИЯ ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ (НОВЫЙ БЛОК)
+    
+        # 🔍 ГЛУБОКАЯ ДИАГНОСТИКА ПОКРЫТИЯ (на основе накопленных данных за эпоху)
         if hasattr(self, 'all_ci_lowers') and hasattr(self, 'all_ci_uppers') and hasattr(self, 'all_actuals') and len(self.all_actuals) > 0:
             try:
-                coverage_results = self.evaluate_coverage(
-                    np.array(self.all_ci_lowers),
-                    np.array(self.all_ci_uppers),
-                    np.array(self.all_actuals)
-                )
-
+                # === КОРРЕКТНЫЙ РАСЧЕТ ОТНОШЕНИЯ ШИРИНЫ ДИ К ВОЛАТИЛЬНОСТИ ДАННЫХ ===
+                ci_lowers_arr = np.array(self.all_ci_lowers)
+                ci_uppers_arr = np.array(self.all_ci_uppers)
+                actuals_arr = np.array(self.all_actuals)
+                
+                # Ширина ДИ и волатильность данных (стандартное отклонение истинных значений)
+                ci_width_mean = np.mean(ci_uppers_arr - ci_lowers_arr)
+                y_actual_std = np.std(actuals_arr) + 1e-8  # Волатильность ДАННЫХ, а не неопределенность модели!
+                width_ratio_true = ci_width_mean / y_actual_std
+                
+                # Покрытие
+                covered = (actuals_arr >= ci_lowers_arr) & (actuals_arr <= ci_uppers_arr)
+                actual_coverage = np.mean(covered)
+                
                 report += "\n🔍 ГЛУБОКАЯ ДИАГНОСТИКА ПОКРЫТИЯ ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ:\n"
-                report += f"   • Фактическое покрытие: {coverage_results['coverage']:.2%}\n"
-                report += f"   • Средняя ширина ДИ: {coverage_results['ci_width']:.4f}\n"
-                report += f"   • Отношение ширины к stddev: {coverage_results['width_ratio']:.2f}\n"
-                report += f"   • Количество попаданий: {int(coverage_results['coverage'] * len(self.all_actuals))}/{len(self.all_actuals)}\n"
-                report += f"   • Статус: {'✅ Хорошо' if coverage_results['is_valid'] else '❌ Требует настройки'}\n"
-
+                report += f"   • Фактическое покрытие: {actual_coverage:.2%}\n"
+                report += f"   • Средняя ширина ДИ: {ci_width_mean:.4f}\n"
+                report += f"   • Волатильность данных (std(y_actual)): {y_actual_std:.4f}\n"
+                report += f"   • Отношение ширины ДИ к волатильности данных: {width_ratio_true:.2f}x\n"
+                report += f"   • Количество попаданий: {int(covered.sum())}/{len(covered)}\n"
+                report += f"   • Статус: {'✅ Хорошо (80-95%)' if 0.80 <= actual_coverage <= 0.95 else '❌ Требует настройки'}\n"
+    
                 # Очищаем сохраненные данные для следующей эпохи
                 self.all_forecasts = []
                 self.all_ci_lowers = []
@@ -4577,7 +4473,7 @@ class LSTMIMMUKF(tf.Module):
                 self.all_target_coverages = []
             except Exception as e:
                 report += f"\n⚠️ ОШИБКА ДИАГНОСТИКИ ПОКРЫТИЯ: {str(e)}\n"
-
+    
         # Режимы волатильности
         regime_weights = [
             tf.reduce_mean([m['regime_low_weight'] for m in train_metrics]).numpy(),
@@ -4585,40 +4481,40 @@ class LSTMIMMUKF(tf.Module):
             tf.reduce_mean([m['regime_high_weight'] for m in train_metrics]).numpy()
         ]
         avg_entropy = tf.reduce_mean([m['regime_entropy'] for m in train_metrics]).numpy()
-
+    
         report += "\n🧠 РЕЖИМЫ ВОЛАТИЛЬНОСТИ (TRAIN):\n"
         report += f"   • LOW: {regime_weights[0]:.1%}, MID: {regime_weights[1]:.1%}, HIGH: {regime_weights[2]:.1%}\n"
         report += f"   • Энтропия распределения: {avg_entropy:.3f} (чем ближе к 1.1, тем равномернее распределение)\n"
-
+    
         # Q/R мониторинг
         avg_qr = tf.reduce_mean([m['qr_ratio'] for m in train_metrics]).numpy()
         avg_q = tf.reduce_mean([m['q_value'] for m in train_metrics]).numpy()
         avg_r = tf.reduce_mean([m['r_value'] for m in train_metrics]).numpy()
-
+    
         qr_status = "доверяет измерениям (низкий)" if avg_qr < 0.5 else "доверяет прогнозу (высокий)"
-
+    
         report += "\n⚙️  Q/R МОНИТОРИНГ:\n"
         report += f"   • Q/R ratio: {avg_qr:.3f} (Q={avg_q:.6f}, R={avg_r:.6f})\n"
         report += f"   • Интерпретация: {qr_status}\n"
-
+    
         # Adaptive inflation
         avg_inflation = np.mean([m['avg_inflation'] for m in train_metrics])
         inflation_anomalies = np.mean([m['inflation_anomaly_ratio'] for m in train_metrics])
-
+    
         report += "\n💦 ADAPTIVE INFLATION:\n"
         report += f"   • Средний inflation factor: {avg_inflation:.3f}\n"
         report += f"   • Доля аномальных инфляций: {inflation_anomalies:.1%}\n"
-
+    
         if self.debug_mode:
             print("\n" + "="*70)
             print("DEBUG: ПРОВЕРКА АГРЕГАЦИИ МЕТРИК")
             print("="*70)
-
+    
             # Показать все значения
             for i, m in enumerate(train_metrics):
                 ratio = m['inflation_anomaly_ratio']
                 print(f"Batch {i}: inflation_anomaly_ratio = {ratio:.4f} ({ratio*100:.1f}%)")
-
+    
             # Показать результат
             inflation_ratios_array = np.array([m['inflation_anomaly_ratio'] for m in train_metrics])
             print(f"\nВсе значения: {inflation_ratios_array}")
@@ -4626,19 +4522,18 @@ class LSTMIMMUKF(tf.Module):
             print(f"Max: {inflation_ratios_array.max():.4f}")
             print(f"Mean: {inflation_ratios_array.mean():.4f} ({inflation_ratios_array.mean()*100:.1f}%)")
             print("="*70 + "\n")
-
-
+    
         # Спектральная стабильность UKF
         min_eig = tf.reduce_mean([m['ukf_min_eigenvalue'] for m in train_metrics]).numpy()
         report += "\n🔬 UKF СПЕКТРАЛЬНАЯ СТАБИЛЬНОСТЬ:\n"
         report += f"   • Минимальное собственное значение: {min_eig:.6f}\n"
-
-        # ДОБАВЛЕНО: анализ распределения нормализованных инноваций
+    
+        # Анализ распределения нормализованных инноваций
         if all_normalized_innov is not None and len(all_normalized_innov) > 0:
             # Удаляем бесконечности и NaN для корректной гистограммы
             valid_innov = all_normalized_innov[np.isfinite(all_normalized_innov)]
             valid_innov = valid_innov[valid_innov <= 10.0]  # ограничиваем максимум для читаемости
-
+    
             if len(valid_innov) > 0:
                 # Нормализация для плотности
                 normalized_innov_hist, bin_edges = np.histogram(
@@ -4647,16 +4542,16 @@ class LSTMIMMUKF(tf.Module):
                     range=(0, 10),
                     density=True
                 )
-
+    
                 report += f"\n📊 РАСПРЕДЕЛЕНИЕ НОРМАЛИЗОВАННЫХ ИННОВАЦИЙ (последние 10 шагов):"
                 report += f"\n   • Всего значений: {len(valid_innov)}"
                 report += f"\n   • Среднее: {np.mean(valid_innov):.3f}, Медиана: {np.median(valid_innov):.3f}"
                 report += f"\n   • 95-й перцентиль: {np.percentile(valid_innov, 95):.3f}"
-
+    
                 # Добавляем детальную гистограмму
-                for i in range(len(bin_edges)-1):
+                for i in range(min(10, len(bin_edges)-1)):  # Ограничиваем вывод 10 бинами для компактности
                     report += f"\n   [{bin_edges[i]:.1f}-{bin_edges[i+1]:.1f}]: {normalized_innov_hist[i]:.4f}"
-
+    
                 # Добавляем рекомендации по анализу распределения
                 if np.mean(valid_innov) > 3.0:
                     report += f"\n   ⚠️ ВЫСОКАЯ СРЕДНЯЯ ИННОВАЦИЯ: требуется анализ детектора аномалий"
@@ -4664,39 +4559,31 @@ class LSTMIMMUKF(tf.Module):
                     report += f"\n   ⚠️ ЧАСТЫЕ КРУПНЫЕ ОШИБКИ: требуется настройка параметров УКФ"
                 else:
                     report += f"\n   ✅ НОРМАЛЬНОЕ РАСПРЕДЕЛЕНИЕ ИННОВАЦИЙ"
-
-        # Валидация
+    
+        # Валидация — отдельный блок с фокусом на метриках валидации
         if val_metrics:
-            report += "\n📊 КАЛИБРОВКА ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ:\n"
-
-            # Используем правильный расчет покрытия по всем точкам вместо per-batch average
+            report += "\n📉 ВАЛИДАЦИЯ:\n"
+            report += f"   • Total Loss: {tf.reduce_mean([m['total_loss'] for m in val_metrics]).numpy():.6f}\n"
+            report += f"   • MSE Loss: {tf.reduce_mean([m['mse_loss'] for m in val_metrics]).numpy():.6f}\n"
+    
+            # Расчет покрытия по всем точкам валидации
             if hasattr(self, 'all_val_covered') and len(self.all_val_covered) > 0:
                 val_coverage = np.mean(self.all_val_covered)
             else:
                 # Fallback для совместимости
                 val_coverage = tf.reduce_mean([m['coverage_ratio'] for m in val_metrics]).numpy()
-
+    
             val_calibration_error = tf.reduce_mean([m['calibration_error'] for m in val_metrics]).numpy()
+            val_ci_width_vs_stddev = tf.reduce_mean([m['ci_width_vs_stddev'] for m in val_metrics]).numpy()
+            val_target_coverage = tf.reduce_mean([m['target_coverage'] for m in val_metrics]).numpy()
+    
+            report += "\n📊 КАЛИБРОВКА ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ (VAL):\n"
             report += f"   • Фактическое покрытие ДИ: {val_coverage:.2%}\n"
-            report += f"   • Целевое покрытие ДИ: {tf.reduce_mean([m['target_coverage'] for m in val_metrics]).numpy():.2%}\n"
+            report += f"   • Целевое покрытие ДИ: {val_target_coverage:.2%}\n"
             report += f"   • Ошибка калибровки: {val_calibration_error:.4f}\n"
-            report += f"   • Средняя ширина ДИ / stddev: {tf.reduce_mean([m['ci_width_vs_stddev'] for m in val_metrics]).numpy():.2f}x\n"
-
-            # Также добавляем глубокую диагностику покрытия, если доступны данные
-            if hasattr(self, 'all_ci_lowers') and hasattr(self, 'all_ci_uppers') and hasattr(self, 'all_actuals') and len(self.all_actuals) > 0:
-                try:
-                    coverage_results = self.evaluate_coverage(
-                        np.array(self.all_ci_lowers),
-                        np.array(self.all_ci_uppers),
-                        np.array(self.all_actuals)
-                    )
-                    report += f"\n🔍 ГЛУБОКАЯ ДИАГНОСТИКА ПОКРЫТИЯ:\n"
-                    report += f"   • Покрытие: {coverage_results['coverage']:.2%}\n"
-                    report += f"   • Количество попаданий: {int(coverage_results['coverage'] * len(self.all_actuals))}/{len(self.all_actuals)}\n"
-                    report += f"   • Отношение ширины ДИ к std: {coverage_results['width_ratio']:.2f}\n"
-                except Exception as e:
-                    report += f"\n⚠️ ОШИБКА ГЛУБОКОЙ ДИАГНОСТИКИ: {str(e)}\n"
-
+            report += f"   • Средняя ширина ДИ / волатильность данных: {val_ci_width_vs_stddev:.2f}x\n"
+            report += f"   • Статус: {'✅ Хорошо' if 0.80 <= val_coverage <= 0.95 else '⚠️ Требует настройки'}\n"
+    
         report += f"\n{'='*80}"
         return report
 
