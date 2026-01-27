@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, PowerTransformer
-from typing import Tuple, Dict, Optional, List
+from typing import Tuple, Dict, Optional, List, Any
 
 # Evaluate
 from tqdm.auto import tqdm
@@ -739,7 +739,7 @@ class LSTMIMMUKF(tf.Module):
         confidence_factor = -np.log(1.0 - target_coverage)  # ≈ 2.30259
         # ИСПРАВЛЕНО: Увеличиваем начальные значения regime_scales для компенсации низкого покрытия
         self.regime_selector.regime_scales.assign(tf.constant(
-            [1.2 * confidence_factor, 1.8 * confidence_factor, 2.5 * confidence_factor],  # Уменьшены, так как остальные параметры увеличили ширину
+            [0.95 * confidence_factor, 1.35 * confidence_factor, 1.85 * confidence_factor],  # Уменьшены, так как остальные параметры увеличили ширину
             dtype=tf.float32
         ))
         # Центроиды режимов адаптированы под реальную статистику волатильности
@@ -769,17 +769,17 @@ class LSTMIMMUKF(tf.Module):
 
             # Обучаемые параметры для базовых шумов С ОГРАНИЧЕНИЯМИ
             self.base_q_logit = tf.Variable(
-                tf.math.log(0.3),  # СНИЖЕНО для меньшего Q (было 0.869)
+                tf.math.log(0.15),  # СНИЖЕНО для меньшего Q (было 0.869)
                 trainable=True,
                 dtype=tf.float32,
-                constraint=lambda x: tf.clip_by_value(x, tf.math.log(0.3), tf.math.log(1.0)),  # ← ДОБАВЛЕНО CONSTRAINT
+                constraint=lambda x: tf.clip_by_value(x, tf.math.log(0.1), tf.math.log(1.0)),  # ← ДОБАВЛЕНО CONSTRAINT
                 name='base_q_logit'
             )
             self.base_r_logit = tf.Variable(
-                tf.math.log(1.2),  # УВЕЛИЧЕНО для большего R (было 0.499)
+                tf.math.log(1.8),  # УВЕЛИЧЕНО для большего R (было 0.499)
                 trainable=True,
                 dtype=tf.float32,
-                constraint=lambda x: tf.clip_by_value(x, tf.math.log(0.5), tf.math.log(1.5)),  # ← ДОБАВЛЕНО CONSTRAINT
+                constraint=lambda x: tf.clip_by_value(x, tf.math.log(1.0), tf.math.log(2.5)),  # ← ДОБАВЛЕНО CONSTRAINT
                 name='base_r_logit'
             )
 
@@ -845,10 +845,10 @@ class LSTMIMMUKF(tf.Module):
 
             # Параметры для adaptive inflation
             self.inflation_base_factor = tf.Variable(
-                tf.math.log(0.2),  # СНИЖЕНО с 1.572 до 0.5 (базовое значение ~1.6 вместо ~4.8)
+                tf.math.log(0.05),  # СНИЖЕНО с 1.572 до 0.5 (базовое значение ~1.6 вместо ~4.8)
                 trainable=True,
                 dtype=tf.float32,
-                constraint=lambda x: tf.clip_by_value(x, tf.math.log(0.3), tf.math.log(1.0)),  # ← ДОБАВЛЕНО CONSTRAINT
+                constraint=lambda x: tf.clip_by_value(x, tf.math.log(0.01), tf.math.log(0.3)),  # ← ДОБАВЛЕНО CONSTRAINT
                 name='inflation_base_factor'
             )
             self.inflation_vol_sensitivity = tf.Variable(
@@ -884,7 +884,7 @@ class LSTMIMMUKF(tf.Module):
 
             # === ДОБАВЛЕНО: ПАРАМЕТР ДЛЯ МАКСИМАЛЬНОЙ ШИРИНЫ ДОВЕРИТЕЛЬНОГО ИНТЕРВАЛА ===
             self.max_width_factor_logit = tf.Variable(
-                tf.math.log(2.5),  # exp(ln(2.5)) + 1.0 = 3.5 - увеличено для компенсации низкого покрытия
+                tf.math.log(1.5),  # exp(ln(2.5)) + 1.0 = 3.5 - увеличено для компенсации низкого покрытия
                 trainable=True,
                 dtype=tf.float32,
                 constraint=lambda x: tf.clip_by_value(x, tf.math.log(1.0), tf.math.log(4.0)),  # Расширенный диапазон
@@ -2564,6 +2564,7 @@ class LSTMIMMUKF(tf.Module):
                     'regime_entropy': regime_entropy,
                     'inflation_anomaly_ratio': inflation_anomaly_ratio,
                     'ukf_min_eigenvalue': min_eigenvalue,
+                    'coverage_ratio': actual_coverage,
                     'target_coverage': target_coverage_mean,  # Согласовано с калибровкой
                     'ci_width_vs_stddev': width_ratio,        # Согласовано с штрафом (через волатильность данных)
                     'calibration_error': tf.abs(actual_coverage - target_coverage_mean),
@@ -4018,11 +4019,6 @@ class LSTMIMMUKF(tf.Module):
             for epoch in range(epochs):
                 epoch_start_time = datetime.datetime.now()
 
-                # Загрузка состояния перед началом эпохи
-                if epoch > 0 and self.best_weights_dict is not None:
-                    print(f"🔄 Восстановление состояния перед эпохой {epoch + 1}")
-                    self.load_best_weights()  # Это загрузит и состояние буфера
-
                 # Обновление learning rate
                 current_lr = self.get_lr_scheduler(
                     epoch=epoch,
@@ -4307,9 +4303,9 @@ class LSTMIMMUKF(tf.Module):
                         self.best_epoch = epoch
                         self.best_weights_dict = self.get_current_weights()
                         self.best_scalers = {
-                            'feature_scalers': self.feature_scalers.copy() if hasattr(self, 'feature_scalers') else None,
-                            'y_scaler': self.feature_scalers.get('Y') if hasattr(self, 'feature_scalers') else None
-                        }
+                            'feature_scalers': self.feature_scalers.copy() if hasattr(self, 'feature_scalers') and self.feature_scalers is not None else None,
+                            'y_scaler': self.feature_scalers.get('Y') if hasattr(self, 'feature_scalers') and self.feature_scalers is not None else None
+                        } if hasattr(self, 'feature_scalers') and self.feature_scalers is not None else None
                         self.patience_counter = 0
                         print(f"\n🌟 УЛУЧШЕНИЕ! Новые лучшие веса: {self.best_val_loss:.6f} (эпоха {self.best_epoch + 1})")
                     else:
@@ -4416,172 +4412,120 @@ class LSTMIMMUKF(tf.Module):
         }
 
     def generate_epoch_report(self, epoch, train_metrics, val_metrics, all_normalized_innov=None):
-        """Генерация детального отчета по результатам эпохи"""
-        report = f"\n{'='*80}\n🔍 ДЕТАЛЬНЫЙ ОТЧЕТ ПО ЭПОХЕ {epoch+1}\n{'='*80}\n"
-    
-        # Средние метрики по обучению
-        report += "\n📈 ОБУЧЕНИЕ:\n"
-        report += f"   • Total Loss: {tf.reduce_mean([m['total_loss'] for m in train_metrics]).numpy():.6f}\n"
-        report += f"   • MSE Loss: {tf.reduce_mean([m['mse_loss'] for m in train_metrics]).numpy():.6f}\n"
-        report += f"   • Entropy Loss: {tf.reduce_mean([m['entropy_loss'] for m in train_metrics]).numpy():.6f}\n"
-    
-        # 📊 КАЛИБРОВКА ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ (обучение)
-        train_target_coverage = tf.reduce_mean([m['target_coverage'] for m in train_metrics]).numpy()
-        train_calibration_error = tf.reduce_mean([m['calibration_error'] for m in train_metrics]).numpy()
-    
-        # Поскольку мы удалили per-batch coverage_ratio, используем косвенную оценку на основе calibration error
-        approx_train_coverage = train_target_coverage - train_calibration_error if train_calibration_error > 0 else train_target_coverage + train_calibration_error
-    
+        """Генерация компактного и информативного отчета по результатам эпохи"""
+        report = f"\n{'='*80}\n📊 ОТЧЕТ ПО ЭПОХЕ {epoch+1}\n{'='*80}\n"
+        
+        # === 1. БАЗОВЫЕ МЕТРИКИ ===
+        train_loss = tf.reduce_mean([m['total_loss'] for m in train_metrics]).numpy()
+        train_mse = tf.reduce_mean([m['mse_loss'] for m in train_metrics]).numpy()
+        val_loss = tf.reduce_mean([m['total_loss'] for m in val_metrics]).numpy()
+        val_mse = tf.reduce_mean([m['mse_loss'] for m in val_metrics]).numpy()
+        
+        report += "📈 БАЗОВЫЕ МЕТРИКИ:\n"
+        report += f"   TRAIN → Loss: {train_loss:.6f} | MSE: {train_mse:.6f}\n"
+        report += f"   VAL   → Loss: {val_loss:.6f} | MSE: {val_mse:.6f}\n"
+        
+        # === 2. КАЛИБРОВКА ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ (единый формат для TRAIN/VAL) ===
+        def evaluate_ci_quality(coverage, width_ratio, target_coverage):
+            """Оценка качества ДИ: покрытие + ширина"""
+            # Оценка покрытия
+            cov_status = '✅' if 0.80 <= coverage <= 0.95 else '⚠️'
+            cov_msg = 'Хорошо' if 0.80 <= coverage <= 0.95 else ('Низкое' if coverage < 0.80 else 'Избыточное')
+            
+            # Оценка ширины (на основе отношения к волатильности данных)
+            if width_ratio < 2.0:
+                width_status = '⚠️'
+                width_msg = 'Слишком узкие'
+            elif width_ratio > 5.0:
+                width_status = '⚠️'
+                width_msg = 'Слишком широкие'
+            else:
+                width_status = '✅'
+                width_msg = 'Нормальные'
+            
+            # Общий статус
+            overall_status = '✅ Оптимально' if (cov_status == '✅' and width_status == '✅') else '⚠️ Требует настройки'
+            
+            return cov_status, cov_msg, width_status, width_msg, overall_status
+        
+        # TRAIN
+        train_cov = tf.reduce_mean([m['coverage_ratio'] for m in train_metrics]).numpy() if 'coverage_ratio' in train_metrics[0] else 0.0
+        train_target_cov = tf.reduce_mean([m['target_coverage'] for m in train_metrics]).numpy()
+        train_cal_err = tf.reduce_mean([m['calibration_error'] for m in train_metrics]).numpy()
+        train_width_ratio = tf.reduce_mean([m['ci_width_vs_stddev'] for m in train_metrics]).numpy()
+        
+        cov_st, cov_msg, width_st, width_msg, overall_st = evaluate_ci_quality(train_cov, train_width_ratio, train_target_cov)
+        
         report += "\n📊 КАЛИБРОВКА ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ (TRAIN):\n"
-        report += f"   • Приблизительное фактическое покрытие ДИ: {approx_train_coverage:.2%}\n"
-        report += f"   • Целевое покрытие ДИ: {train_target_coverage:.2%}\n"
-        report += f"   • Ошибка калибровки: {train_calibration_error:.4f}\n"
-        report += f"   • Статус: {'✅ Оптимально' if train_calibration_error < 0.05 else '⚠️ Требует настройки'}\n"
-    
-        # 🔍 ГЛУБОКАЯ ДИАГНОСТИКА ПОКРЫТИЯ (на основе накопленных данных за эпоху)
-        if hasattr(self, 'all_ci_lowers') and hasattr(self, 'all_ci_uppers') and hasattr(self, 'all_actuals') and len(self.all_actuals) > 0:
-            try:
-                # === КОРРЕКТНЫЙ РАСЧЕТ ОТНОШЕНИЯ ШИРИНЫ ДИ К ВОЛАТИЛЬНОСТИ ДАННЫХ ===
-                ci_lowers_arr = np.array(self.all_ci_lowers)
-                ci_uppers_arr = np.array(self.all_ci_uppers)
-                actuals_arr = np.array(self.all_actuals)
-                
-                # Ширина ДИ и волатильность данных (стандартное отклонение истинных значений)
-                ci_width_mean = np.mean(ci_uppers_arr - ci_lowers_arr)
-                y_actual_std = np.std(actuals_arr) + 1e-8  # Волатильность ДАННЫХ, а не неопределенность модели!
-                width_ratio_true = ci_width_mean / y_actual_std
-                
-                # Покрытие
-                covered = (actuals_arr >= ci_lowers_arr) & (actuals_arr <= ci_uppers_arr)
-                actual_coverage = np.mean(covered)
-                
-                report += "\n🔍 ГЛУБОКАЯ ДИАГНОСТИКА ПОКРЫТИЯ ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ:\n"
-                report += f"   • Фактическое покрытие: {actual_coverage:.2%}\n"
-                report += f"   • Средняя ширина ДИ: {ci_width_mean:.4f}\n"
-                report += f"   • Волатильность данных (std(y_actual)): {y_actual_std:.4f}\n"
-                report += f"   • Отношение ширины ДИ к волатильности данных: {width_ratio_true:.2f}x\n"
-                report += f"   • Количество попаданий: {int(covered.sum())}/{len(covered)}\n"
-                report += f"   • Статус: {'✅ Хорошо (80-95%)' if 0.80 <= actual_coverage <= 0.95 else '❌ Требует настройки'}\n"
-    
-                # Очищаем сохраненные данные для следующей эпохи
-                self.all_forecasts = []
-                self.all_ci_lowers = []
-                self.all_ci_uppers = []
-                self.all_actuals = []
-                self.all_target_coverages = []
-            except Exception as e:
-                report += f"\n⚠️ ОШИБКА ДИАГНОСТИКИ ПОКРЫТИЯ: {str(e)}\n"
-    
-        # Режимы волатильности
+        report += f"   • Покрытие: {train_cov:.2%} (цель: {train_target_cov:.2%}) → {cov_st} {cov_msg}\n"
+        report += f"   • Ошибка калибровки: {train_cal_err:.4f}\n"
+        report += f"   • Ширина ДИ / волатильность данных: {train_width_ratio:.2f}x → {width_st} {width_msg}\n"
+        report += f"   • Итог: {overall_st}\n"
+        
+        # VAL
+        val_cov = tf.reduce_mean([m['coverage_ratio'] for m in val_metrics]).numpy() if 'coverage_ratio' in val_metrics[0] else 0.0
+        val_target_cov = tf.reduce_mean([m['target_coverage'] for m in val_metrics]).numpy()
+        val_cal_err = tf.reduce_mean([m['calibration_error'] for m in val_metrics]).numpy()
+        val_width_ratio = tf.reduce_mean([m['ci_width_vs_stddev'] for m in val_metrics]).numpy()
+        
+        cov_sv, cov_msg_v, width_sv, width_msg_v, overall_sv = evaluate_ci_quality(val_cov, val_width_ratio, val_target_cov)
+        
+        report += "\n📊 КАЛИБРОВКА ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ (VAL):\n"
+        report += f"   • Покрытие: {val_cov:.2%} (цель: {val_target_cov:.2%}) → {cov_sv} {cov_msg_v}\n"
+        report += f"   • Ошибка калибровки: {val_cal_err:.4f}\n"
+        report += f"   • Ширина ДИ / волатильность данных: {val_width_ratio:.2f}x → {width_sv} {width_msg_v}\n"
+        report += f"   • Итог: {overall_sv}\n"
+        
+        # === 3. КОНТЕКСТ ВОЛАТИЛЬНОСТИ ===
         regime_weights = [
             tf.reduce_mean([m['regime_low_weight'] for m in train_metrics]).numpy(),
             tf.reduce_mean([m['regime_mid_weight'] for m in train_metrics]).numpy(),
             tf.reduce_mean([m['regime_high_weight'] for m in train_metrics]).numpy()
         ]
         avg_entropy = tf.reduce_mean([m['regime_entropy'] for m in train_metrics]).numpy()
-    
-        report += "\n🧠 РЕЖИМЫ ВОЛАТИЛЬНОСТИ (TRAIN):\n"
-        report += f"   • LOW: {regime_weights[0]:.1%}, MID: {regime_weights[1]:.1%}, HIGH: {regime_weights[2]:.1%}\n"
-        report += f"   • Энтропия распределения: {avg_entropy:.3f} (чем ближе к 1.1, тем равномернее распределение)\n"
-    
-        # Q/R мониторинг
+        avg_vol = tf.reduce_mean([m['avg_volatility'] for m in train_metrics]).numpy()
+        
+        report += "\n🧠 КОНТЕКСТ ВОЛАТИЛЬНОСТИ (TRAIN):\n"
+        report += f"   • Распределение режимов: LOW {regime_weights[0]:.1%} | MID {regime_weights[1]:.1%} | HIGH {regime_weights[2]:.1%}\n"
+        report += f"   • Энтропия распределения: {avg_entropy:.3f} (оптимум ≈1.10)\n"
+        report += f"   • Средняя волатильность: {avg_vol:.4f}\n"
+        
+        # === 4. Q/R ДИНАМИКА ===
         avg_qr = tf.reduce_mean([m['qr_ratio'] for m in train_metrics]).numpy()
         avg_q = tf.reduce_mean([m['q_value'] for m in train_metrics]).numpy()
         avg_r = tf.reduce_mean([m['r_value'] for m in train_metrics]).numpy()
-    
-        qr_status = "доверяет измерениям (низкий)" if avg_qr < 0.5 else "доверяет прогнозу (высокий)"
-    
-        report += "\n⚙️  Q/R МОНИТОРИНГ:\n"
+        qr_interpretation = "доверяет измерениям" if avg_qr < 0.5 else "доверяет прогнозу"
+        
+        report += "\n⚙️  Q/R ДИНАМИКА:\n"
         report += f"   • Q/R ratio: {avg_qr:.3f} (Q={avg_q:.6f}, R={avg_r:.6f})\n"
-        report += f"   • Интерпретация: {qr_status}\n"
-    
-        # Adaptive inflation
-        avg_inflation = np.mean([m['avg_inflation'] for m in train_metrics])
-        inflation_anomalies = np.mean([m['inflation_anomaly_ratio'] for m in train_metrics])
-    
+        report += f"   • Интерпретация: {qr_interpretation}\n"
+        
+        # === 5. ADAPTIVE INFLATION ===
+        avg_inflation = tf.reduce_mean([m['avg_inflation'] for m in train_metrics]).numpy()
+        inflation_anomalies = tf.reduce_mean([m['inflation_anomaly_ratio'] for m in train_metrics]).numpy()
+        
         report += "\n💦 ADAPTIVE INFLATION:\n"
-        report += f"   • Средний inflation factor: {avg_inflation:.3f}\n"
-        report += f"   • Доля аномальных инфляций: {inflation_anomalies:.1%}\n"
-    
-        if self.debug_mode:
-            print("\n" + "="*70)
-            print("DEBUG: ПРОВЕРКА АГРЕГАЦИИ МЕТРИК")
-            print("="*70)
-    
-            # Показать все значения
-            for i, m in enumerate(train_metrics):
-                ratio = m['inflation_anomaly_ratio']
-                print(f"Batch {i}: inflation_anomaly_ratio = {ratio:.4f} ({ratio*100:.1f}%)")
-    
-            # Показать результат
-            inflation_ratios_array = np.array([m['inflation_anomaly_ratio'] for m in train_metrics])
-            print(f"\nВсе значения: {inflation_ratios_array}")
-            print(f"Min: {inflation_ratios_array.min():.4f}")
-            print(f"Max: {inflation_ratios_array.max():.4f}")
-            print(f"Mean: {inflation_ratios_array.mean():.4f} ({inflation_ratios_array.mean()*100:.1f}%)")
-            print("="*70 + "\n")
-    
-        # Спектральная стабильность UKF
+        report += f"   • Средний фактор: {avg_inflation:.3f}\n"
+        report += f"   • Доля аномалий: {inflation_anomalies:.1%}\n"
+        
+        # === 6. СПЕКТРАЛЬНАЯ СТАБИЛЬНОСТЬ ===
         min_eig = tf.reduce_mean([m['ukf_min_eigenvalue'] for m in train_metrics]).numpy()
+        eig_status = '✅ Стабильно' if min_eig > 0.01 else '⚠️ Риск нестабильности'
+        
         report += "\n🔬 UKF СПЕКТРАЛЬНАЯ СТАБИЛЬНОСТЬ:\n"
-        report += f"   • Минимальное собственное значение: {min_eig:.6f}\n"
-    
-        # Анализ распределения нормализованных инноваций
+        report += f"   • Мин. собственное значение: {min_eig:.6f} → {eig_status}\n"
+        
+        # === 7. ИННОВАЦИИ (компактно) ===
         if all_normalized_innov is not None and len(all_normalized_innov) > 0:
-            # Удаляем бесконечности и NaN для корректной гистограммы
             valid_innov = all_normalized_innov[np.isfinite(all_normalized_innov)]
-            valid_innov = valid_innov[valid_innov <= 10.0]  # ограничиваем максимум для читаемости
-    
             if len(valid_innov) > 0:
-                # Нормализация для плотности
-                normalized_innov_hist, bin_edges = np.histogram(
-                    valid_innov,
-                    bins=20,
-                    range=(0, 10),
-                    density=True
-                )
-    
-                report += f"\n📊 РАСПРЕДЕЛЕНИЕ НОРМАЛИЗОВАННЫХ ИННОВАЦИЙ (последние 10 шагов):"
-                report += f"\n   • Всего значений: {len(valid_innov)}"
-                report += f"\n   • Среднее: {np.mean(valid_innov):.3f}, Медиана: {np.median(valid_innov):.3f}"
-                report += f"\n   • 95-й перцентиль: {np.percentile(valid_innov, 95):.3f}"
-    
-                # Добавляем детальную гистограмму
-                for i in range(min(10, len(bin_edges)-1)):  # Ограничиваем вывод 10 бинами для компактности
-                    report += f"\n   [{bin_edges[i]:.1f}-{bin_edges[i+1]:.1f}]: {normalized_innov_hist[i]:.4f}"
-    
-                # Добавляем рекомендации по анализу распределения
-                if np.mean(valid_innov) > 3.0:
-                    report += f"\n   ⚠️ ВЫСОКАЯ СРЕДНЯЯ ИННОВАЦИЯ: требуется анализ детектора аномалий"
-                elif np.percentile(valid_innov, 95) > 5.0:
-                    report += f"\n   ⚠️ ЧАСТЫЕ КРУПНЫЕ ОШИБКИ: требуется настройка параметров УКФ"
-                else:
-                    report += f"\n   ✅ НОРМАЛЬНОЕ РАСПРЕДЕЛЕНИЕ ИННОВАЦИЙ"
-    
-        # Валидация — отдельный блок с фокусом на метриках валидации
-        if val_metrics:
-            report += "\n📉 ВАЛИДАЦИЯ:\n"
-            report += f"   • Total Loss: {tf.reduce_mean([m['total_loss'] for m in val_metrics]).numpy():.6f}\n"
-            report += f"   • MSE Loss: {tf.reduce_mean([m['mse_loss'] for m in val_metrics]).numpy():.6f}\n"
-    
-            # Расчет покрытия по всем точкам валидации
-            if hasattr(self, 'all_val_covered') and len(self.all_val_covered) > 0:
-                val_coverage = np.mean(self.all_val_covered)
-            else:
-                # Fallback для совместимости
-                val_coverage = tf.reduce_mean([m['coverage_ratio'] for m in val_metrics]).numpy()
-    
-            val_calibration_error = tf.reduce_mean([m['calibration_error'] for m in val_metrics]).numpy()
-            val_ci_width_vs_stddev = tf.reduce_mean([m['ci_width_vs_stddev'] for m in val_metrics]).numpy()
-            val_target_coverage = tf.reduce_mean([m['target_coverage'] for m in val_metrics]).numpy()
-    
-            report += "\n📊 КАЛИБРОВКА ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ (VAL):\n"
-            report += f"   • Фактическое покрытие ДИ: {val_coverage:.2%}\n"
-            report += f"   • Целевое покрытие ДИ: {val_target_coverage:.2%}\n"
-            report += f"   • Ошибка калибровки: {val_calibration_error:.4f}\n"
-            report += f"   • Средняя ширина ДИ / волатильность данных: {val_ci_width_vs_stddev:.2f}x\n"
-            report += f"   • Статус: {'✅ Хорошо' if 0.80 <= val_coverage <= 0.95 else '⚠️ Требует настройки'}\n"
-    
+                mean_innov = np.mean(valid_innov)
+                p95_innov = np.percentile(valid_innov, 95)
+                innov_status = '✅ Нормальное' if mean_innov < 2.0 and p95_innov < 4.0 else '⚠️ Требует анализа'
+                
+                report += "\n📉 НОРМАЛИЗОВАННЫЕ ИННОВАЦИИ:\n"
+                report += f"   • Среднее: {mean_innov:.3f} | 95-й перцентиль: {p95_innov:.3f} → {innov_status}\n"
+        
         report += f"\n{'='*80}"
         return report
 
@@ -5087,230 +5031,321 @@ class LSTMIMMUKF(tf.Module):
 
         return self
 
-
-    def get_current_weights(self):
-        """Сохранение полного состояния модели в памяти для ранней остановки"""
-        # Используем логику из save(), но без записи на диск
+    def get_current_weights(self) -> Dict[str, Any]:
+        """
+        Сохранение ПОЛНОГО состояния модели в памяти для ранней остановки.
+        Включает ВСЕ компоненты: веса LSTM, состояние фильтра, обучаемые параметры,
+        состояние режимов волатильности и буфер аномалий.
+        
+        Возвращает:
+            Словарь с полным состоянием модели для последующего восстановления
+        """
         state_dict = {
-            # LSTM веса
-            'lstm_weights': self.model.get_weights() if self.model else None,
-
-            # UKF состояние
-            '_last_state': self._last_state.numpy(),
-            '_last_P': self._last_P.numpy(),
-            '_state_initialized': self._state_initialized.numpy(),
-            '_step_counter': self._step_counter.numpy(),
-            '_last_anomaly_time': self._last_anomaly_time.numpy(),
-
-            # ✅ СОСТОЯНИЕ БУФЕРА АНОМАЛИЙ ДЛЯ СОХРАНЕНИЯ МЕЖДУ ЭПОХАМИ
+            # === LSTM ВЕСА ===
+            'lstm_weights': self.model.get_weights() if self.model is not None else None,
+            
+            # === UKF СОСТОЯНИЕ (основное) ===
+            '_last_state': self._last_state.numpy() if hasattr(self, '_last_state') else None,
+            '_last_P': self._last_P.numpy() if hasattr(self, '_last_P') else None,
+            '_state_initialized': self._state_initialized.numpy() if hasattr(self, '_state_initialized') else False,
+            '_step_counter': self._step_counter.numpy() if hasattr(self, '_step_counter') else 0,
+            '_last_anomaly_time': self._last_anomaly_time.numpy() if hasattr(self, '_last_anomaly_time') else -100,
+            
+            # === СОСТОЯНИЕ БУФЕРА АНОМАЛИЙ ===
             'anomaly_buffer': self.anomaly_buffer.value().numpy() if hasattr(self, 'anomaly_buffer') else None,
-            'buffer_index': self.buffer_index.numpy() if hasattr(self, 'buffer_index') else None,
-
-            # Обучаемые параметры для волатильности
-            'base_q_logit': self.base_q_logit.numpy(),
-            'base_r_logit': self.base_r_logit.numpy(),
-            'volatility_sensitivity': self.volatility_sensitivity.numpy(),
-            'student_t_base_dof': self.student_t_base_dof.numpy(),
-            'student_t_vol_sensitivity': self.student_t_vol_sensitivity.numpy(),
-            'inflation_base_factor': self.inflation_base_factor.numpy(),
-            'inflation_vol_sensitivity': self.inflation_vol_sensitivity.numpy(),
-            'inflation_decay_rate': self.inflation_decay_rate.numpy(),
-            'confidence_base': self.confidence_base.numpy(),
-            'confidence_vol_sensitivity': self.confidence_vol_sensitivity.numpy(),
-
-            # Скейлеры
-            'feature_scalers': self.feature_scalers if hasattr(self, 'feature_scalers') else None,
-            'best_scalers': self.best_scalers if hasattr(self, 'best_scalers') else None,
-
-            # Дифференцируемый UKF
-            'diff_ukf_state': {},
+            'buffer_index': self.buffer_index.numpy() if hasattr(self, 'buffer_index') else 0,
+            'anomaly_buffer_size': getattr(self, 'anomaly_buffer_size', 100),
+            
+            # === ОБУЧАЕМЫЕ ПАРАМЕТРЫ БАЗОВЫХ ШУМОВ ===
+            'base_q_logit': self.base_q_logit.numpy() if hasattr(self, 'base_q_logit') else np.log(0.15),
+            'base_r_logit': self.base_r_logit.numpy() if hasattr(self, 'base_r_logit') else np.log(1.8),
+            
+            # === ПАРАМЕТРЫ КОНТЕКСТНОЙ ВОЛАТИЛЬНОСТИ ===
+            'volatility_sensitivity': self.volatility_sensitivity.numpy() if hasattr(self, 'volatility_sensitivity') else 1.0,
+            'student_t_base_dof': self.student_t_base_dof.numpy() if hasattr(self, 'student_t_base_dof') else np.log(2.5),
+            'student_t_vol_sensitivity': self.student_t_vol_sensitivity.numpy() if hasattr(self, 'student_t_vol_sensitivity') else 0.3,
+            
+            # === ПАРАМЕТРЫ АДАПТИВНОЙ ИНФЛЯЦИИ ===
+            'inflation_base_factor': self.inflation_base_factor.numpy() if hasattr(self, 'inflation_base_factor') else np.log(0.05),
+            'inflation_vol_sensitivity': self.inflation_vol_sensitivity.numpy() if hasattr(self, 'inflation_vol_sensitivity') else 0.2,
+            'inflation_decay_rate': self.inflation_decay_rate.numpy() if hasattr(self, 'inflation_decay_rate') else 0.95,
+            
+            # === ПАРАМЕТРЫ КАЛИБРОВКИ ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ ===
+            'confidence_base': self.confidence_base.numpy() if hasattr(self, 'confidence_base') else 0.90,
+            'confidence_vol_sensitivity': self.confidence_vol_sensitivity.numpy() if hasattr(self, 'confidence_vol_sensitivity') else 0.1,
+            'max_width_factor_logit': self.max_width_factor_logit.numpy() if hasattr(self, 'max_width_factor_logit') else np.log(1.5),
+            
+            # === СОСТОЯНИЕ ДИФФЕРЕНЦИРУЕМОГО UKF ===
+            'diff_ukf_state': {
+                'd_raw': self.diff_ukf_component.spec_param.d_raw.numpy() 
+                if self.use_diff_ukf and hasattr(self, 'diff_ukf_component') and hasattr(self.diff_ukf_component.spec_param, 'd_raw')
+                else np.log(0.1)
+            },
+            
+            # === СОСТОЯНИЕ VOLATILITY REGIME SELECTOR (КРИТИЧЕСКИ ВАЖНО) ===
+            'regime_selector_state': {
+                'regime_scales': self.regime_selector.regime_scales.numpy() 
+                if hasattr(self, 'regime_selector') and hasattr(self.regime_selector, 'regime_scales')
+                else np.array([2.96, 4.44, 6.16], dtype=np.float32),
+                
+                'temperature': self.regime_selector.temperature.numpy() 
+                if hasattr(self, 'regime_selector') and hasattr(self.regime_selector, 'temperature')
+                else 0.4,
+                
+                'history': self.regime_selector._vol_history.numpy() 
+                if hasattr(self, 'regime_selector') and hasattr(self.regime_selector, '_vol_history')
+                else np.zeros([1, 100], dtype=np.float32),
+                
+                'center_logits': self.regime_selector.center_logits.numpy() 
+                if hasattr(self, 'regime_selector') and hasattr(self.regime_selector, 'center_logits') and self.regime_selector.learnable_centers
+                else np.log([0.12, 0.35, 0.75])
+            },
+            
+            # === СКЕЙЛЕРЫ ===
+            'feature_scalers': self.feature_scalers.copy() if hasattr(self, 'feature_scalers') and self.feature_scalers is not None else None,
+            'best_scalers': self.best_scalers.copy() if hasattr(self, 'best_scalers') and self.best_scalers is not None else None,
+            'scale_groups': self.scale_groups.copy() if hasattr(self, 'scale_groups') and self.scale_groups is not None else None,
+            
+            # === МЕТРИКИ ТРЕКИНГА ЛУЧШИХ ВЕСОВ ===
             'best_val_loss': self.best_val_loss,
-            'best_epoch': self.best_epoch
+            'best_epoch': self.best_epoch,
+            'patience_counter': self.patience_counter,
+            
+            # === ФЛАГИ КОНФИГУРАЦИИ ===
+            'use_diff_ukf': self.use_diff_ukf,
+            'num_modes': self.num_modes,
+            'state_dim': self.state_dim,
+            'seq_len': self.seq_len,
+            
+            # === ЭНТРОПИЙНАЯ РЕГУЛЯРИЗАЦИЯ ===
+            'lambda_entropy': self.lambda_entropy.numpy() if hasattr(self, 'lambda_entropy') else 0.02,
+            
+            # === АДАПТИВНЫЙ ПОРОГ АНОМАЛИЙ ===
+            'threshold_ema': self.threshold_ema.numpy() if hasattr(self, 'threshold_ema') else 3.0,
         }
-
-        # Добавляем состояние diff_ukf если используется
-        if self.use_diff_ukf and hasattr(self, 'diff_ukf_component'):
-            state_dict['diff_ukf_state']['d_raw'] = self.diff_ukf_component.spec_param.d_raw.numpy()
-
+        
+        # Валидация сохранённого состояния
+        required_keys = ['lstm_weights', '_last_state', '_last_P', 'base_q_logit', 'base_r_logit', 'regime_selector_state']
+        missing_keys = [k for k in required_keys if state_dict.get(k) is None]
+        if missing_keys:
+            print(f"⚠️  Предупреждение: отсутствуют ключевые компоненты при сохранении: {missing_keys}")
+        
+        print(f"✅ Полное состояние модели сохранено в памяти")
+        print(f"   • LSTM веса: {'Да' if state_dict['lstm_weights'] is not None else 'Нет'}")
+        print(f"   • Состояние фильтра: размер _last_state={state_dict['_last_state'].shape if state_dict['_last_state'] is not None else 'N/A'}")
+        print(f"   • Regime Selector: сохранены все параметры (scales, temperature, history, centers)")
+        print(f"   • Буфер аномалий: размер={state_dict['anomaly_buffer'].shape if state_dict['anomaly_buffer'] is not None else 'N/A'}")
+        
         return state_dict
 
-    def load_best_weights(self):
-        """Загрузка лучших весов - полное восстановление состояния с проверкой размерностей"""
+    def load_best_weights(self) -> bool:
+        """
+        ЗАГРУЗКА ЛУЧШИХ ВЕСОВ — полное восстановление состояния модели на момент лучшей эпохи.
+        
+        ВАЖНО: Этот метод восстанавливает ПОЛНОЕ состояние (включая обучаемые параметры),
+        что необходимо для воспроизводимости результатов. Это НЕ нарушает принцип "не перезаписывать
+        обучаемые параметры" — мы восстанавливаем состояние на момент лучшей эпохи, а не загружаем
+        внешние веса в середине обучения.
+        
+        Возвращает:
+            bool — успешность загрузки
+        """
         if self.best_weights_dict is None:
-            print("⚠️  Нет лучших весов для загрузки")
+            print("⚠️  Нет лучших весов для загрузки (best_weights_dict is None)")
             return False
-
+        
         try:
-            print("\n" + "=" * 60)
-            print("📥 ЗАГРУЗКА ЛУЧШИХ ВЕСОВ")
-            print("=" * 60)
-
-            # === 1. БЕЗОПАСНОЕ ОПРЕДЕЛЕНИЕ РАЗМЕРА БАТЧА ===
-            current_batch_size = None
-            if hasattr(self, '_last_state') and self._last_state is not None:
-                try:
-                    # Проверяем, что переменная инициализирована
-                    if self._last_state.shape is not None and len(self._last_state.shape) > 0:
-                        current_batch_size = self._last_state.shape[0]
-                    else:
-                        print(f"   ⚠️ _last_state не инициализирован, используем размер из сохраненных данных")
-                except Exception as e:
-                    print(f"   ⚠️ Ошибка при получении размера _last_state: {str(e)}")
-
-            # Если не удалось определить размер, используем размер из сохраненных данных
-            if current_batch_size is None and '_last_state' in self.best_weights_dict:
-                current_batch_size = self.best_weights_dict['_last_state'].shape[0]
-                print(f"   ✅ Размер батча определен из сохраненных данных: {current_batch_size}")
-
-            # === 2. ЗАГРУЗКА LSTM ВЕСОВ ===
+            print("\n" + "=" * 80)
+            print("📥 ЗАГРУЗКА ЛУЧШИХ ВЕСОВ — ВОССТАНОВЛЕНИЕ ПОЛНОГО СОСТОЯНИЯ")
+            print("=" * 80)
+            
+            # === 0. ВАЛИДАЦИЯ СТРУКТУРЫ ===
+            required_keys = ['lstm_weights', '_last_state', '_last_P', 'base_q_logit', 'base_r_logit', 'regime_selector_state']
+            missing_keys = [k for k in required_keys if k not in self.best_weights_dict or self.best_weights_dict[k] is None]
+            if missing_keys:
+                print(f"❌ КРИТИЧЕСКАЯ ОШИБКА: отсутствуют обязательные компоненты: {missing_keys}")
+                return False
+            
+            print("✅ Структура весов валидна, начинаем восстановление...")
+            
+            # === 1. ЗАГРУЗКА LSTM ВЕСОВ ===
             if self.best_weights_dict['lstm_weights'] is not None and self.model is not None:
                 try:
                     self.model.set_weights(self.best_weights_dict['lstm_weights'])
                     print("✅ LSTM веса загружены")
                 except Exception as e:
                     print(f"   ⚠️ Ошибка при загрузке LSTM весов: {str(e)}")
-
-            # === 3. ВОССТАНОВЛЕНИЕ UKF СОСТОЯНИЯ С ПРОВЕРКОЙ РАЗМЕРНОСТЕЙ ===
-            print("🔧 Восстановление UKF состояния...")
-            ukf_vars = ['_last_state', '_last_P', '_state_initialized', '_step_counter', '_last_anomaly_time']
-
-            for attr in ukf_vars:
-                if attr in self.best_weights_dict and hasattr(self, attr):
-                    saved_value = self.best_weights_dict[attr]
-                    current_var = getattr(self, attr)
-
-                    # Проверка размерностей для _last_state и _last_P
-                    if attr in ['_last_state', '_last_P'] and current_batch_size is not None:
-                        saved_size = saved_value.shape[0]
-                        if saved_size != current_batch_size:
-                            print(f"⚠️  Размерность {attr} изменилась при загрузке: {saved_size} → {current_batch_size}")
-
-                            if attr == '_last_state':
-                                # Создаем новое состояние с правильным размером
-                                if saved_value.ndim > 1:
-                                    new_value = np.zeros([current_batch_size] + list(saved_value.shape[1:]), dtype=np.float32)
-                                else:
-                                    new_value = np.zeros([current_batch_size], dtype=np.float32)
-                                print(f"   ✅ Создано новое состояние _last_state размером {current_batch_size}")
-                            elif attr == '_last_P':
-                                # Создаем новую ковариационную матрицу
-                                base_q = tf.nn.softplus(self.base_q_logit) + 1e-6
-                                new_value = np.eye(self.state_dim, dtype=np.float32)[np.newaxis, :, :] * base_q.numpy()
-                                new_value = np.tile(new_value, [current_batch_size, 1, 1])
-                                print(f"   ✅ Создана новая ковариационная матрица размером {current_batch_size}×{self.state_dim}×{self.state_dim}")
-
-                            saved_value = new_value
-
-                    try:
-                        current_var.assign(saved_value)
-                        print(f"   ✅ {attr} восстановлен")
-                    except Exception as e:
-                        print(f"   ⚠️ Ошибка при восстановлении {attr}: {str(e)}")
-
-            # ✅ ВОССТАНОВЛЕНИЕ СОСТОЯНИЯ БУФЕРА АНОМАЛИЙ МЕЖДУ ЭПОХАМИ
-            print("🔧 Восстановление состояния детектора аномалий...")
-            if hasattr(self, 'anomaly_buffer') and 'anomaly_buffer' in self.best_weights_dict:
-                if self.best_weights_dict['anomaly_buffer'] is not None:
-                    self.anomaly_buffer.assign(self.best_weights_dict['anomaly_buffer'])
-                    print("   ✅ anomaly_buffer восстановлен")
-            if hasattr(self, 'buffer_index') and 'buffer_index' in self.best_weights_dict:
-                if self.best_weights_dict['buffer_index'] is not None:
-                    self.buffer_index.assign(self.best_weights_dict['buffer_index'])
-                    print("   ✅ buffer_index восстановлен")
-
-            # ✅ ЭКСТРАПОЛЯЦИЯ СОСТОЯНИЯ МЕЖДУ ЭПОХАМИ
-            print("🔮 Экстраполяция состояния для продолжения тренда...")
-            if hasattr(self, 'anomaly_buffer') and hasattr(self, 'buffer_index'):
-                if not hasattr(self, 'anomaly_buffer_size'):
-                    self.anomaly_buffer_size = 100  # Значение по умолчанию
-
-                buffer_threshold = tf.cast(self.anomaly_buffer_size * 0.8, tf.int32)
-                if self.buffer_index > buffer_threshold:
-                    print("   📈 Буфер заполнен на 80%+, выполняем экстраполяцию тренда")
-                    buffer_values = self.anomaly_buffer.value()
-                    # Рассчитываем тренд на основе последних 10 значений
-                    if tf.shape(buffer_values)[0] >= 11:
-                        trend = buffer_values[-10:] - buffer_values[-11:-1]
-                        predicted_trend = tf.reduce_mean(trend)
-                        # Прогнозируем следующие 10 значений
-                        last_value = buffer_values[-1]
-                        forecast_values = tf.fill([10], last_value + predicted_trend)
-                        # Обновляем буфер: убираем первые 10 значений, добавляем прогноз
-                        updated_buffer = tf.concat([buffer_values[10:], forecast_values], axis=0)
-                        self.anomaly_buffer.assign(updated_buffer)
-                        print(f"   ✅ Буфер экстраполирован. Предсказанный тренд: {predicted_trend:.4f}")
-                    else:
-                        print("   ⚠️ Недостаточно данных для экстраполяции (требуется минимум 11 значений)")
-                else:
-                    print("   ⚠️ Буфер заполнен менее чем на 80%, пропускаем экстраполяцию")
+                    return False
+            
+            # === 2. ВОССТАНОВЛЕНИЕ СОСТОЯНИЯ ФИЛЬТРА С ПРОВЕРКОЙ РАЗМЕРНОСТЕЙ ===
+            print("\n🔧 Восстановление состояния фильтра UKF...")
+            
+            # Проверка размерностей ДО восстановления
+            current_state_shape = self._last_state.shape if hasattr(self, '_last_state') else None
+            saved_state_shape = self.best_weights_dict['_last_state'].shape if self.best_weights_dict['_last_state'] is not None else None
+            
+            if current_state_shape != saved_state_shape:
+                print(f"⚠️  НЕСОВПАДЕНИЕ РАЗМЕРНОСТЕЙ:")
+                print(f"   Текущее состояние: {current_state_shape}")
+                print(f"   Сохранённое состояние: {saved_state_shape}")
+                print(f"   → Состояние НЕ будет восстановлено (риск численной нестабильности)")
+                # НЕ создаём новые значения — это нарушит логику фильтрации
+                # Вместо этого оставляем текущее состояние и продолжаем загрузку остальных параметров
             else:
-                print("   ⚠️ Нет данных для экстраполяции (отсутствуют anomaly_buffer или buffer_index)")
-
-            # === 4. ВОССТАНОВЛЕНИЕ ОБУЧАЕМЫХ ПАРАМЕТРОВ ===
-            print("🔧 Восстановление обучаемых параметров...")
-            trainable_params = [
-                'base_q_logit', 'base_r_logit', 'volatility_sensitivity',
-                'student_t_base_dof', 'student_t_vol_sensitivity',
-                'inflation_base_factor', 'inflation_vol_sensitivity', 'inflation_decay_rate',
-                'confidence_base', 'confidence_vol_sensitivity'
-            ]
-
-            for param in trainable_params:
-                if param in self.best_weights_dict and hasattr(self, param):
+                try:
+                    self._last_state.assign(self.best_weights_dict['_last_state'])
+                    self._last_P.assign(self.best_weights_dict['_last_P'])
+                    self._state_initialized.assign(self.best_weights_dict['_state_initialized'])
+                    self._step_counter.assign(self.best_weights_dict['_step_counter'])
+                    self._last_anomaly_time.assign(self.best_weights_dict['_last_anomaly_time'])
+                    print("✅ Состояние фильтра восстановлено")
+                except Exception as e:
+                    print(f"   ⚠️ Ошибка при восстановлении состояния фильтра: {str(e)}")
+                    return False
+            
+            # === 3. ВОССТАНОВЛЕНИЕ БУФЕРА АНОМАЛИЙ ===
+            print("\n🔧 Восстановление состояния детектора аномалий...")
+            if 'anomaly_buffer' in self.best_weights_dict and self.best_weights_dict['anomaly_buffer'] is not None:
+                if hasattr(self, 'anomaly_buffer'):
                     try:
-                        getattr(self, param).assign(self.best_weights_dict[param])
-                        print(f"   ✅ {param} восстановлен")
+                        self.anomaly_buffer.assign(self.best_weights_dict['anomaly_buffer'])
+                        print("   ✅ anomaly_buffer восстановлен")
                     except Exception as e:
-                        print(f"   ⚠️ Ошибка при восстановлении {param}: {str(e)}")
-
-            # === 5. ВОССТАНОВЛЕНИЕ СКЕЙЛЕРОВ ===
-            if 'feature_scalers' in self.best_weights_dict:
-                self.feature_scalers = self.best_weights_dict['feature_scalers']
-                print("✅ Скейлеры признаков восстановлены")
-
-            if 'best_scalers' in self.best_weights_dict:
-                self.best_scalers = self.best_weights_dict['best_scalers']
-                print("✅ Лучшие скейлеры восстановлены")
-
-            # === 6. ВОССТАНОВЛЕНИЕ ДИФФЕРЕНЦИРУЕМОГО UKF ===
+                        print(f"   ⚠️ Ошибка при восстановлении anomaly_buffer: {str(e)}")
+            
+            if 'buffer_index' in self.best_weights_dict and self.best_weights_dict['buffer_index'] is not None:
+                if hasattr(self, 'buffer_index'):
+                    try:
+                        self.buffer_index.assign(self.best_weights_dict['buffer_index'])
+                        print("   ✅ buffer_index восстановлен")
+                    except Exception as e:
+                        print(f"   ⚠️ Ошибка при восстановлении buffer_index: {str(e)}")
+            
+            # === 4. ВОССТАНОВЛЕНИЕ ОБУЧАЕМЫХ ПАРАМЕТРОВ ===
+            print("\n🔧 Восстановление обучаемых параметров...")
+            trainable_params = [
+                ('base_q_logit', 'base_q_logit'),
+                ('base_r_logit', 'base_r_logit'),
+                ('volatility_sensitivity', 'volatility_sensitivity'),
+                ('student_t_base_dof', 'student_t_base_dof'),
+                ('student_t_vol_sensitivity', 'student_t_vol_sensitivity'),
+                ('inflation_base_factor', 'inflation_base_factor'),
+                ('inflation_vol_sensitivity', 'inflation_vol_sensitivity'),
+                ('inflation_decay_rate', 'inflation_decay_rate'),
+                ('confidence_base', 'confidence_base'),
+                ('confidence_vol_sensitivity', 'confidence_vol_sensitivity'),
+                ('max_width_factor_logit', 'max_width_factor_logit'),
+                ('lambda_entropy', 'lambda_entropy'),
+                ('threshold_ema', 'threshold_ema'),
+            ]
+            
+            for attr_name, dict_key in trainable_params:
+                if dict_key in self.best_weights_dict and self.best_weights_dict[dict_key] is not None:
+                    if hasattr(self, attr_name):
+                        try:
+                            var = getattr(self, attr_name)
+                            if isinstance(var, tf.Variable):
+                                var.assign(self.best_weights_dict[dict_key])
+                                print(f"   ✅ {attr_name} восстановлен")
+                            else:
+                                setattr(self, attr_name, self.best_weights_dict[dict_key])
+                                print(f"   ✅ {attr_name} установлен")
+                        except Exception as e:
+                            print(f"   ⚠️ Ошибка при восстановлении {attr_name}: {str(e)}")
+            
+            # === 5. ВОССТАНОВЛЕНИЕ ДИФФЕРЕНЦИРУЕМОГО UKF ===
+            print("\n🔧 Восстановление состояния дифференцируемого UKF...")
             if self.use_diff_ukf and 'diff_ukf_state' in self.best_weights_dict:
-                if hasattr(self, 'diff_ukf_component') and 'd_raw' in self.best_weights_dict['diff_ukf_state']:
+                if hasattr(self, 'diff_ukf_component') and hasattr(self.diff_ukf_component.spec_param, 'd_raw'):
                     try:
                         self.diff_ukf_component.spec_param.d_raw.assign(self.best_weights_dict['diff_ukf_state']['d_raw'])
                         print("✅ Состояние дифференцируемого UKF восстановлено")
                     except Exception as e:
                         print(f"   ⚠️ Ошибка при восстановлении d_raw: {str(e)}")
-
-            # === 7. ВОССТАНОВЛЕНИЕ VOLATILITY REGIME SELECTOR ===
-            if hasattr(self, 'regime_selector') and 'regime_selector_state' in self.best_weights_dict:
+            
+            # === 6. ВОССТАНОВЛЕНИЕ VOLATILITY REGIME SELECTOR (КРИТИЧЕСКИ ВАЖНО) ===
+            print("\n🔧 Восстановление состояния Volatility Regime Selector...")
+            if 'regime_selector_state' in self.best_weights_dict and hasattr(self, 'regime_selector'):
                 selector_state = self.best_weights_dict['regime_selector_state']
-                try:
-                    if 'regime_scales' in selector_state:
+                restored = []
+                
+                # regime_scales
+                if 'regime_scales' in selector_state and selector_state['regime_scales'] is not None:
+                    try:
                         self.regime_selector.regime_scales.assign(selector_state['regime_scales'])
-                    if 'temperature' in selector_state:
+                        restored.append('regime_scales')
+                    except Exception as e:
+                        print(f"   ⚠️ Ошибка при восстановлении regime_scales: {str(e)}")
+                
+                # temperature
+                if 'temperature' in selector_state and selector_state['temperature'] is not None:
+                    try:
                         self.regime_selector.temperature.assign(selector_state['temperature'])
-                    if 'history' in selector_state:
+                        restored.append('temperature')
+                    except Exception as e:
+                        print(f"   ⚠️ Ошибка при восстановлении temperature: {str(e)}")
+                
+                # history
+                if 'history' in selector_state and selector_state['history'] is not None:
+                    try:
                         self.regime_selector._vol_history.assign(selector_state['history'])
-                    if hasattr(self.regime_selector, 'center_logits') and 'center_logits' in selector_state:
+                        restored.append('history')
+                    except Exception as e:
+                        print(f"   ⚠️ Ошибка при восстановлении _vol_history: {str(e)}")
+                
+                # center_logits (если обучаемые)
+                if (hasattr(self.regime_selector, 'learnable_centers') and 
+                    self.regime_selector.learnable_centers and 
+                    'center_logits' in selector_state and 
+                    selector_state['center_logits'] is not None):
+                    try:
                         self.regime_selector.center_logits.assign(selector_state['center_logits'])
-                    print("✅ Состояние Volatility Regime Selector восстановлено")
-                except Exception as e:
-                    print(f"   ⚠️ Ошибка при восстановлении Regime Selector: {str(e)}")
-
-            # === 8. ОБНОВЛЕНИЕ МЕТРИК ===
-            self.best_val_loss = self.best_weights_dict['best_val_loss']
-            self.best_epoch = self.best_weights_dict['best_epoch']
-
-            print("\n" + "=" * 60)
-            print(f"✅ ПОЛНОЕ СОСТОЯНИЕ ЗАГРУЖЕНО ИЗ ЛУЧШИХ ВЕСОВ")
-            print(f"   Эпоха: {self.best_epoch}, Val Loss: {self.best_val_loss:.6f}")
-            print(f"   Размер батча: {current_batch_size}")
-            print("=" * 60)
-
+                        restored.append('center_logits')
+                    except Exception as e:
+                        print(f"   ⚠️ Ошибка при восстановлении center_logits: {str(e)}")
+                
+                if restored:
+                    print(f"✅ Восстановлены параметры: {', '.join(restored)}")
+                else:
+                    print("⚠️ Не удалось восстановить параметры Regime Selector")
+            
+            # === 7. ВОССТАНОВЛЕНИЕ СКЕЙЛЕРОВ ===
+            print("\n🔧 Восстановление скейлеров...")
+            if 'feature_scalers' in self.best_weights_dict:
+                self.feature_scalers = self.best_weights_dict['feature_scalers']
+                print("✅ Скейлеры признаков восстановлены")
+            
+            if 'best_scalers' in self.best_weights_dict:
+                self.best_scalers = self.best_weights_dict['best_scalers']
+                print("✅ Лучшие скейлеры восстановлены")
+            
+            if 'scale_groups' in self.best_weights_dict:
+                self.scale_groups = self.best_weights_dict['scale_groups']
+                print("✅ scale_groups восстановлены")
+            
+            # === 8. ОБНОВЛЕНИЕ МЕТРИК ТРЕКИНГА ===
+            self.best_val_loss = self.best_weights_dict.get('best_val_loss', float('inf'))
+            self.best_epoch = self.best_weights_dict.get('best_epoch', 0)
+            self.patience_counter = self.best_weights_dict.get('patience_counter', 0)
+            
+            # === 9. ФИНАЛЬНАЯ ВАЛИДАЦИЯ ===
+            print("\n" + "=" * 80)
+            print("✅ ПОЛНОЕ СОСТОЯНИЕ УСПЕШНО ВОССТАНОВЛЕНО")
+            print("=" * 80)
+            print(f"   📅 Эпоха: {self.best_epoch + 1}")
+            print(f"   📉 Val Loss: {self.best_val_loss:.6f}")
+            print(f"   🔁 Счётчик шагов: {self._step_counter.numpy()}")
+            print(f"   🧠 Состояние фильтра: {'Инициализировано' if self._state_initialized.numpy() else 'Не инициализировано'}")
+            print(f"   🎭 Regime Selector: scales={self.regime_selector.regime_scales.numpy()}, temp={self.regime_selector.temperature.numpy():.3f}")
+            print(f"   💧 Adaptive inflation: base={tf.nn.softplus(self.inflation_base_factor).numpy():.3f}")
+            print(f"   📏 Max width factor: {tf.nn.softplus(self.max_width_factor_logit).numpy() + 1.0:.2f}x")
+            print("=" * 80)
+            
             return True
-
+            
         except Exception as e:
-            print(f"❌ КРИТИЧЕСКАЯ ОШИБКА при загрузке лучших весов: {str(e)}")
+            print(f"\n❌ КРИТИЧЕСКАЯ ОШИБКА при загрузке лучших весов:")
+            print(f"   {str(e)}")
             import traceback
             traceback.print_exc()
             return False
@@ -5330,133 +5365,521 @@ class LSTMIMMUKF(tf.Module):
 
         print("✓ Отслеживание лучших весов сброшено")
 
-    def evaluate(self, df: pd.DataFrame, plot: bool = False, N: int = 300) -> Dict[str, float]:
+    @tf.function(jit_compile=False)
+    def _online_predict_step(
+        self,
+        X_scaled: tf.Tensor,
+        initial_state: tf.Tensor,
+        initial_covariance: tf.Tensor,
+        last_volatility: tf.Tensor
+    ) -> Tuple[
+        tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor,
+        tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, Dict[str, tf.Tensor]
+    ]:
         """
-        Оценка модели на тестовых данных с использованием скользящего окна
-        для новой архитектуры с контекстной волатильностью
+        Внутренний графовый метод для онлайн-прогнозирования.
+        Все операции совместимы с @tf.function и работают в графовом режиме.
+        
+        Входы:
+            X_scaled: [B, seq_len, n_features] - масштабированные признаки
+            initial_state: [B, 1] - начальное состояние фильтра
+            initial_covariance: [B, 1, 1] - начальная ковариация
+            last_volatility: [B] - волатильность с предыдущего шага
+        
+        Выходы (все в масштабированном пространстве):
+            forecast: [B] - прогноз на следующий шаг
+            std_dev: [B] - стандартное отклонение прогноза
+            ci_lower: [B] - нижняя граница ДИ
+            ci_upper: [B] - верхняя граница ДИ
+            final_state: [B, 1] - фильтрованное состояние последнего шага
+            final_covariance: [B, 1, 1] - ковариация последнего шага
+            final_volatility: [B] - финальная волатильность
+            inflation_factor: [B] - фактор инфляции
+            target_coverage: [B] - целевое покрытие ДИ
+            regime_info: Dict - информация о распределении по режимам
+        """
+        B = tf.shape(X_scaled)[0]
+        T = tf.shape(X_scaled)[1]
+        
+        # === 1. LSTM FORWARD PASS ===
+        lstm_outputs = self.model(X_scaled, training=False)
+        params_output = lstm_outputs['params']  # [B, T, 37]
+        
+        # === 2. ОБРАБОТКА ВЫХОДОВ LSTM ===
+        vol_context, ukf_params, inflation_config, student_t_config = self.process_lstm_output(params_output)
+        
+        # === 3. АДАПТИВНАЯ ФИЛЬТРАЦИЯ UKF ===
+        # Гарантируем правильные размерности состояния
+        initial_state = tf.reshape(initial_state, [B, self.state_dim])
+        initial_covariance = tf.reshape(initial_covariance, [B, self.state_dim, self.state_dim])
+        
+        # Извлекаем целевую переменную из признаков (колонка 'level')
+        # Предполагаем, что 'level' находится в первом столбце масштабированных признаков
+        y_level_batch = X_scaled[:, :, 0]  # [B, T] - извлекаем уровень из признаков
+        
+        results = self.adaptive_ukf_filter(
+            X_scaled,
+            y_level_batch,
+            vol_context,
+            ukf_params,
+            inflation_config,
+            student_t_config,
+            initial_state,
+            initial_covariance
+        )
+        
+        # Распаковка результатов фильтрации
+        x_filtered = results[0]        # [B, T, 1]
+        innovations = results[1]       # [B, T, 1]
+        volatility_levels = results[2] # [B, T, 1]
+        inflation_factors = results[3] # [B, T, 1]
+        final_state = results[4]       # [B, 1]
+        final_covariance = results[5]  # [B, 1, 1]
+        
+        # === 4. ИЗВЛЕЧЕНИЕ ФИНАЛЬНЫХ ПАРАМЕТРОВ ===
+        final_volatility = tf.squeeze(volatility_levels[:, -1, :])  # [B]
+        final_inflation = tf.squeeze(inflation_factors[:, -1, :])   # [B]
+        
+        # === 5. ЯВНЫЙ PREDICT НА СЛЕДУЮЩИЙ ШАГ ===
+        t_last = T - 1
+        
+        # Извлечение параметров последнего шага
+        q_base_final = tf.gather(ukf_params['q_base'], t_last, axis=1)           # [B, 1]
+        q_sensitivity_final = tf.gather(ukf_params['q_sensitivity'], t_last, axis=1)
+        q_floor_final = tf.gather(ukf_params['q_floor'], t_last, axis=1)
+        r_base_final = tf.gather(ukf_params['r_base'], t_last, axis=1)
+        r_sensitivity_final = tf.gather(ukf_params['r_sensitivity'], t_last, axis=1)
+        r_floor_final = tf.gather(ukf_params['r_floor'], t_last, axis=1)
+        relax_base_final = tf.gather(ukf_params['relax_base'], t_last, axis=1)
+        relax_sensitivity_final = tf.gather(ukf_params['relax_sensitivity'], t_last, axis=1)
+        alpha_base_final = tf.gather(ukf_params['alpha_base'], t_last, axis=1)
+        alpha_sensitivity_final = tf.gather(ukf_params['alpha_sensitivity'], t_last, axis=1)
+        kappa_base_final = tf.gather(ukf_params['kappa_base'], t_last, axis=1)
+        kappa_sensitivity_final = tf.gather(ukf_params['kappa_sensitivity'], t_last, axis=1)
+        inf_factor_final = tf.reshape(final_inflation, [B, 1])  # [B] → [B, 1]
+        
+        forecast, std_dev = self._explicit_predict_next_step(
+            final_state,
+            final_covariance,
+            final_volatility,
+            q_base_final, q_sensitivity_final, q_floor_final,
+            inf_factor_final,
+            relax_base_final, relax_sensitivity_final,
+            alpha_base_final, alpha_sensitivity_final,
+            kappa_base_final, kappa_sensitivity_final
+        )  # forecast: [B], std_dev: [B]
+        
+        # === 6. РАСПРЕДЕЛЕНИЕ ПО РЕЖИМАМ ВОЛАТИЛЬНОСТИ ===
+        regime_info = self.regime_selector.assign_soft_regimes(final_volatility)  # final_volatility: [B]
+        
+        # === 7. КАЛИБРОВКА ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ С УЧЁТОМ РЕЖИМОВ ===
+        # Настройка параметров Student-t для калибровки
+        batch_shape = tf.shape(final_volatility)
+        student_t_config_final = {
+            'dof_base': tf.fill(batch_shape, 6.0),
+            'dof_sensitivity': tf.fill(batch_shape, 0.5),
+            'asymmetry_pos': tf.fill(batch_shape, 0.7)[:, tf.newaxis],
+            'asymmetry_neg': tf.fill(batch_shape, 1.3)[:, tf.newaxis],
+            'regime_scale': tf.ones([B, 1], dtype=tf.float32),  # будет заменено ниже
+            'regime_soft_weights': tf.ones([B, 3], dtype=tf.float32)
+        }
+        
+        # Получаем мягкие веса режимов и вычисляем адаптивный масштаб
+        soft_weights = regime_info['soft_weights']  # [B, 3]
+        regime_scale = self.regime_selector.get_regime_scales(soft_weights)  # [B, 1]
+        student_t_config_final['regime_scale'] = regime_scale
+        student_t_config_final['regime_soft_weights'] = soft_weights
+        
+        # Калибровка ДИ с учётом режимов
+        ci_lower, ci_upper, target_coverage = self._calibrate_confidence_interval(
+            forecast,
+            std_dev,
+            final_volatility,
+            student_t_config_final,
+            innovations=innovations[:, -10:, :] if innovations is not None else None,
+            regime_assignment=regime_info['regime_assignment']
+        )  # ci_lower/ci_upper: [B], target_coverage: [B]
+        
+        # === 8. ГАРАНТИЯ ВАЛИДНОСТИ ГРАНИЦ ===
+        ci_min = tf.minimum(ci_lower, ci_upper)
+        ci_max = tf.maximum(ci_lower, ci_upper)
+        
+        return (
+            forecast,           # [B]
+            std_dev,            # [B]
+            ci_min,             # [B]
+            ci_max,             # [B]
+            final_state,        # [B, 1]
+            final_covariance,   # [B, 1, 1]
+            final_volatility,   # [B]
+            final_inflation,    # [B]
+            target_coverage,    # [B]
+            regime_info         # Dict[str, tf.Tensor]
+        )
+    
+    
+    def online_predict(
+        self,
+        df: pd.DataFrame,
+        reset_state: bool = False
+    ) -> Dict[str, np.ndarray]:
+        """
+        Публичный метод для онлайн-прогнозирования на новых данных.
+        Возвращает результаты в исходном (обратно преобразованном) масштабе.
+        
+        Аргументы:
+            df: pd.DataFrame - данные с колонками OHLC + рассчитанные признаки
+                Минимальный размер: seq_len точек для подготовки признаков
+            reset_state: bool - сбросить состояние фильтра перед прогнозом
+            
+        Возвращает:
+            Словарь с ключами:
+                'forecast': прогноз уровня на следующий шаг
+                'ci_lower': нижняя граница 90% ДИ
+                'ci_upper': верхняя граница 90% ДИ
+                'std_dev': стандартное отклонение прогноза
+                'volatility': текущий уровень волатильности
+                'inflation_factor': адаптивный фактор инфляции
+                'target_coverage': целевое покрытие ДИ
+                'regime': доминирующий режим волатильности (0=LOW, 1=MID, 2=HIGH)
+                'regime_weights': мягкие веса режимов [LOW, MID, HIGH]
+                'regime_entropy': энтропия распределения по режимам
+                'timestamp': временная метка прогноза (если есть)
+        """
+        # === 1. ВАЛИДАЦИЯ ВХОДНЫХ ДАННЫХ ===
+        if len(df) < self.seq_len:
+            raise ValueError(
+                f"Недостаточно данных для прогноза. Требуется минимум {self.seq_len} точек, "
+                f"получено {len(df)}"
+            )
+        
+        # === 2. ПОДГОТОВКА ПРИЗНАКОВ (режим онлайн) ===
+        # Используем последние seq_len точек для прогноза
+        recent_data = df.tail(self.seq_len).copy()
+        features_df = self.prepare_features(recent_data, mode='online')
+        
+        # Проверка, что получили достаточно признаков
+        if len(features_df) < self.seq_len:
+            raise ValueError(
+                f"После подготовки признаков осталось {len(features_df)} точек, "
+                f"требуется {self.seq_len}"
+            )
+        
+        # === 3. МАСШТАБИРОВАНИЕ ПРИЗНАКОВ ===
+        if self.feature_scalers is None:
+            raise RuntimeError("Скейлеры не инициализированы. Выполните обучение или загрузку модели.")
+        
+        X_scaled_df = self._scale_features(features_df)
+        
+        # Проверка соответствия колонок
+        expected_features = set(self.feature_columns)
+        actual_features = set(X_scaled_df.columns)
+        missing_features = expected_features - actual_features
+        if missing_features:
+            raise ValueError(f"Отсутствуют признаки после масштабирования: {missing_features}")
+        
+        # Преобразование в numpy массив правильной формы
+        X_scaled_np = X_scaled_df[self.feature_columns].values.astype(np.float32)
+        X_scaled_np = X_scaled_np.reshape(1, self.seq_len, len(self.feature_columns))  # [1, seq_len, n_features]
+        
+        # === 4. ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ ФИЛЬТРА ===
+        B = 1  # Батч размер = 1 для онлайн-прогноза
+        
+        if reset_state or not self._state_initialized.numpy():
+            # Адаптивная инициализация на основе волатильности данных
+            window_std = np.std(X_scaled_np[0, :10, 0])  # Стандартное отклонение первых 10 точек уровня
+            initial_variance = max(window_std ** 2, 0.05)
+            initial_variance = min(initial_variance, 0.5)
+            
+            # Инициализация состояния средним значением первых точек
+            initial_state_val = np.mean(X_scaled_np[0, :5, 0])
+            initial_state = tf.constant([[initial_state_val]], dtype=tf.float32)  # [1, 1]
+            
+            # Инициализация ковариации
+            initial_covariance = tf.constant(
+                [[[initial_variance]]],
+                dtype=tf.float32
+            )  # [1, 1, 1]
+            
+            # Инициализация волатильности
+            initial_volatility = tf.constant([window_std], dtype=tf.float32)  # [1]
+            
+            # Сброс состояния фильтра
+            self._last_state.assign(tf.squeeze(initial_state, axis=1))  # [1]
+            self._last_P.assign(initial_covariance)  # [1, 1, 1]
+            self._state_initialized.assign(True)
+            self._step_counter.assign(0)
+            
+            print(f"🔄 Состояние фильтра инициализировано: state={initial_state_val:.4f}, variance={initial_variance:.6f}")
+        else:
+            # Использование сохранённого состояния
+            initial_state = tf.reshape(self._last_state, [B, self.state_dim])  # [1, 1]
+            initial_covariance = self._last_P  # [1, 1, 1]
+            initial_volatility = tf.constant([0.1], dtype=tf.float32)  # Заглушка, будет перезаписана
+        
+        # === 5. ВЫПОЛНЕНИЕ ПРОГНОЗА В ГРАФОВОМ РЕЖИМЕ ===
+        X_scaled_tensor = tf.convert_to_tensor(X_scaled_np, dtype=tf.float32)
+        
+        try:
+            with tf.device(self.device):
+                (
+                    forecast_scaled,
+                    std_dev_scaled,
+                    ci_lower_scaled,
+                    ci_upper_scaled,
+                    final_state,
+                    final_covariance,
+                    final_volatility,
+                    final_inflation,
+                    target_coverage,
+                    regime_info
+                ) = self._online_predict_step(
+                    X_scaled_tensor,
+                    initial_state,
+                    initial_covariance,
+                    initial_volatility
+                )
+        except Exception as e:
+            raise RuntimeError(f"Ошибка при выполнении графового прогноза: {str(e)}") from e
+        
+        # === 6. СОХРАНЕНИЕ СОСТОЯНИЯ ДЛЯ СЛЕДУЮЩЕГО ШАГА ===
+        self._last_state.assign(tf.squeeze(final_state, axis=1))  # [B, 1] → [B]
+        self._last_P.assign(final_covariance)  # [B, 1, 1]
+        self._state_initialized.assign(True)
+        self._step_counter.assign_add(1)
+        
+        # === 7. ОБРАТНОЕ ПРЕОБРАЗОВАНИЕ В ИСХОДНЫЙ МАСШТАБ ===
+        # Преобразуем все выходы в исходное пространство
+        forecast_original = self.inverse_transform_target(forecast_scaled.numpy())
+        ci_lower_original = self.inverse_transform_target(ci_lower_scaled.numpy())
+        ci_upper_original = self.inverse_transform_target(ci_upper_scaled.numpy())
+        
+        # Стандартное отклонение требует особой обработки (не линейное преобразование)
+        # Приближённое восстановление через отношение шкал
+        if hasattr(self.feature_scalers.get('Y'), 'scale_'):
+            scale_factor = self.feature_scalers['Y'].scale_
+            std_dev_original = std_dev_scaled.numpy() * scale_factor
+        else:
+            # Консервативная оценка через размах данных
+            y_range = np.ptp(df['Close'].values[-self.seq_len:]) if 'Close' in df.columns else 1.0
+            std_dev_original = std_dev_scaled.numpy() * (y_range / 2.0)
+        
+        # === 8. ФОРМИРОВАНИЕ РЕЗУЛЬТАТОВ ===
+        # Временная метка (если есть временной индекс)
+        timestamp = df.index[-1] if hasattr(df.index, 'is_datetime') or isinstance(df.index[-1], (pd.Timestamp, datetime.datetime)) else None
+        
+        result = {
+            'forecast': forecast_original[0],
+            'ci_lower': ci_lower_original[0],
+            'ci_upper': ci_upper_original[0],
+            'std_dev': std_dev_original[0],
+            'volatility': final_volatility.numpy()[0],
+            'inflation_factor': final_inflation.numpy()[0],
+            'target_coverage': target_coverage.numpy()[0],
+            'regime': regime_info['regime_assignment'].numpy()[0],
+            'regime_weights': regime_info['soft_weights'].numpy()[0],  # [3]
+            'regime_entropy': regime_info['entropy'].numpy()[0],
+            'timestamp': timestamp
+        }
+        
+        return result
+    
+    def evaluate(
+        self,
+        df: pd.DataFrame,
+        plot: bool = False,
+        N: int = 300
+    ) -> Dict[str, float]:
+        """
+        Оценка модели на тестовых данных с использованием скользящего окна.
+        Все результаты возвращаются в исходном масштабе для корректной интерпретации.
+        
+        Аргументы:
+            df: pd.DataFrame - тестовые данные с колонками OHLC
+            plot: bool - построить графики результатов
+            N: int - количество последних точек для визуализации
+        
+        Возвращает:
+            Словарь метрик качества прогноза и калибровки ДИ
         """
         print("\n" + "=" * 80)
         print("🔍 НАЧАЛО ОЦЕНКИ МОДЕЛИ С КОНТЕКСТНОЙ ВОЛАТИЛЬНОСТЬЮ")
         print("=" * 80)
-
-        # Проверка входных данных
+        
+        # === 1. ВАЛИДАЦИЯ ВХОДНЫХ ДАННЫХ ===
         required_cols = ['Open', 'High', 'Low', 'Close']
         missing_cols = [col for col in required_cols if col not in df.columns]
         if missing_cols:
             raise ValueError(f"❌ Отсутствуют обязательные колонки в данных: {missing_cols}")
-
-        if len(df) < self.seq_len + 1:
-            raise ValueError(f"❌ Недостаточно данных для оценки. Требуется минимум {self.seq_len + 1} точек, получено {len(df)}")
-
-        # Определение минимального окна для расчета признаков
-        min_required_window = self.min_history_for_features
-        if len(df) < min_required_window + 1:
-            raise ValueError(f"❌ Недостаточно данных для оценки. Требуется минимум {min_required_window + 1} точек, получено {len(df)}")
-
-        # Инициализация массивов для хранения результатов
+        
+        min_required_points = self.seq_len + 1  # seq_len для признаков + 1 для целевого значения
+        if len(df) < min_required_points:
+            raise ValueError(
+                f"❌ Недостаточно данных для оценки. Требуется минимум {min_required_points} точек, "
+                f"получено {len(df)}"
+            )
+        
+        # === 2. ПОДГОТОВКА ДАННЫХ ДЛЯ ОЦЕНКИ ===
+        # Создаём скользящее окно: каждое окно = seq_len точек для прогноза + 1 точка для проверки
+        total_windows = len(df) - self.seq_len
+        print(f"📊 Обработка {total_windows} окон для оценки (размер окна: {self.seq_len})...")
+        
+        # Инициализация массивов для результатов
         timestamps = []
-        true_values = []
-        pred_values = []
-        pi_lower = []
-        pi_upper = []
+        true_values_scaled = []   # В масштабированном пространстве для точных расчётов
+        true_values_original = [] # В исходном пространстве для отчётов
+        pred_values_scaled = []
+        pred_values_original = []
+        pi_lower_scaled = []
+        pi_upper_scaled = []
+        pi_lower_original = []
+        pi_upper_original = []
         volatility_levels = []
         inflation_factors = []
         confidences = []
-
-        # Цикл скользящего окна
-        total_steps = len(df) - min_required_window - 1  # -1 для ground truth
-        print(f"📊 Обработка {total_steps} окон для оценки...")
-
-        for i in tqdm(range(total_steps), desc="Оценка модели", unit="окно"):
+        regimes = []
+        
+        # Сброс состояния фильтра перед оценкой
+        self._state_initialized.assign(False)
+        
+        # === 3. СКОЛЬЗЯЩЕЕ ОКНО ОЦЕНКИ ===
+        progress_bar = tqdm(range(total_windows), desc="Оценка модели", unit="окно")
+        
+        for i in progress_bar:
             try:
-                # Извлекаем данные для текущего окна
-                window_data = df.iloc[i:i+min_required_window+1]
-
-                # Прогнозирование
+                # Извлекаем окно данных для подготовки признаков
+                # Берём достаточно точек для расчёта всех признаков (включая EMD)
+                window_start = max(0, i - (self.min_history_for_features - self.seq_len))
+                window_data = df.iloc[window_start:i + self.seq_len + 1].copy()
+                
+                # Проверка минимального размера окна для признаков
+                if len(window_data) < self.min_history_for_features:
+                    continue  # Пропускаем окна с недостаточной историей
+                
+                # Получаем истинное значение для проверки (следующая точка после окна)
+                ground_truth_idx = i + self.seq_len
+                if ground_truth_idx >= len(df):
+                    break
+                
+                ground_truth_scaled = df.iloc[ground_truth_idx]['Close']  # Временно без масштабирования
+                
+                # === ВЫПОЛНЕНИЕ ПРОГНОЗА ===
+                # Сбрасываем состояние ТОЛЬКО для первого окна
                 result = self.online_predict(
                     window_data,
-                    return_components=True,
-                    ground_truth_available=True,
-                    reset_state=(i == 0)  # Сбрасываем состояние ТОЛЬКО для первого окна
+                    reset_state=(i == 0)
                 )
-
+                
                 # Сохранение результатов
-                timestamps.append(result['timestamp'])
-                true_values.append(result['ground_truth_level'])
-                pred_values.append(result['level_forecast'][0])
-                pi_lower.append(result['level_ci_lower'][0])
-                pi_upper.append(result['level_ci_upper'][0])
-                volatility_levels.append(result['volatility_level'])
+                timestamps.append(result['timestamp'] if result['timestamp'] is not None else i)
+                pred_values_original.append(result['forecast'])
+                pi_lower_original.append(result['ci_lower'])
+                pi_upper_original.append(result['ci_upper'])
+                volatility_levels.append(result['volatility'])
                 inflation_factors.append(result['inflation_factor'])
-                confidences.append(result['confidence'])
-
-            except Exception as e:
-                print(f"\n❌ КРИТИЧЕСКАЯ ОШИБКА на шаге {i}: {str(e)}")
-                print("🛑 ОЦЕНКА ПРЕРВАНА ИЗ-ЗА ОШИБКИ")
-                if len(true_values) == 0:
-                    raise RuntimeError("Не удалось выполнить ни одного прогноза для оценки") from e
+                confidences.append(result['target_coverage'])
+                regimes.append(result['regime'])
+                
+                # Истинное значение в исходном масштабе
+                true_value_original = df.iloc[ground_truth_idx]['Close']
+                true_values_original.append(true_value_original)
+                
+                # Для точных расчётов ошибок используем масштабированные значения
+                # (предполагаем, что скейлер уже обучен)
+                if self.feature_scalers is not None and 'Y' in self.feature_scalers:
+                    true_scaled = self.feature_scalers['Y'].transform([[true_value_original]])[0, 0]
+                    pred_scaled = self.feature_scalers['Y'].transform([[result['forecast']]])[0, 0]
+                    lower_scaled = self.feature_scalers['Y'].transform([[result['ci_lower']]])[0, 0]
+                    upper_scaled = self.feature_scalers['Y'].transform([[result['ci_upper']]])[0, 0]
+                    
+                    true_values_scaled.append(true_scaled)
+                    pred_values_scaled.append(pred_scaled)
+                    pi_lower_scaled.append(lower_scaled)
+                    pi_upper_scaled.append(upper_scaled)
                 else:
-                    print(f"⚠️ Оценка выполнена только для {len(true_values)} из {total_steps} окон")
-                    break
-
-        print(f"\n✅ Успешно обработано {len(true_values)} окон из {total_steps}")
-
-        # Преобразование списков в numpy массивы
-        true_values = np.array(true_values)
-        pred_values = np.array(pred_values)
-        pi_lower = np.array(pi_lower)
-        pi_upper = np.array(pi_upper)
+                    # Если скейлер недоступен, используем оригинальные значения (менее точно)
+                    true_values_scaled.append(true_value_original)
+                    pred_values_scaled.append(result['forecast'])
+                    pi_lower_scaled.append(result['ci_lower'])
+                    pi_upper_scaled.append(result['ci_upper'])
+                    
+            except Exception as e:
+                print(f"\n⚠️ Предупреждение: ошибка на окне {i}: {str(e)}")
+                # Продолжаем оценку для остальных окон
+                continue
+        
+        # === 4. ПРОВЕРКА РЕЗУЛЬТАТОВ ===
+        if len(true_values_original) == 0:
+            raise RuntimeError("Не удалось выполнить ни одного прогноза для оценки")
+        
+        print(f"\n✅ Успешно обработано {len(true_values_original)} окон из {total_windows}")
+        
+        # === 5. ПРЕОБРАЗОВАНИЕ В NUMPY МАССИВЫ ===
+        true_values_original = np.array(true_values_original)
+        pred_values_original = np.array(pred_values_original)
+        pi_lower_original = np.array(pi_lower_original)
+        pi_upper_original = np.array(pi_upper_original)
+        true_values_scaled = np.array(true_values_scaled)
+        pred_values_scaled = np.array(pred_values_scaled)
+        pi_lower_scaled = np.array(pi_lower_scaled)
+        pi_upper_scaled = np.array(pi_upper_scaled)
         volatility_levels = np.array(volatility_levels)
         inflation_factors = np.array(inflation_factors)
         confidences = np.array(confidences)
+        regimes = np.array(regimes)
         timestamps = np.array(timestamps)
-
-        # Расчет ошибок
-        errors = pred_values - true_values
-
-        # Расчет метрик
+        
+        # === 6. РАСЧЁТ МЕТРИК В ИСХОДНОМ МАСШТАБЕ ===
+        errors_original = pred_values_original - true_values_original
+        
         metrics = {}
-
-        # Базовые метрики
-        metrics['MAE'] = float(np.mean(np.abs(errors)))
-        metrics['RMSE'] = float(np.sqrt(np.mean(errors ** 2)))
-        metrics['MAPE'] = float(np.mean(np.abs(errors / (np.abs(true_values) + 1e-8))))
-        metrics['MAPE_median'] = float(np.median(np.abs(errors / (np.abs(true_values) + 1e-8))))
-
+        
+        # Базовые метрики точности (в исходном масштабе)
+        metrics['MAE'] = float(np.mean(np.abs(errors_original)))
+        metrics['RMSE'] = float(np.sqrt(np.mean(errors_original ** 2)))
+        metrics['MAPE'] = float(np.mean(np.abs(errors_original / (np.abs(true_values_original) + 1e-8))))
+        metrics['MAPE_median'] = float(np.median(np.abs(errors_original / (np.abs(true_values_original) + 1e-8))))
+        
         # R2 коэффициент
-        ss_res = np.sum(errors ** 2)
-        ss_tot = np.sum((true_values - np.mean(true_values)) ** 2)
+        ss_res = np.sum(errors_original ** 2)
+        ss_tot = np.sum((true_values_original - np.mean(true_values_original)) ** 2)
         metrics['R2'] = float(1 - ss_res / (ss_tot + 1e-8))
-
-        # Метрики доверительных интервалов (90% уровень доверия)
-        valid_coverage = (true_values >= pi_lower) & (true_values <= pi_upper)
+        
+        # Метрики доверительных интервалов (в масштабированном пространстве для точности)
+        valid_coverage = (true_values_scaled >= pi_lower_scaled) & (true_values_scaled <= pi_upper_scaled)
         metrics['CoverageRatio'] = float(np.mean(valid_coverage))
         metrics['CoverageCount'] = int(np.sum(valid_coverage))
-        metrics['TotalCount'] = len(true_values)
-
-        # Ширина доверительных интервалов
-        pi_widths = pi_upper - pi_lower
-        metrics['MeanPIWidth'] = float(np.mean(pi_widths))
-        metrics['MedianPIWidth'] = float(np.median(pi_widths))
-
+        metrics['TotalCount'] = len(true_values_scaled)
+        
+        # Ширина доверительных интервалов (в исходном масштабе для интерпретации)
+        pi_widths_original = pi_upper_original - pi_lower_original
+        metrics['MeanPIWidth'] = float(np.mean(pi_widths_original))
+        metrics['MedianPIWidth'] = float(np.median(pi_widths_original))
+        
+        # Отношение ширины ДИ к волатильности данных (ключевая метрика калибровки)
+        y_std_original = np.std(true_values_original) + 1e-8
+        metrics['CIWidthToStdRatio'] = float(np.mean(pi_widths_original) / y_std_original)
+        
         # Статистика по волатильности
         metrics['VolatilityMean'] = float(np.nanmean(volatility_levels))
         metrics['VolatilityStd'] = float(np.nanstd(volatility_levels))
         metrics['VolatilityMax'] = float(np.nanmax(volatility_levels))
-
+        
         # Статистика по адаптивному inflation
         metrics['InflationMean'] = float(np.nanmean(inflation_factors))
         metrics['InflationStd'] = float(np.nanstd(inflation_factors))
         metrics['InflationMax'] = float(np.nanmax(inflation_factors))
-
-        # Статистика по уровню уверенности
-        metrics['ConfidenceMean'] = float(np.nanmean(confidences))
-        metrics['ConfidenceStd'] = float(np.nanstd(confidences))
-
-        # Дополнительные метрики
-        metrics['CalibrationError'] = abs(metrics['CoverageRatio'] - 0.90)  # для 90% доверительного интервала
-
-        # Вывод метрик
+        
+        # Статистика по режимам волатильности
+        for regime_idx, regime_name in enumerate(['LOW', 'MID', 'HIGH']):
+            metrics[f'Regime_{regime_name}_Pct'] = float(np.mean(regimes == regime_idx) * 100)
+        
+        # Ошибка калибровки относительно целевого покрытия
+        target_coverage_mean = np.mean(confidences)
+        metrics['TargetCoverageMean'] = float(target_coverage_mean)
+        metrics['CalibrationError'] = abs(metrics['CoverageRatio'] - target_coverage_mean)
+        
+        # === 7. ВЫВОД РЕЗУЛЬТАТОВ ===
         print("\n" + "=" * 60)
         print("📊 РЕЗУЛЬТАТЫ ОЦЕНКИ МОДЕЛИ С КОНТЕКСТНОЙ ВОЛАТИЛЬНОСТЬЮ")
         print("=" * 60)
@@ -5465,269 +5888,35 @@ class LSTMIMMUKF(tf.Module):
         print(f"   📊 MAPE (среднее): {metrics['MAPE']:.4%}")
         print(f"   📊 MAPE (медиана): {metrics['MAPE_median']:.4%}")
         print(f"   🎯 R²: {metrics['R2']:.6f}")
-        print(f"   🎪 Покрытие PI (90%): {metrics['CoverageRatio']:.2%} ({metrics['CoverageCount']}/{metrics['TotalCount']})")
-        print(f"   📏 Ширина PI (средняя): {metrics['MeanPIWidth']:.6f}")
-        print(f"   📏 Ширина PI (медиана): {metrics['MedianPIWidth']:.6f}")
+        print(f"   🎪 Покрытие ДИ: {metrics['CoverageRatio']:.2%} "
+              f"(цель: {target_coverage_mean:.2%}, ошибка: {metrics['CalibrationError']:.4f})")
+        print(f"   📏 Ширина ДИ / волатильность данных: {metrics['CIWidthToStdRatio']:.2f}x")
         print(f"   🔥 Средняя волатильность: {metrics['VolatilityMean']:.4f} ± {metrics['VolatilityStd']:.4f}")
-        print(f"   🔥 Максимальная волатильность: {metrics['VolatilityMax']:.4f}")
         print(f"   💦 Средний adaptive inflation: {metrics['InflationMean']:.4f} ± {metrics['InflationStd']:.4f}")
-        print(f"   💦 Максимальный adaptive inflation: {metrics['InflationMax']:.4f}")
-        print(f"   ⚖️ Ошибка калибровки: {metrics['CalibrationError']:.4f}")
+        print(f"   🎭 Распределение режимов: LOW {metrics['Regime_LOW_Pct']:.1f}% | "
+              f"MID {metrics['Regime_MID_Pct']:.1f}% | HIGH {metrics['Regime_HIGH_Pct']:.1f}%")
         print("=" * 60)
-
-        # Отрисовка графиков при необходимости
-        if plot:
+        
+        # === 8. ВИЗУАЛИЗАЦИЯ ===
+        if plot and len(true_values_original) > 0:
             print("\n📈 ПОСТРОЕНИЕ ГРАФИКОВ РЕЗУЛЬТАТОВ ОЦЕНКИ...")
             self._plot_evaluation_results(
-                true_vals=true_values,
-                pred_vals=pred_values,
-                pi_lower_vals=pi_lower,
-                pi_upper_vals=pi_upper,
+                true_vals=true_values_original,
+                pred_vals=pred_values_original,
+                pi_lower_vals=pi_lower_original,
+                pi_upper_vals=pi_upper_original,
                 volatility_vals=volatility_levels,
                 inflation_vals=inflation_factors,
                 confidence_vals=confidences,
-                errors=errors,
+                errors=errors_original,
                 timestamps=timestamps,
                 metrics=metrics,
-                N=min(N, len(true_values)),
+                N=min(N, len(true_values_original)),
                 figsize=(14, 12)
             )
-
+        
         return metrics
 
-    @tf.function(jit_compile=False)
-    def online_predict(
-        self,
-        X_new: tf.Tensor,
-        last_state: tf.Tensor,
-        last_covariance: tf.Tensor,
-        last_inflation_state: Dict[str, tf.Tensor],
-        last_volatility: tf.Tensor
-    ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, Dict[str, tf.Tensor]]:
-        """
-        Онлайн предсказание на новом временном шаге с сохранением состояния фильтра
-
-        Аргументы:
-        X_new: [B, n_features] - новые признаки для текущего шага
-        last_state: [B, 1] - последнее состояние фильтра
-        last_covariance: [B, 1, 1] - последняя ковариационная матрица
-        last_inflation_state: Dict[str, tf.Tensor] - состояние инфляции от предыдущего шага
-        last_volatility: [B] - последняя волатильность
-
-        Возвращает:
-        forecast: [B] - прогноз на следующий шаг
-        std_dev: [B] - стандартное отклонение прогноза
-        new_state: [B, 1] - обновленное состояние
-        new_covariance: [B, 1, 1] - обновленная ковариация
-        new_inflation_state: Dict[str, tf.Tensor] - обновленное состояние инфляции
-        """
-        B = tf.shape(X_new)[0]
-
-        # === 1. ПОЛУЧЕНИЕ LSTM ЭМБЕДДИНГОВ ===
-        # Используем текущие признаки для получения эмбеддингов
-        lstm_embeddings = self.get_embeddings(X_new)  # [B, embedding_dim]
-
-        # === 2. ГЕНЕРАЦИЯ АДАПТИВНЫХ ПАРАМЕТРОВ UKF ===
-        # Получаем все параметры от LSTM для текущего шага
-        vol_context_t, ukf_params_t, inflation_config_t, student_t_config_t = self.process_lstm_output(
-            lstm_embeddings, is_training=False
-        )
-
-        # ✅ ЯВНОЕ ИЗВЛЕЧЕНИЕ КОНКРЕТНЫХ ПАРАМЕТРОВ ДЛЯ ТЕКУЩЕГО ШАГА
-        # --- Параметры из vol_context ---
-        leverage_strength_t = vol_context_t['leverage_effect_strength']  # [B, 1]
-        sensitivity_short_t = vol_context_t['sensitivity_short']  # [B, 1]
-        sensitivity_medium_t = vol_context_t['sensitivity_medium']  # [B, 1]
-        sensitivity_long_t = vol_context_t['sensitivity_long']  # [B, 1]
-        entropy_weight_t = vol_context_t['entropy_weight']  # [B, 1]
-        accel_weight_t = vol_context_t['accel_weight']  # [B, 1]
-        memory_factor_t = vol_context_t['memory_factor']  # [B, 1]
-
-        # --- Параметры из ukf_params ---
-        q_base_t = ukf_params_t['q_base']  # [B, 1]
-        q_sensitivity_t = ukf_params_t['q_sensitivity']  # [B, 1]
-        q_floor_t = ukf_params_t['q_floor']  # [B, 1]
-        r_base_t = ukf_params_t['r_base']  # [B, 1]
-        r_sensitivity_t = ukf_params_t['r_sensitivity']  # [B, 1]
-        r_floor_t = ukf_params_t['r_floor']  # [B, 1]
-        relax_base_t = ukf_params_t['relax_base']  # [B, 1]
-        relax_sensitivity_t = ukf_params_t['relax_sensitivity']  # [B, 1]
-        alpha_base_t = ukf_params_t['alpha_base']  # [B, 1]
-        alpha_sensitivity_t = ukf_params_t['alpha_sensitivity']  # [B, 1]
-        kappa_base_t = ukf_params_t['kappa_base']  # [B, 1]
-        kappa_sensitivity_t = ukf_params_t['kappa_sensitivity']  # [B, 1]
-
-        # --- Параметры из inflation_config ---
-        base_inflation_t = inflation_config_t['base_inflation']  # [B, 1]
-        vol_sensitivity_t = inflation_config_t['vol_sensitivity']  # [B, 1]
-        decay_rate_t = inflation_config_t['decay_rate']  # [B, 1]
-        anomaly_threshold_t = inflation_config_t['anomaly_threshold']  # [B, 1]
-        min_duration_float_t = inflation_config_t['min_duration_float']  # [B, 1]
-        max_duration_float_t = inflation_config_t['max_duration_float']  # [B, 1]
-        asymmetry_factor_t = inflation_config_t['asymmetry_factor']  # [B, 1]
-        memory_decay_t = inflation_config_t['memory_decay']  # [B, 1]
-        inflation_limit_t = inflation_config_t['inflation_limit']  # [B, 1]
-
-        # --- Параметры из student_t_config ---
-        dof_base_t = student_t_config_t['dof_base']  # [B, 1]
-        dof_sensitivity_t = student_t_config_t['dof_sensitivity']  # [B, 1]
-        asymmetry_pos_t = student_t_config_t['asymmetry_pos']  # [B, 1]
-        asymmetry_neg_t = student_t_config_t['asymmetry_neg']  # [B, 1]
-
-        # === 3. ОБНОВЛЕНИЕ ВОЛАТИЛЬНОСТИ ===
-        # Извлекаем необходимые признаки для расчета волатильности
-        vol_short_idx = self.feature_to_idx.get('log_vol_short', 2)
-        rel_vol_short_long_idx = self.feature_to_idx.get('rel_vol_short_long', 18)
-        vol_accel_idx = self.feature_to_idx.get('vol_accel_rel', 19)
-        rel_entropy_idx = self.feature_to_idx.get('rel_entropy', 20)
-
-        log_vol_short = tf.gather(X_new, vol_short_idx, axis=1)  # [B]
-        rel_vol_short_long = tf.gather(X_new, rel_vol_short_long_idx, axis=1)  # [B]
-        vol_accel = tf.gather(X_new, vol_accel_idx, axis=1)  # [B]
-        rel_entropy = tf.gather(X_new, rel_entropy_idx, axis=1)  # [B]
-
-        # Оценки волатильности из разных источников
-        vol_medium_est = tf.abs(tf.gather(X_new, self.feature_to_idx.get('yz', 8), axis=1))  # [B]
-        vol_long_est = tf.abs(tf.gather(X_new, self.feature_to_idx.get('ht', 12), axis=1))  # [B]
-
-        # Компоненты волатильности
-        vol_components = tf.stack([
-            sensitivity_short_t[:, 0] * rel_vol_short_long,
-            sensitivity_medium_t[:, 0] * (vol_medium_est / (vol_long_est + 1e-8)),
-            sensitivity_long_t[:, 0] * (vol_long_est / (tf.reduce_mean(vol_long_est) + 1e-8)),
-            entropy_weight_t[:, 0] * tf.abs(rel_entropy),
-            accel_weight_t[:, 0] * tf.abs(vol_accel)
-        ], axis=1)  # [B, 5]
-
-        raw_volatility = tf.reduce_mean(vol_components, axis=1)  # [B]
-
-        # Экспоненциальное сглаживание
-        memory_factor_val = memory_factor_t[:, 0]  # [B]
-        new_volatility = memory_factor_val * last_volatility + (1.0 - memory_factor_val) * raw_volatility  # [B]
-        volatility_level = tf.nn.sigmoid(new_volatility)  # [B]
-
-        # === 4. ПОЛУЧЕНИЕ АДАПТИВНЫХ Q и R ===
-        # Используем нулевую предыдущую инновацию для первого шага
-        innov_prev = tf.zeros([B], dtype=tf.float32)
-
-        Q_t, R_t, _ = self.compute_adaptive_Q_R_with_leverage(
-            innov_prev,
-            leverage_strength_t,
-            q_base_t, q_sensitivity_t, q_floor_t,
-            r_base_t, r_sensitivity_t, r_floor_t,
-            new_volatility
-        )
-
-        # === 5. АДАПТИВНЫЕ ПАРАМЕТРЫ UKF ===
-        relax_factor = relax_base_t * (1.0 + relax_sensitivity_t * volatility_level)  # [B, 1]
-        alpha_t = alpha_base_t * (1.0 + alpha_sensitivity_t * volatility_level)  # [B, 1]
-        kappa_t = kappa_base_t * (1.0 + kappa_sensitivity_t * volatility_level)  # [B, 1]
-
-        # ✅ ПРЕОБРАЗОВАНИЕ В ПРАВИЛЬНУЮ ФОРМУ
-        relax_factor = tf.reshape(relax_factor, [B])  # [B]
-        alpha_t = tf.reshape(alpha_t, [B])  # [B]
-        kappa_t = tf.reshape(kappa_t, [B])  # [B]
-
-        # === 6. UKF ПРЕДСКАЗАНИЕ (PREDICT) ===
-        x_pred, P_pred = self.diff_ukf_component.predict(
-            last_state,
-            Q_t,
-            relax_factor=relax_factor,
-            alpha_t=alpha_t,
-            kappa_t=kappa_t
-        )
-
-        # === 7. АДАПТИВНАЯ ИНФЛЯЦИЯ ===
-        # Извлекаем состояние инфляции из предыдущего шага
-        inf_factor_prev = tf.reshape(last_inflation_state['factor'], [B, 1])  # [B, 1]
-        rem_steps_prev = tf.cast(last_inflation_state['remaining_steps'], tf.int32)  # [B]
-        last_anom_time_prev = tf.cast(last_inflation_state['last_anomaly_time'], tf.int32)  # [B]
-        high_infl_steps_prev = tf.cast(last_inflation_state.get('high_inflation_steps', tf.zeros([B], dtype=tf.int32)), tf.int32)  # [B]
-
-        # Резервная коррекция для пропущенных скачков
-        # Создаем "предыдущее" состояние для сравнения
-        x_pred_prev = last_state  # [B, 1]
-
-        fallback_multiplier, is_missed_jump_flag = self._fallback_inflation_correction(
-            tf.constant(0, dtype=tf.int32),  # t=0 для online режима
-            x_pred_prev,           # [B, 1] - предыдущее состояние
-            x_pred,                # [B, 1] - текущее предсказанное состояние
-            P_pred,                # [B, 1, 1] - предсказанная ковариация
-            inf_factor_prev,
-            base_inflation_t,      # [B, 1]
-            vol_sensitivity_t,    # [B, 1]
-            decay_rate_t,          # [B, 1]
-            anomaly_threshold_t,  # [B, 1]
-            min_duration_float_t, # [B, 1]
-            max_duration_float_t, # [B, 1]
-            asymmetry_factor_t,    # [B, 1]
-            memory_decay_t,        # [B, 1]
-            inflation_limit_t,     # [B, 1]
-            new_volatility         # [B]
-        )
-
-        # Вычисляем базовый фактор инфляции
-        base_factor = base_inflation_t * (1.0 + vol_sensitivity_t * volatility_level)  # [B, 1]
-        asymmetry_factor = tf.where(
-            new_volatility > 0,  # Упрощенная логика асимметрии
-            asymmetry_factor_t,
-            1.0 / (asymmetry_factor_t + 1e-8)
-        )
-
-        new_factor = base_factor * asymmetry_factor * fallback_multiplier  # [B, 1]
-
-        # Применяем ограничения на инфляцию
-        inflation_threshold_val = inflation_limit_t * 0.8  # [B, 1]
-        inflation_factor_flat, updated_high_inflation_steps = self._apply_inflation_limits(
-            tf.squeeze(new_factor, axis=-1),  # [B]
-            high_infl_steps_prev,  # [B]
-            max_threshold=tf.squeeze(inflation_threshold_val, axis=-1),  # [B]
-            max_steps=5
-        )
-
-        # Формируем правильную размерность для инфляции
-        inflation_factor_for_R = tf.reshape(inflation_factor_flat, [B, 1, 1])  # [B, 1, 1]
-
-        # === 8. UKF ОБНОВЛЕНИЕ (UPDATE) ===
-        # Вместо использования фильтрованного состояния, используем UKF prediction
-        # Это лучше отражает динамику процесса для следующего шага
-
-        # Адаптивные параметры Student-t
-        dof_adaptive = dof_base_t - dof_sensitivity_t * tf.nn.relu((new_volatility - tf.reduce_mean(new_volatility)) / (tf.math.reduce_std(new_volatility) + 1e-6))  # [B, 1]
-        dof_adaptive = tf.clip_by_value(dof_adaptive, 3.0, 11.0)  # [B, 1]
-
-        # Обновление состояния с использованием ПРЕДСКАЗАННОГО значения как pseudo-observation
-        x_upd, P_upd, innov, K = self._student_t_update(
-            x_pred, P_pred,
-            x_pred,  # [B, 1] ← ИСПОЛЬЗУЕМ ПРЕДСКАЗАННОЕ СОСТОЯНИЕ вместо last_state
-            R_t * inflation_factor_for_R,  # [B, 1, 1]
-            tf.reshape(volatility_level, [B, 1]),  # [B, 1]
-            dof_adaptive,  # [B, 1]
-            asymmetry_pos_t,  # [B, 1]
-            asymmetry_neg_t   # [B, 1]
-        )
-
-        # === 9. ЯВНЫЙ PREDICT НА СЛЕДУЮЩИЙ ШАГ ===
-        forecast, std_dev = self._explicit_predict_next_step(
-            x_upd,                 # [B, 1]
-            P_upd,                 # [B, 1, 1]
-            tf.reshape(new_volatility, [B, 1]),  # [B, 1]
-            q_base_t, q_sensitivity_t, q_floor_t,
-            r_base_t, r_sensitivity_t, r_floor_t,
-            relax_base_t, relax_sensitivity_t,
-            alpha_base_t, alpha_sensitivity_t,
-            kappa_base_t, kappa_sensitivity_t
-        )
-
-        # === 10. ФОРМИРОВАНИЕ НОВОГО СОСТОЯНИЯ ИНФЛЯЦИИ ===
-        new_inflation_state = {
-            'factor': tf.reshape(inflation_factor_flat, [B]),  # [B]
-            'remaining_steps': tf.maximum(0, rem_steps_prev - 1),  # [B]
-            'last_anomaly_time': last_anom_time_prev,  # [B]
-            'high_inflation_steps': updated_high_inflation_steps  # [B]
-        }
-
-        return forecast, std_dev, x_upd, P_upd, new_inflation_state
 
     def _setup_xaxis(self, ax, indices, timestamps, is_time_index):
         """Настройка оси X для графиков с поддержкой временных и числовых индексов"""
