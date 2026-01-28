@@ -4178,13 +4178,17 @@ class LSTMIMMUKF(tf.Module):
 
                     # === ФУНКЦИИ ДЛЯ ВЫБОРА СОСТОЯНИЯ ДЛЯ ВАЛИДАЦИИ ===
                     def use_saved_state_for_val():
-                        # Усредняем состояние для всех примеров валидации
-                        avg_state = tf.reduce_mean(self._last_state)
-                        initial_state = tf.fill([B_val, self.state_dim], avg_state)
-
-                        # Для ковариации используем усредненную матрицу
-                        avg_P = tf.reduce_mean(self._last_P, axis=0, keepdims=True)
-                        initial_covariance = tf.tile(avg_P, [B_val, 1, 1])
+                        # Единый паттерн расширения через tile (как в обучении)
+                        # Расширяем скалярное состояние [1] → [B_val, 1]
+                        initial_state = tf.tile(
+                            tf.reshape(self._last_state, [1, self.state_dim]),
+                            [B_val, 1]
+                        )
+                        # Расширяем ковариацию [1, 1, 1] → [B_val, 1, 1]
+                        initial_covariance = tf.tile(
+                            tf.reshape(self._last_P, [1, self.state_dim, self.state_dim]),
+                            [B_val, 1, 1]
+                        )
                         return initial_state, initial_covariance
 
                     def initialize_val_from_data():
