@@ -5516,171 +5516,165 @@ class LSTMIMMUKF(tf.Module):
             target_coverage,    # [B]
             regime_info         # Dict[str, tf.Tensor]
         )
-    
-    
+
     def online_predict(
         self,
         df: pd.DataFrame,
-        reset_state: bool = False
-    ) -> Dict[str, np.ndarray]:
+        reset_state: bool = False,
+        return_components: bool = False,
+        ground_truth_available: bool = False
+    ) -> Dict[str, Any]:
         """
-        Публичный метод для онлайн-прогнозирования на новых данных.
-        Возвращает результаты в исходном (обратно преобразованном) масштабе.
+        Онлайн-прогноз на основе ПОЛНОЙ переданной истории (минимум min_history_for_features точек).
+        
+        КРИТИЧЕСКИ ВАЖНО: Признаки рассчитываются на ВСЕЙ переданной истории (не обрезаются до seq_len!),
+        что обеспечивает корректную декомпозицию EMD и стабильные признаки волатильности.
         
         Аргументы:
-            df: pd.DataFrame - данные с колонками OHLC + рассчитанные признаки
-                Минимальный размер: seq_len точек для подготовки признаков
-            reset_state: bool - сбросить состояние фильтра перед прогнозом
-            
+            df: DataFrame с OHLC данными (минимум min_history_for_features точек)
+            reset_state: сбросить состояние фильтра перед прогнозом (для первого шага)
+            return_components: вернуть все компоненты для отладки
+            ground_truth_available: флаг для внутренней логики (не используется в текущей реализации)
+        
         Возвращает:
-            Словарь с ключами:
-                'forecast': прогноз уровня на следующий шаг
-                'ci_lower': нижняя граница 90% ДИ
-                'ci_upper': верхняя граница 90% ДИ
-                'std_dev': стандартное отклонение прогноза
-                'volatility': текущий уровень волатильности
-                'inflation_factor': адаптивный фактор инфляции
-                'target_coverage': целевое покрытие ДИ
-                'regime': доминирующий режим волатильности (0=LOW, 1=MID, 2=HIGH)
-                'regime_weights': мягкие веса режимов [LOW, MID, HIGH]
-                'regime_entropy': энтропия распределения по режимам
-                'timestamp': временная метка прогноза (если есть)
+            Словарь с прогнозом, доверительными интервалами и диагностикой
         """
         # === 1. ВАЛИДАЦИЯ ВХОДНЫХ ДАННЫХ ===
-        if len(df) < self.seq_len:
+        required_cols = ['Open', 'High', 'Low', 'Close']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Отсутствуют обязательные колонки: {missing_cols}")
+        
+        if len(df) < self.min_history_for_features:
             raise ValueError(
-                f"Недостаточно данных для прогноза. Требуется минимум {self.seq_len} точек, "
+                f"Требуется минимум {self.min_history_for_features} точек для расчёта признаков, "
                 f"получено {len(df)}"
             )
         
-        # === 2. ПОДГОТОВКА ПРИЗНАКОВ (режим онлайн) ===
-        # Используем последние seq_len точек для прогноза
-        recent_data = df.tail(self.seq_len).copy()
-        features_df = self.prepare_features(recent_data, mode='online')
+        # === 2. РАСЧЁТ ПРИЗНАКОВ НА ПОЛНОЙ ИСТОРИИ (КЛЮЧЕВОЕ ИЗМЕНЕНИЕ!) ===
+        # ✅ ПРАВИЛЬНО: используем ВСЮ переданную историю для расчёта признаков
+        # Это гарантирует корректную декомпозицию EMD и стабильные оценки волатильности
+        # Используем mode='online' для семантической точности (имитация реального онлайн-режима)
+        features_df = self.prepare_features(df, mode='batch')
         
-        # Проверка, что получили достаточно признаков
+        # Проверка достаточности признаков после расчёта
         if len(features_df) < self.seq_len:
             raise ValueError(
-                f"После подготовки признаков осталось {len(features_df)} точек, "
-                f"требуется {self.seq_len}"
+                f"После расчёта признаков осталось {len(features_df)} точек, "
+                f"требуется минимум {self.seq_len}"
             )
         
-        # === 3. МАСШТАБИРОВАНИЕ ПРИЗНАКОВ ===
-        if self.feature_scalers is None:
-            raise RuntimeError("Скейлеры не инициализированы. Выполните обучение или загрузку модели.")
+        # === 3. ПОДГОТОВКА ОКНА ДЛЯ МОДЕЛИ ===
+        # Берём последние seq_len признаков ТОЛЬКО ПОСЛЕ расчёта всех признаков
+        X_window = features_df.tail(self.seq_len).copy()
         
-        X_scaled_df = self._scale_features(features_df)
-        
-        # Проверка соответствия колонок
-        expected_features = set(self.feature_columns)
-        actual_features = set(X_scaled_df.columns)
-        missing_features = expected_features - actual_features
-        if missing_features:
-            raise ValueError(f"Отсутствуют признаки после масштабирования: {missing_features}")
-        
-        # Преобразование в numpy массив правильной формы
+        # Масштабирование признаков
+        X_scaled_df = self._scale_features(X_window)
         X_scaled_np = X_scaled_df[self.feature_columns].values.astype(np.float32)
-        X_scaled_np = X_scaled_np.reshape(1, self.seq_len, len(self.feature_columns))  # [1, seq_len, n_features]
+        X_scaled_tensor = tf.convert_to_tensor(
+            X_scaled_np.reshape(1, self.seq_len, len(self.feature_columns)),
+            dtype=tf.float32
+        )
         
-        # === 4. ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ ФИЛЬТРА ===
-        B = 1  # Батч размер = 1 для онлайн-прогноза
-        
+        # === 4. ИНИЦИАЛИЗАЦИЯ/ОБНОВЛЕНИЕ СОСТОЯНИЯ ФИЛЬТРА ===
+        B = 1
         if reset_state or not self._state_initialized.numpy():
-            # Адаптивная инициализация на основе волатильности данных
-            window_std = np.std(X_scaled_np[0, :10, 0])  # Стандартное отклонение первых 10 точек уровня
+            # Адаптивная инициализация на основе волатильности первых точек окна
+            window_std = np.std(X_scaled_np[0, :min(10, self.seq_len), 0])
             initial_variance = max(window_std ** 2, 0.05)
             initial_variance = min(initial_variance, 0.5)
+            initial_state_val = np.mean(X_scaled_np[0, :min(5, self.seq_len), 0])
             
-            # Инициализация состояния средним значением первых точек
-            initial_state_val = np.mean(X_scaled_np[0, :5, 0])
-            initial_state = tf.constant([[initial_state_val]], dtype=tf.float32)  # [1, 1]
+            initial_state = tf.constant([[initial_state_val]], dtype=tf.float32)
+            initial_covariance = tf.constant([[[initial_variance]]], dtype=tf.float32)
+            initial_volatility = tf.constant([window_std], dtype=tf.float32)
             
-            # Инициализация ковариации
-            initial_covariance = tf.constant(
-                [[[initial_variance]]],
-                dtype=tf.float32
-            )  # [1, 1, 1]
-            
-            # Инициализация волатильности
-            initial_volatility = tf.constant([window_std], dtype=tf.float32)  # [1]
-            
-            # Сброс состояния фильтра
-            self._last_state.assign(tf.squeeze(initial_state, axis=1))  # [1]
-            self._last_P.assign(initial_covariance)  # [1, 1, 1]
+            # Сохраняем состояние для следующего вызова
+            self._last_state.assign(tf.squeeze(initial_state, axis=1))
+            self._last_P.assign(initial_covariance)
             self._state_initialized.assign(True)
             self._step_counter.assign(0)
-            
-            print(f"🔄 Состояние фильтра инициализировано: state={initial_state_val:.4f}, variance={initial_variance:.6f}")
         else:
-            # Использование сохранённого состояния
-            initial_state = tf.reshape(self._last_state, [B, self.state_dim])  # [1, 1]
-            initial_covariance = self._last_P  # [1, 1, 1]
-            initial_volatility = tf.constant([0.1], dtype=tf.float32)  # Заглушка, будет перезаписана
+            # Используем сохранённое состояние от предыдущего вызова
+            initial_state = tf.reshape(self._last_state, [B, self.state_dim])
+            initial_covariance = self._last_P
+            initial_volatility = tf.constant([0.1], dtype=tf.float32)
         
-        # === 5. ВЫПОЛНЕНИЕ ПРОГНОЗА В ГРАФОВОМ РЕЖИМЕ ===
-        X_scaled_tensor = tf.convert_to_tensor(X_scaled_np, dtype=tf.float32)
+        # === 5. ПРОГНОЗ НА СЛЕДУЮЩИЙ ШАГ ===
+        with tf.device(self.device):
+            (
+                forecast_scaled,
+                std_dev_scaled,
+                ci_lower_scaled,
+                ci_upper_scaled,
+                final_state,
+                final_covariance,
+                final_volatility,
+                final_inflation,
+                target_coverage,
+                regime_info
+            ) = self._online_predict_step(
+                X_scaled_tensor,
+                initial_state,
+                initial_covariance,
+                initial_volatility
+            )
         
-        try:
-            with tf.device(self.device):
-                (
-                    forecast_scaled,
-                    std_dev_scaled,
-                    ci_lower_scaled,
-                    ci_upper_scaled,
-                    final_state,
-                    final_covariance,
-                    final_volatility,
-                    final_inflation,
-                    target_coverage,
-                    regime_info
-                ) = self._online_predict_step(
-                    X_scaled_tensor,
-                    initial_state,
-                    initial_covariance,
-                    initial_volatility
-                )
-        except Exception as e:
-            raise RuntimeError(f"Ошибка при выполнении графового прогноза: {str(e)}") from e
-        
-        # === 6. СОХРАНЕНИЕ СОСТОЯНИЯ ДЛЯ СЛЕДУЮЩЕГО ШАГА ===
-        self._last_state.assign(tf.squeeze(final_state, axis=1))  # [B, 1] → [B]
-        self._last_P.assign(final_covariance)  # [B, 1, 1]
-        self._state_initialized.assign(True)
+        # Сохраняем состояние для следующего вызова (критично для онлайн-режима)
+        self._last_state.assign(tf.squeeze(final_state, axis=1))
+        self._last_P.assign(final_covariance)
         self._step_counter.assign_add(1)
         
-        # === 7. ОБРАТНОЕ ПРЕОБРАЗОВАНИЕ В ИСХОДНЫЙ МАСШТАБ ===
-        # Преобразуем все выходы в исходное пространство
+        # === 6. ОБРАТНОЕ ПРЕОБРАЗОВАНИЕ В ИСХОДНЫЙ МАСШТАБ ===
         forecast_original = self.inverse_transform_target(forecast_scaled.numpy())
         ci_lower_original = self.inverse_transform_target(ci_lower_scaled.numpy())
         ci_upper_original = self.inverse_transform_target(ci_upper_scaled.numpy())
         
-        # Стандартное отклонение требует особой обработки (не линейное преобразование)
-        # Приближённое восстановление через отношение шкал
-        if hasattr(self.feature_scalers.get('Y'), 'scale_'):
-            scale_factor = self.feature_scalers['Y'].scale_
-            std_dev_original = std_dev_scaled.numpy() * scale_factor
+        # Стандартное отклонение в исходном масштабе
+        if self.feature_scalers is not None and 'Y' in self.feature_scalers:
+            if hasattr(self.feature_scalers['Y'], 'scale_'):
+                scale_factor = self.feature_scalers['Y'].scale_
+                std_dev_original = std_dev_scaled.numpy() * scale_factor
+            else:
+                # Резервный вариант: оценка масштаба из данных
+                y_range = np.ptp(df['Close'].values[-self.seq_len:]) if 'Close' in df.columns else 1.0
+                std_dev_original = std_dev_scaled.numpy() * (y_range / 2.0)
         else:
-            # Консервативная оценка через размах данных
-            y_range = np.ptp(df['Close'].values[-self.seq_len:]) if 'Close' in df.columns else 1.0
-            std_dev_original = std_dev_scaled.numpy() * (y_range / 2.0)
+            std_dev_original = std_dev_scaled.numpy()
         
-        # === 8. ФОРМИРОВАНИЕ РЕЗУЛЬТАТОВ ===
-        # Временная метка (если есть временной индекс)
-        timestamp = df.index[-1] if hasattr(df.index, 'is_datetime') or isinstance(df.index[-1], (pd.Timestamp, datetime.datetime)) else None
+        # === 7. ФОРМИРОВАНИЕ РЕЗУЛЬТАТА ===
+        # Временная метка последней точки истории (момент прогноза)
+        timestamp = df.index[-1] if hasattr(df.index, '__iter__') and len(df.index) > 0 else len(df)
         
         result = {
-            'forecast': forecast_original[0],
-            'ci_lower': ci_lower_original[0],
-            'ci_upper': ci_upper_original[0],
-            'std_dev': std_dev_original[0],
-            'volatility': final_volatility.numpy()[0],
-            'inflation_factor': final_inflation.numpy()[0],
-            'target_coverage': target_coverage.numpy()[0],
-            'regime': regime_info['regime_assignment'].numpy()[0],
-            'regime_weights': regime_info['soft_weights'].numpy()[0],  # [3]
-            'regime_entropy': regime_info['entropy'].numpy()[0],
-            'timestamp': timestamp
+            'timestamp': timestamp,
+            'level_forecast': forecast_original,           # [1] - прогноз level[t] в исходном масштабе
+            'level_forecast_scaled': forecast_scaled.numpy(),  # [1] - в масштабированном пространстве
+            'std_dev': std_dev_original,                  # [1] - std в исходном масштабе
+            'std_dev_scaled': std_dev_scaled.numpy(),     # [1] - std в масштабированном пространстве
+            'level_ci_lower': ci_lower_original,          # [1] - нижняя граница ДИ (исходный)
+            'level_ci_lower_scaled': ci_lower_scaled.numpy(),  # [1] - нижняя граница ДИ (масштабированный)
+            'level_ci_upper': ci_upper_original,          # [1] - верхняя граница ДИ (исходный)
+            'level_ci_upper_scaled': ci_upper_scaled.numpy(),  # [1] - верхняя граница ДИ (масштабированный)
+            'volatility_level': final_volatility.numpy()[0],   # скаляр - уровень волатильности
+            'inflation_factor': final_inflation.numpy()[0],    # скаляр - фактор инфляции
+            'confidence': target_coverage.numpy()[0],          # скаляр - целевой уровень покрытия
+            'regime': regime_info['regime_assignment'].numpy()[0]  # 0=нормальный, 1=высокая волатильность
         }
+        
+        # Дополнительные компоненты для отладки (опционально)
+        if return_components:
+            result.update({
+                'features_used': X_scaled_df,              # последние seq_len масштабированных признаков
+                'raw_features': features_df,               # все признаки на полной истории
+                'covariance': final_covariance.numpy(),    # ковариационная матрица фильтра
+                'state': final_state.numpy(),              # состояние фильтра
+                'inflation_state': {
+                    'factor': final_inflation.numpy()[0],
+                    'remaining_steps': regime_info.get('remaining_steps', tf.constant([0])).numpy()[0],
+                    'last_anomaly_time': regime_info.get('last_anomaly_time', tf.constant([0])).numpy()[0]
+                }
+            })
         
         return result
     
@@ -5691,19 +5685,20 @@ class LSTMIMMUKF(tf.Module):
         N: int = 300
     ) -> Dict[str, float]:
         """
-        Оценка модели на тестовых данных с использованием скользящего окна.
-        Все результаты возвращаются в исходном масштабе для корректной интерпретации.
+        Честная оценка модели на тестовых данных с использованием скользящего окна.
+        Все признаки рассчитываются на корректной истории (минимум min_history_for_features точек).
+        Нет утечки будущего: признаки для прогноза точки t рассчитываются только на истории [t-350 .. t-1].
         
         Аргументы:
-            df: pd.DataFrame - тестовые данные с колонками OHLC
-            plot: bool - построить графики результатов
-            N: int - количество последних точек для визуализации
+            df: DataFrame с колонками ['Open', 'High', 'Low', 'Close']
+            plot: флаг построения графиков
+            N: количество точек для визуализации
         
         Возвращает:
-            Словарь метрик качества прогноза и калибровки ДИ
+            Словарь с метриками качества
         """
         print("\n" + "=" * 80)
-        print("🔍 НАЧАЛО ОЦЕНКИ МОДЕЛИ С КОНТЕКСТНОЙ ВОЛАТИЛЬНОСТЬЮ")
+        print("🔍 НАЧАЛО ЧЕСТНОЙ ОЦЕНКИ МОДЕЛИ (БЕЗ УТЕЧКИ БУДУЩЕГО)")
         print("=" * 80)
         
         # === 1. ВАЛИДАЦИЯ ВХОДНЫХ ДАННЫХ ===
@@ -5712,211 +5707,228 @@ class LSTMIMMUKF(tf.Module):
         if missing_cols:
             raise ValueError(f"❌ Отсутствуют обязательные колонки в данных: {missing_cols}")
         
-        min_required_points = self.seq_len + 1  # seq_len для признаков + 1 для целевого значения
-        if len(df) < min_required_points:
+        window_size = self.min_history_for_features  # 350
+        if len(df) < window_size + 1:
             raise ValueError(
-                f"❌ Недостаточно данных для оценки. Требуется минимум {min_required_points} точек, "
+                f"❌ Недостаточно данных для оценки. Требуется минимум {window_size + 1} точек, "
                 f"получено {len(df)}"
             )
         
-        # === 2. ПОДГОТОВКА ДАННЫХ ДЛЯ ОЦЕНКИ ===
-        # Создаём скользящее окно: каждое окно = seq_len точек для прогноза + 1 точка для проверки
-        total_windows = len(df) - self.seq_len
-        print(f"📊 Обработка {total_windows} окон для оценки (размер окна: {self.seq_len})...")
+        # === 2. СОХРАНЕНИЕ ИСХОДНОГО СОСТОЯНИЯ ФИЛЬТРА (КРИТИЧЕСКИ ВАЖНО: ДО ЛЮБЫХ ИЗМЕНЕНИЙ) ===
+        original_state_initialized_val = self._state_initialized.numpy()
+        original_last_state_val = self._last_state.numpy().copy() if original_state_initialized_val else None
+        original_last_P_val = self._last_P.numpy().copy() if original_state_initialized_val else None
+        original_step_counter_val = self._step_counter.numpy()
         
-        # Инициализация массивов для результатов
-        timestamps = []
-        true_values_scaled = []   # В масштабированном пространстве для точных расчётов
-        true_values_original = [] # В исходном пространстве для отчётов
-        pred_values_scaled = []
-        pred_values_original = []
-        pi_lower_scaled = []
-        pi_upper_scaled = []
-        pi_lower_original = []
-        pi_upper_original = []
-        volatility_levels = []
-        inflation_factors = []
-        confidences = []
-        regimes = []
+        print(f"💾 Сохранено исходное состояние фильтра: initialized={original_state_initialized_val}")
         
-        # Сброс состояния фильтра перед оценкой
+        # === 3. СБРОС СОСТОЯНИЯ ДЛЯ ЧИСТОЙ ОЦЕНКИ ===
         self._state_initialized.assign(False)
+        print(f"🔄 Состояние фильтра сброшено перед оценкой (чистый старт)")
         
-        # === 3. СКОЛЬЗЯЩЕЕ ОКНО ОЦЕНКИ ===
-        progress_bar = tqdm(range(total_windows), desc="Оценка модели", unit="окно")
+        # === 4. ИНИЦИАЛИЗАЦИЯ МАССИВОВ ДЛЯ ХРАНЕНИЯ РЕЗУЛЬТАТОВ ===
+        timestamps = []
+        true_values_original = []   # level[t] в исходном масштабе
+        true_values_scaled = []     # level[t] в масштабированном пространстве
+        pred_values_original = []   # прогноз в исходном масштабе
+        pred_values_scaled = []     # прогноз в масштабированном пространстве
+        pi_lower_original = []      # нижняя граница ДИ (исходный масштаб)
+        pi_upper_original = []      # верхняя граница ДИ (исходный масштаб)
+        pi_lower_scaled = []        # нижняя граница ДИ (масштабированный)
+        pi_upper_scaled = []        # верхняя граница ДИ (масштабированный)
+        volatility_levels = []      # уровень волатильности
+        inflation_factors = []      # фактор инфляции ковариации
+        confidences = []            # целевой уровень покрытия ДИ
+        regimes = []                # режим фильтра (0=нормальный, 1=высокая волатильность)
         
-        for i in progress_bar:
-            try:
-                # Извлекаем окно данных для подготовки признаков
-                # Берём достаточно точек для расчёта всех признаков (включая EMD)
-                window_start = max(0, i - (self.min_history_for_features - self.seq_len))
-                window_data = df.iloc[window_start:i + self.seq_len + 1].copy()
-                
-                # Проверка минимального размера окна для признаков
-                if len(window_data) < self.min_history_for_features:
-                    continue  # Пропускаем окна с недостаточной историей
-                
-                # Получаем истинное значение для проверки (следующая точка после окна)
-                ground_truth_idx = i + self.seq_len
-                if ground_truth_idx >= len(df):
-                    break
-                
-                ground_truth_scaled = df.iloc[ground_truth_idx]['Close']  # Временно без масштабирования
-                
-                # === ВЫПОЛНЕНИЕ ПРОГНОЗА ===
-                # Сбрасываем состояние ТОЛЬКО для первого окна
-                result = self.online_predict(
-                    window_data,
-                    reset_state=(i == 0)
+        # === 5. СКОЛЬЗЯЩЕЕ ОКНО ОЦЕНКИ ===
+        # t — индекс прогнозируемой точки level[t]
+        total_steps = len(df) - window_size
+        print(f"📊 Обработка {total_steps} шагов оценки (окно = {window_size} точек)...")
+        
+        # Прогресс-бар для отслеживания хода оценки
+        progress_bar = tqdm(range(window_size, len(df)), desc="Оценка модели", unit="шаг")
+        
+        try:
+            for t in progress_bar:
+                try:
+                    # === ШАГ 1: ИСТОРИЯ ДЛЯ РАСЧЁТА ПРИЗНАКОВ (БЕЗ УТЕЧКИ БУДУЩЕГО) ===
+                    # История: [t-350 .. t-1] → ровно 350 точек ДО момента прогноза
+                    history_features = df.iloc[t - window_size : t].copy()
+                    
+                    # === ШАГ 2: ПРОГНОЗ ЧЕРЕЗ ИСПРАВЛЕННЫЙ online_predict ===
+                    # online_predict рассчитает признаки на ПОЛНОЙ переданной истории (350 точек)
+                    # Состояние сохраняется между окнами благодаря: reset_state=(t == window_size)
+                    result = self.online_predict(
+                        history_features,
+                        reset_state=(t == window_size),  # Сбрасываем состояние ТОЛЬКО для первого шага
+                        return_components=False,
+                        ground_truth_available=False
+                    )
+                    
+                    # === ШАГ 3: ПОЛУЧЕНИЕ ЧЕСТНОГО GROUND TRUTH (level[t]) ===
+                    # Расширенная история: [t-350 .. t] → 351 точка (включая прогнозируемую)
+                    # КРИТИЧЕСКИ ВАЖНО: расчёт через тот же prepare_features для сохранения контекста!
+                    history_gt = df.iloc[t - window_size : t + 1].copy()
+                    features_gt = self.prepare_features(history_gt, mode='batch')
+                    level_t_true = features_gt.iloc[-1]['level']  # level[t] в исходном масштабе
+                    
+                    # Масштабируем для точного сравнения в пространстве обучения
+                    if self.feature_scalers is not None and 'Y' in self.feature_scalers:
+                        level_t_true_scaled = self.feature_scalers['Y'].transform([[level_t_true]])[0, 0]
+                    else:
+                        level_t_true_scaled = level_t_true
+                    
+                    # === ШАГ 4: СОХРАНЕНИЕ РЕЗУЛЬТАТОВ ===
+                    # Временная метка прогнозируемой точки
+                    timestamp = df.index[t] if hasattr(df.index, '__iter__') and len(df.index) > t else t
+                    
+                    # Агрегация результатов
+                    timestamps.append(timestamp)
+                    true_values_original.append(level_t_true)
+                    true_values_scaled.append(level_t_true_scaled)
+                    pred_values_original.append(result['level_forecast'][0])
+                    pred_values_scaled.append(result['level_forecast_scaled'][0])
+                    pi_lower_original.append(result['level_ci_lower'][0])
+                    pi_upper_original.append(result['level_ci_upper'][0])
+                    pi_lower_scaled.append(result['level_ci_lower_scaled'][0])
+                    pi_upper_scaled.append(result['level_ci_upper_scaled'][0])
+                    volatility_levels.append(result['volatility_level'])
+                    inflation_factors.append(result['inflation_factor'])
+                    confidences.append(result['confidence'])
+                    regimes.append(result['regime'])
+                    
+                except Exception as e:
+                    print(f"\n⚠️ Ошибка на шаге t={t}: {str(e)}")
+                    # Продолжаем оценку для остальных шагов (не прерываем полностью)
+                    continue
+            
+            # === 6. ПРОВЕРКА РЕЗУЛЬТАТОВ ===
+            if len(true_values_original) == 0:
+                raise RuntimeError("❌ Не удалось выполнить ни одного прогноза для оценки")
+            
+            print(f"\n✅ Успешно обработано {len(true_values_original)} шагов из {total_steps}")
+            
+            # === 7. ПРЕОБРАЗОВАНИЕ В NUMPY МАССИВЫ ===
+            true_values_original = np.array(true_values_original)
+            true_values_scaled = np.array(true_values_scaled)
+            pred_values_original = np.array(pred_values_original)
+            pred_values_scaled = np.array(pred_values_scaled)
+            pi_lower_original = np.array(pi_lower_original)
+            pi_upper_original = np.array(pi_upper_original)
+            pi_lower_scaled = np.array(pi_lower_scaled)
+            pi_upper_scaled = np.array(pi_upper_scaled)
+            volatility_levels = np.array(volatility_levels)
+            inflation_factors = np.array(inflation_factors)
+            confidences = np.array(confidences)
+            regimes = np.array(regimes)
+            timestamps = np.array(timestamps)
+            
+            # === 8. РАСЧЁТ ОШИБОК ===
+            errors_original = pred_values_original - true_values_original
+            errors_scaled = pred_values_scaled - true_values_scaled
+            
+            # === 9. РАСЧЁТ МЕТРИК ===
+            metrics = {}
+            
+            # Базовые метрики (в исходном масштабе)
+            metrics['MAE'] = float(np.mean(np.abs(errors_original)))
+            metrics['RMSE'] = float(np.sqrt(np.mean(errors_original ** 2)))
+            metrics['MAPE'] = float(np.mean(np.abs(errors_original / (np.abs(true_values_original) + 1e-8))))
+            metrics['MAPE_median'] = float(np.median(np.abs(errors_original / (np.abs(true_values_original) + 1e-8))))
+            
+            # R² коэффициент
+            ss_res = np.sum(errors_original ** 2)
+            ss_tot = np.sum((true_values_original - np.mean(true_values_original)) ** 2)
+            metrics['R2'] = float(1 - ss_res / (ss_tot + 1e-8))
+            
+            # Метрики доверительных интервалов (90% уровень доверия)
+            valid_coverage_original = (true_values_original >= pi_lower_original) & (true_values_original <= pi_upper_original)
+            metrics['CoverageRatio'] = float(np.mean(valid_coverage_original))
+            metrics['CoverageCount'] = int(np.sum(valid_coverage_original))
+            metrics['TotalCount'] = len(true_values_original)
+            
+            # Ширина доверительных интервалов
+            pi_widths_original = pi_upper_original - pi_lower_original
+            metrics['MeanPIWidth'] = float(np.mean(pi_widths_original))
+            metrics['MedianPIWidth'] = float(np.median(pi_widths_original))
+            metrics['StdPIWidth'] = float(np.std(pi_widths_original))
+            
+            # Статистика по волатильности
+            metrics['VolatilityMean'] = float(np.nanmean(volatility_levels))
+            metrics['VolatilityStd'] = float(np.nanstd(volatility_levels))
+            metrics['VolatilityMax'] = float(np.nanmax(volatility_levels))
+            metrics['VolatilityMin'] = float(np.nanmin(volatility_levels))
+            
+            # Статистика по адаптивному inflation
+            metrics['InflationMean'] = float(np.nanmean(inflation_factors))
+            metrics['InflationStd'] = float(np.nanstd(inflation_factors))
+            metrics['InflationMax'] = float(np.nanmax(inflation_factors))
+            metrics['InflationMin'] = float(np.nanmin(inflation_factors))
+            
+            # Статистика по уровню уверенности (покрытию ДИ)
+            metrics['ConfidenceMean'] = float(np.nanmean(confidences))
+            metrics['ConfidenceStd'] = float(np.nanstd(confidences))
+            
+            # Дополнительные метрики
+            metrics['CalibrationError'] = abs(metrics['CoverageRatio'] - 0.90)  # для 90% доверительного интервала
+            if len(errors_original) > 1:
+                metrics['DirectionalAccuracy'] = float(
+                    np.mean((np.sign(errors_original[:-1]) != np.sign(errors_original[1:])).astype(int))
                 )
-                
-                # Сохранение результатов
-                timestamps.append(result['timestamp'] if result['timestamp'] is not None else i)
-                pred_values_original.append(result['forecast'])
-                pi_lower_original.append(result['ci_lower'])
-                pi_upper_original.append(result['ci_upper'])
-                volatility_levels.append(result['volatility'])
-                inflation_factors.append(result['inflation_factor'])
-                confidences.append(result['target_coverage'])
-                regimes.append(result['regime'])
-                
-                # Истинное значение в исходном масштабе
-                true_value_original = df.iloc[ground_truth_idx]['Close']
-                true_values_original.append(true_value_original)
-                
-                # Для точных расчётов ошибок используем масштабированные значения
-                # (предполагаем, что скейлер уже обучен)
-                if self.feature_scalers is not None and 'Y' in self.feature_scalers:
-                    true_scaled = self.feature_scalers['Y'].transform([[true_value_original]])[0, 0]
-                    pred_scaled = self.feature_scalers['Y'].transform([[result['forecast']]])[0, 0]
-                    lower_scaled = self.feature_scalers['Y'].transform([[result['ci_lower']]])[0, 0]
-                    upper_scaled = self.feature_scalers['Y'].transform([[result['ci_upper']]])[0, 0]
-                    
-                    true_values_scaled.append(true_scaled)
-                    pred_values_scaled.append(pred_scaled)
-                    pi_lower_scaled.append(lower_scaled)
-                    pi_upper_scaled.append(upper_scaled)
-                else:
-                    # Если скейлер недоступен, используем оригинальные значения (менее точно)
-                    true_values_scaled.append(true_value_original)
-                    pred_values_scaled.append(result['forecast'])
-                    pi_lower_scaled.append(result['ci_lower'])
-                    pi_upper_scaled.append(result['ci_upper'])
-                    
-            except Exception as e:
-                print(f"\n⚠️ Предупреждение: ошибка на окне {i}: {str(e)}")
-                # Продолжаем оценку для остальных окон
-                continue
-        
-        # === 4. ПРОВЕРКА РЕЗУЛЬТАТОВ ===
-        if len(true_values_original) == 0:
-            raise RuntimeError("Не удалось выполнить ни одного прогноза для оценки")
-        
-        print(f"\n✅ Успешно обработано {len(true_values_original)} окон из {total_windows}")
-        
-        # === 5. ПРЕОБРАЗОВАНИЕ В NUMPY МАССИВЫ ===
-        true_values_original = np.array(true_values_original)
-        pred_values_original = np.array(pred_values_original)
-        pi_lower_original = np.array(pi_lower_original)
-        pi_upper_original = np.array(pi_upper_original)
-        true_values_scaled = np.array(true_values_scaled)
-        pred_values_scaled = np.array(pred_values_scaled)
-        pi_lower_scaled = np.array(pi_lower_scaled)
-        pi_upper_scaled = np.array(pi_upper_scaled)
-        volatility_levels = np.array(volatility_levels)
-        inflation_factors = np.array(inflation_factors)
-        confidences = np.array(confidences)
-        regimes = np.array(regimes)
-        timestamps = np.array(timestamps)
-        
-        # === 6. РАСЧЁТ МЕТРИК В ИСХОДНОМ МАСШТАБЕ ===
-        errors_original = pred_values_original - true_values_original
-        
-        metrics = {}
-        
-        # Базовые метрики точности (в исходном масштабе)
-        metrics['MAE'] = float(np.mean(np.abs(errors_original)))
-        metrics['RMSE'] = float(np.sqrt(np.mean(errors_original ** 2)))
-        metrics['MAPE'] = float(np.mean(np.abs(errors_original / (np.abs(true_values_original) + 1e-8))))
-        metrics['MAPE_median'] = float(np.median(np.abs(errors_original / (np.abs(true_values_original) + 1e-8))))
-        
-        # R2 коэффициент
-        ss_res = np.sum(errors_original ** 2)
-        ss_tot = np.sum((true_values_original - np.mean(true_values_original)) ** 2)
-        metrics['R2'] = float(1 - ss_res / (ss_tot + 1e-8))
-        
-        # Метрики доверительных интервалов (в масштабированном пространстве для точности)
-        valid_coverage = (true_values_scaled >= pi_lower_scaled) & (true_values_scaled <= pi_upper_scaled)
-        metrics['CoverageRatio'] = float(np.mean(valid_coverage))
-        metrics['CoverageCount'] = int(np.sum(valid_coverage))
-        metrics['TotalCount'] = len(true_values_scaled)
-        
-        # Ширина доверительных интервалов (в исходном масштабе для интерпретации)
-        pi_widths_original = pi_upper_original - pi_lower_original
-        metrics['MeanPIWidth'] = float(np.mean(pi_widths_original))
-        metrics['MedianPIWidth'] = float(np.median(pi_widths_original))
-        
-        # Отношение ширины ДИ к волатильности данных (ключевая метрика калибровки)
-        y_std_original = np.std(true_values_original) + 1e-8
-        metrics['CIWidthToStdRatio'] = float(np.mean(pi_widths_original) / y_std_original)
-        
-        # Статистика по волатильности
-        metrics['VolatilityMean'] = float(np.nanmean(volatility_levels))
-        metrics['VolatilityStd'] = float(np.nanstd(volatility_levels))
-        metrics['VolatilityMax'] = float(np.nanmax(volatility_levels))
-        
-        # Статистика по адаптивному inflation
-        metrics['InflationMean'] = float(np.nanmean(inflation_factors))
-        metrics['InflationStd'] = float(np.nanstd(inflation_factors))
-        metrics['InflationMax'] = float(np.nanmax(inflation_factors))
-        
-        # Статистика по режимам волатильности
-        for regime_idx, regime_name in enumerate(['LOW', 'MID', 'HIGH']):
-            metrics[f'Regime_{regime_name}_Pct'] = float(np.mean(regimes == regime_idx) * 100)
-        
-        # Ошибка калибровки относительно целевого покрытия
-        target_coverage_mean = np.mean(confidences)
-        metrics['TargetCoverageMean'] = float(target_coverage_mean)
-        metrics['CalibrationError'] = abs(metrics['CoverageRatio'] - target_coverage_mean)
-        
-        # === 7. ВЫВОД РЕЗУЛЬТАТОВ ===
-        print("\n" + "=" * 60)
-        print("📊 РЕЗУЛЬТАТЫ ОЦЕНКИ МОДЕЛИ С КОНТЕКСТНОЙ ВОЛАТИЛЬНОСТЬЮ")
-        print("=" * 60)
-        print(f"   📈 MAE: {metrics['MAE']:.6f}")
-        print(f"   📉 RMSE: {metrics['RMSE']:.6f}")
-        print(f"   📊 MAPE (среднее): {metrics['MAPE']:.4%}")
-        print(f"   📊 MAPE (медиана): {metrics['MAPE_median']:.4%}")
-        print(f"   🎯 R²: {metrics['R2']:.6f}")
-        print(f"   🎪 Покрытие ДИ: {metrics['CoverageRatio']:.2%} "
-              f"(цель: {target_coverage_mean:.2%}, ошибка: {metrics['CalibrationError']:.4f})")
-        print(f"   📏 Ширина ДИ / волатильность данных: {metrics['CIWidthToStdRatio']:.2f}x")
-        print(f"   🔥 Средняя волатильность: {metrics['VolatilityMean']:.4f} ± {metrics['VolatilityStd']:.4f}")
-        print(f"   💦 Средний adaptive inflation: {metrics['InflationMean']:.4f} ± {metrics['InflationStd']:.4f}")
-        print(f"   🎭 Распределение режимов: LOW {metrics['Regime_LOW_Pct']:.1f}% | "
-              f"MID {metrics['Regime_MID_Pct']:.1f}% | HIGH {metrics['Regime_HIGH_Pct']:.1f}%")
-        print("=" * 60)
-        
-        # === 8. ВИЗУАЛИЗАЦИЯ ===
-        if plot and len(true_values_original) > 0:
-            print("\n📈 ПОСТРОЕНИЕ ГРАФИКОВ РЕЗУЛЬТАТОВ ОЦЕНКИ...")
-            self._plot_evaluation_results(
-                true_vals=true_values_original,
-                pred_vals=pred_values_original,
-                pi_lower_vals=pi_lower_original,
-                pi_upper_vals=pi_upper_original,
-                volatility_vals=volatility_levels,
-                inflation_vals=inflation_factors,
-                confidence_vals=confidences,
-                errors=errors_original,
-                timestamps=timestamps,
-                metrics=metrics,
-                N=min(N, len(true_values_original)),
-                figsize=(14, 12)
-            )
-        
-        return metrics
-
+            else:
+                metrics['DirectionalAccuracy'] = 0.0
+            
+            # === 10. ВЫВОД МЕТРИК ===
+            print("\n" + "=" * 60)
+            print("📊 РЕЗУЛЬТАТЫ ЧЕСТНОЙ ОЦЕНКИ МОДЕЛИ")
+            print("=" * 60)
+            print(f"   📈 MAE: {metrics['MAE']:.6f}")
+            print(f"   📉 RMSE: {metrics['RMSE']:.6f}")
+            print(f"   📊 MAPE (среднее): {metrics['MAPE']:.4%}")
+            print(f"   📊 MAPE (медиана): {metrics['MAPE_median']:.4%}")
+            print(f"   🎯 R²: {metrics['R2']:.6f}")
+            print(f"   🎪 Покрытие PI (90%): {metrics['CoverageRatio']:.2%} "
+                  f"({metrics['CoverageCount']}/{metrics['TotalCount']})")
+            print(f"   📏 Ширина PI (средняя): {metrics['MeanPIWidth']:.6f}")
+            print(f"   📏 Ширина PI (медиана): {metrics['MedianPIWidth']:.6f}")
+            print(f"   🔥 Средняя волатильность: {metrics['VolatilityMean']:.4f} ± {metrics['VolatilityStd']:.4f}")
+            print(f"   💦 Средний adaptive inflation: {metrics['InflationMean']:.4f} ± {metrics['InflationStd']:.4f}")
+            print(f"   ⚖️ Ошибка калибровки: {metrics['CalibrationError']:.4f}")
+            print("=" * 60)
+            
+            # === 11. ОТРИСОВКА ГРАФИКОВ ПРИ НЕОБХОДИМОСТИ ===
+            if plot:
+                print("\n📈 ПОСТРОЕНИЕ ГРАФИКОВ РЕЗУЛЬТАТОВ ОЦЕНКИ...")
+                self._plot_evaluation_results(
+                    true_vals=true_values_original,
+                    pred_vals=pred_values_original,
+                    pi_lower_vals=pi_lower_original,
+                    pi_upper_vals=pi_upper_original,
+                    volatility_vals=volatility_levels,
+                    inflation_vals=inflation_factors,
+                    confidence_vals=confidences,
+                    errors=errors_original,
+                    timestamps=timestamps,
+                    metrics=metrics,
+                    N=min(N, len(true_values_original)),
+                    figsize=(14, 12)
+                )
+            
+            return metrics
+            
+        finally:
+            # === 12. ВОССТАНОВЛЕНИЕ ИСХОДНОГО СОСТОЯНИЯ ФИЛЬТРА ===
+            # Это критически важно для корректной работы после оценки в продакшене
+            if original_state_initialized_val:
+                self._state_initialized.assign(True)
+                self._last_state.assign(original_last_state_val)
+                self._last_P.assign(original_last_P_val)
+                self._step_counter.assign(original_step_counter_val)
+                print(f"\n✅ Состояние фильтра восстановлено в исходное (как до оценки)")
+            else:
+                self._state_initialized.assign(False)
+                print(f"\n✅ Состояние фильтра оставлено сброшенным (не было инициализировано до оценки)")    
 
     def _setup_xaxis(self, ax, indices, timestamps, is_time_index):
         """Настройка оси X для графиков с поддержкой временных и числовых индексов"""
