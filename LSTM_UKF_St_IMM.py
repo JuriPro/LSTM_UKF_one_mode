@@ -3739,6 +3739,9 @@ class LSTMIMMUKF(tf.Module):
         # 1. БАЗОВЫЕ ПРИЗНАКИ
         features_df['level'] = features_df['St_comp']
 
+        rolling_std = features_df['St_comp'].rolling(window=20, min_periods=5).std()
+        features_df['st_comp_diff'] = np.sinh(features_df['St_comp'].diff() / (rolling_std + 1e-8))
+
         # 2. МНОГОШКАЛЬНЫЕ ОЦЕНКИ ВОЛАТИЛЬНОСТИ
         # Короткосрочная волатильность (EWMA)
         features_df['vol_short'] = features_df['St_comp'].ewm(
