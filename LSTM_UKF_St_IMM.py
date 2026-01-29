@@ -783,15 +783,20 @@ class LSTMIMMUKF(tf.Module):
                 name='base_r_logit'
             )
 
-            # Вычисление начальной ковариации
+            # Вычисление начальной ковариации — ЕДИНАЯ ФОРМА [1, state_dim, state_dim]
             base_q = tf.nn.softplus(self.base_q_logit) + 1e-6
-            self._last_P = tf.Variable(
+            # Явное преобразование в трехмерную форму [1, 1, 1]
+            initial_P = tf.reshape(
                 tf.eye(self.state_dim, dtype=tf.float32) * base_q,
+                [1, self.state_dim, self.state_dim]
+            )
+            self._last_P = tf.Variable(
+                initial_P,
                 trainable=False,
                 name='last_P',
                 dtype=tf.float32
             )
-            print(f"✅ _last_P: shape={self._last_P.shape}")
+            print(f"✅ _last_P: shape={self._last_P.shape} (единая форма [1, 1, 1])")
 
             # Флаг инициализации состояния
             self._state_initialized = tf.Variable(
@@ -4054,24 +4059,27 @@ class LSTMIMMUKF(tf.Module):
                         max_variance = 0.5 * tf.math.reduce_variance(y_for_filtering_batch) + 0.1
                         initial_variance = tf.minimum(initial_variance, max_variance)
                         
-                        # ✅ КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: СКАЛЯРНАЯ ИНИЦИАЛИЗАЦИЯ [1], а не [batch_size]
+                        # ✅ ИНИЦИАЛИЗАЦИЯ КАК СКАЛЯРА [1]
                         initial_state_val = tf.reduce_mean(y_for_filtering_batch[:, 0])  # Скаляр
                         
-                        # Пересоздаём переменные с правильной формой [1] и [1, 1, 1]
+                        # Создаём переменные с формой [1] и [1, 1, 1]
                         self._last_state = tf.Variable(
-                            tf.reshape(initial_state_val, [1]),  # ← Явное преобразование в [1]
+                            tf.reshape(initial_state_val, [1]),  # ← Явно [1]
                             trainable=False,
                             name='last_state'
                         )
                         
-                        # Для ковариации: скалярная дисперсия → [1, 1, 1]
-                        initial_cov_value = tf.reshape(tf.reduce_mean(initial_variance), [1, self.state_dim, self.state_dim])
+                        # Для ковариации: усредняем дисперсию → [1, 1, 1]
+                        initial_cov_value = tf.reshape(
+                            tf.reduce_mean(initial_variance),
+                            [1, self.state_dim, self.state_dim]  # ← Явно [1, 1, 1]
+                        )
                         self._last_P = tf.Variable(
                             initial_cov_value,
                             trainable=False,
                             name='last_P'
                         )
-                        
+                       
                         self._state_initialized.assign(False)
                         print(f"✅ Переменные состояния инициализированы: state={self._last_state.shape}, P={self._last_P.shape}")
                         print(f"   Начальная дисперсия: {tf.reduce_mean(initial_variance):.6f}")
@@ -4080,9 +4088,11 @@ class LSTMIMMUKF(tf.Module):
                     should_use_saved_state = tf.logical_and(self._state_initialized, self._step_counter > 0)
                     
                     def use_saved_state():
-                        # ✅ ВСЕГДА расширяем скаляр [1] → [B, 1] через tile
-                        return (tf.tile(tf.reshape(self._last_state, [1, self.state_dim]), [batch_size, 1]), 
-                                tf.tile(tf.reshape(self._last_P, [1, self.state_dim, self.state_dim]), [batch_size, 1, 1]))
+                        # ✅ РАСШИРЕНИЕ СКАЛЯРА [1] → [B, 1] ЧЕРЕЗ TILE
+                        return (
+                            tf.tile(tf.reshape(self._last_state, [1, self.state_dim]), [batch_size, 1]),
+                            tf.tile(tf.reshape(self._last_P, [1, self.state_dim, self.state_dim]), [batch_size, 1, 1])
+                        )
                     
                     def initialize_from_data():
                         # Инициализация только если состояние ещё не инициализировано
@@ -4120,12 +4130,12 @@ class LSTMIMMUKF(tf.Module):
                     }
 
                     # ===== СОХРАНЕНИЕ СОСТОЯНИЯ ДЛЯ СЛЕДУЮЩЕГО ШАГА =====
-                    # Усреднение по батчу для сохранения скалярного состояния
+                    # ✅ УСРЕДНЕНИЕ ПО БАТЧУ ДО СКАЛЯРА [1]
                     self._last_state.assign(
-                        tf.reduce_mean(tf.squeeze(final_state, axis=1), axis=0, keepdims=True)  # [B] → [1] ✅
+                        tf.reduce_mean(tf.squeeze(final_state, axis=1), keepdims=True)  # [B] → [1]
                     )
                     self._last_P.assign(
-                        tf.reduce_mean(final_covariance, axis=0, keepdims=True)  # [B, 1, 1] → [1, 1, 1] ✅
+                        tf.reduce_mean(final_covariance, axis=0, keepdims=True)  # [B, 1, 1] → [1, 1, 1]
                     )
                     self._state_initialized.assign(True)
                     self._step_counter.assign_add(1)
@@ -4178,19 +4188,17 @@ class LSTMIMMUKF(tf.Module):
 
                     # === ФУНКЦИИ ДЛЯ ВЫБОРА СОСТОЯНИЯ ДЛЯ ВАЛИДАЦИИ ===
                     def use_saved_state_for_val():
-                        # Единый паттерн расширения через tile (как в обучении)
-                        # Расширяем скалярное состояние [1] → [B_val, 1]
+                        # ✅ ЕДИНЫЙ ПАТТЕРН: расширение скаляра [1] → [B_val, 1] через tile
                         initial_state = tf.tile(
                             tf.reshape(self._last_state, [1, self.state_dim]),
                             [B_val, 1]
                         )
-                        # Расширяем ковариацию [1, 1, 1] → [B_val, 1, 1]
                         initial_covariance = tf.tile(
                             tf.reshape(self._last_P, [1, self.state_dim, self.state_dim]),
                             [B_val, 1, 1]
                         )
                         return initial_state, initial_covariance
-
+                    
                     def initialize_val_from_data():
                         base_value = y_val_for_filtering_batch[:, 0]
                         initial_state = tf.reshape(base_value, [B_val, self.state_dim])
@@ -4198,7 +4206,7 @@ class LSTMIMMUKF(tf.Module):
                         initial_covariance = tf.reshape(initial_variance, [B_val, self.state_dim, self.state_dim])
                         initial_covariance = tf.maximum(initial_covariance, 1e-8)
                         return initial_state, initial_covariance
-
+                    
                     # Используем tf.cond для графового режима
                     initial_state_val, initial_covariance_val = tf.cond(
                         tf.logical_and(self._state_initialized, self._step_counter > 0),
@@ -4588,15 +4596,28 @@ class LSTMIMMUKF(tf.Module):
         print(f"✅ Метаданные сохранены: {metadata_path}")
         
         # === 4. СЕРИАЛИЗАЦИЯ СОСТОЯНИЯ С ГАРАНТИРОВАННОЙ КАНОНИЧЕСКОЙ ФОРМОЙ ===
-        # 🔑 КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: всегда сохраняем состояние как [1] / [1, 1], НЕ как [B]
+        _last_state_val = self._last_state.numpy()
+        if len(_last_state_val.shape) > 0 and _last_state_val.shape[0] > 1:
+            _last_state_val = np.mean(_last_state_val).item()  # → скаляр
+        else:
+            _last_state_val = _last_state_val.item() if _last_state_val.shape == () else _last_state_val[0]
+        
+        _last_P_val = self._last_P.numpy()
+        if len(_last_P_val.shape) == 3 and _last_P_val.shape[0] > 1:
+            _last_P_val = np.mean(_last_P_val, axis=0).tolist()  # → [1, 1]
+        elif len(_last_P_val.shape) == 2:
+            _last_P_val = _last_P_val.tolist()
+        else:
+            _last_P_val = _last_P_val.item() if _last_P_val.shape == () else _last_P_val.tolist()
+        
         model_state = {
-            # UKF состояние — ВСЕГДА в канонической форме [state_dim] / [state_dim, state_dim]
-            '_last_state': tf.reshape(self._last_state, [self.state_dim]).numpy(),  # ← ГАРАНТИРОВАННО [1]
-            '_last_P': tf.reshape(self._last_P, [self.state_dim, self.state_dim]).numpy(),  # ← ГАРАНТИРОВАННО [1, 1]
+            # UKF состояние (УСРЕДНЁННОЕ)
+            '_last_state': _last_state_val,  # СКАЛЯР
+            '_last_P': _last_P_val,          # [1, 1]
             '_state_initialized': self._state_initialized.numpy(),
             '_step_counter': self._step_counter.numpy(),
             '_last_anomaly_time': self._last_anomaly_time.numpy(),
-            # Обучаемые параметры
+            # Обучаемые параметры...
             'base_q_logit': self.base_q_logit.numpy(),
             'base_r_logit': self.base_r_logit.numpy(),
             'volatility_sensitivity': self.volatility_sensitivity.numpy(),
@@ -4731,37 +4752,83 @@ class LSTMIMMUKF(tf.Module):
             model_state = pickle.load(f)
         print("✅ Состояние загружено")
         
-        # === 5. БЕЗОПАСНОЕ ВОССТАНОВЛЕНИЕ СОСТОЯНИЯ ФИЛЬТРА С РЕДУКЦИЕЙ РАЗМЕРНОСТЕЙ ===
-        print("🔧 Восстановление состояния фильтра...")
+        # === 5. БЕЗОПАСНОЕ ВОССТАНОВЛЕНИЕ СОСТОЯНИЯ ФИЛЬТРА (СКАЛЯРНОЕ) ===
+        def _safe_assign_variable(var, value, var_name):
+            """Безопасное присваивание значения переменной с проверкой размерностей"""
+            if value is None:
+                print(f"   ⚠️ {var_name}: значение None, пропускаем")
+                return
+            try:
+                # Проверяем совместимость размерностей
+                if hasattr(var, 'shape') and hasattr(value, 'shape'):
+                    if var.shape != value.shape:
+                        print(f"   ⚠️ {var_name}: размерность изменилась {var.shape} → {value.shape}")
+                        # Создаем новую переменную с правильной размерностью
+                        if isinstance(value, np.ndarray):
+                            new_value = np.zeros_like(value)
+                        else:
+                            new_value = value
+                        var.assign(new_value)
+                    else:
+                        var.assign(value)
+                else:
+                    var.assign(value)
+                print(f"   ✅ {var_name}: восстановлено")
+            except Exception as e:
+                print(f"   ❌ {var_name}: ошибка при восстановлении - {str(e)}")
         
-        # 🔑 КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: редукция [B] → [1] при загрузке старых чекпоинтов
+        print("🔧 Восстановление UKF состояния (скалярное, независимое от батча)...")
+        
+        # ВОССТАНОВЛЕНИЕ _last_state КАК СКАЛЯРА [1]
         if '_last_state' in model_state and model_state['_last_state'] is not None:
-            loaded = model_state['_last_state']
-            # Если сохранено как [B] вместо [1] — усредняем
-            if len(loaded.shape) == 1 and loaded.shape[0] > self.state_dim:
-                loaded = np.mean(loaded).reshape([self.state_dim])
-                print(f"   ⚠️ _last_state: редуцировано {loaded.shape} → ({self.state_dim},)")
-            # Если скаляр — преобразуем в [1]
-            elif len(loaded.shape) == 0:
-                loaded = np.array([loaded], dtype=np.float32)
-            # Присваиваем с сохранением ссылочной целостности графа
-            try:
-                self._last_state.assign(loaded)
-                print(f"   ✅ _last_state: восстановлено {self._last_state.shape}")
-            except Exception as e:
-                print(f"   ❌ _last_state: ошибка - {str(e)}")
+            saved_val = model_state['_last_state']
+            if np.isscalar(saved_val) or (isinstance(saved_val, np.ndarray) and saved_val.shape == ()):
+                new_val = tf.constant([float(saved_val)], dtype=tf.float32)  # [1]
+            else:
+                # Если сохранено как массив — усредняем до скаляра
+                new_val = tf.constant([np.mean(saved_val).item()], dtype=tf.float32)  # [1]
+            _safe_assign_variable(self._last_state, new_val, '_last_state')
+            print(f"   ✅ _last_state: восстановлен как скаляр [1] = {new_val.numpy()[0]:.6f}")
         
+        # ВОССТАНОВЛЕНИЕ _last_P С АВТОМАТИЧЕСКОЙ АДАПТАЦИЕЙ ФОРМЫ
         if '_last_P' in model_state and model_state['_last_P'] is not None:
-            loaded = model_state['_last_P']
-            # Если сохранено как [B, 1, 1] вместо [1, 1] — усредняем по батчу
-            if len(loaded.shape) == 3 and loaded.shape[0] > 1:
-                loaded = np.mean(loaded, axis=0).reshape([self.state_dim, self.state_dim])
-                print(f"   ⚠️ _last_P: редуцировано {loaded.shape} → ({self.state_dim}, {self.state_dim})")
-            try:
-                self._last_P.assign(loaded)
-                print(f"   ✅ _last_P: восстановлено {self._last_P.shape}")
-            except Exception as e:
-                print(f"   ❌ _last_P: ошибка - {str(e)}")
+            saved_val = model_state['_last_P']
+            if isinstance(saved_val, list):
+                saved_val = np.array(saved_val)
+            
+            # Определяем текущую форму переменной
+            current_shape = self._last_P.shape.as_list()
+            
+            # Случай 1: сохранено как [B, 1, 1] → усредняем по батчу до [1, 1, 1]
+            if len(saved_val.shape) == 3 and saved_val.shape[0] > 1:
+                new_val = np.mean(saved_val, axis=0, keepdims=True)  # [1, 1, 1]
+                print(f"   ⚠️ _last_P: усреднено по батчу [{saved_val.shape[0]} → 1]")
+            
+            # Случай 2: сохранено как [1, 1] (2D) → преобразуем в [1, 1, 1]
+            elif len(saved_val.shape) == 2:
+                new_val = saved_val.reshape(1, 1, 1)
+                print(f"   ⚠️ _last_P: преобразовано из [1, 1] → [1, 1, 1]")
+            
+            # Случай 3: сохранено как скаляр → преобразуем в [1, 1, 1]
+            elif saved_val.shape == () or len(saved_val.shape) == 1:
+                new_val = np.array([[saved_val]]).reshape(1, 1, 1)
+                print(f"   ⚠️ _last_P: преобразован из скаляра → [1, 1, 1]")
+            
+            # Случай 4: уже [1, 1, 1]
+            else:
+                new_val = saved_val.reshape(1, 1, 1)
+                print(f"   ✅ _last_P: форма уже корректна [1, 1, 1]")
+            
+            # Приводим к текущей форме переменной (если она [1, 1])
+            if current_shape == [1, 1]:
+                # Сжимаем до [1, 1] для совместимости со старыми версиями
+                new_val_2d = new_val.reshape(1, 1)
+                _safe_assign_variable(self._last_P, new_val_2d, '_last_P')
+                print(f"   ✅ _last_P: восстановлен как [1, 1] (для обратной совместимости)")
+            else:
+                # Используем трехмерную форму
+                _safe_assign_variable(self._last_P, new_val, '_last_P')
+                print(f"   ✅ _last_P: восстановлен как [1, 1, 1]")
         
         # Восстановление остальных состояний
         for var_name in ['_state_initialized', '_step_counter', '_last_anomaly_time']:
@@ -4852,109 +4919,90 @@ class LSTMIMMUKF(tf.Module):
 
     def get_current_weights(self) -> Dict[str, Any]:
         """
-        Сохранение ПОЛНОГО состояния модели в памяти для ранней остановки.
-        Включает ВСЕ компоненты: веса LSTM, состояние фильтра, обучаемые параметры,
-        состояние режимов волатильности и буфер аномалий.
-        
-        Возвращает:
-            Словарь с полным состоянием модели для последующего восстановления
+        Сохранение ПОЛНОГО состояния модели с УСРЕДНЕНИЕМ по батчу для независимости от размера батча.
+        Все состояния фильтра сохраняются как скаляры/матрицы без размерности батча.
         """
+        # === УСРЕДНЕНИЕ СОСТОЯНИЯ ФИЛЬТРА ПО БАТЧУ ===
+        _last_state_val = self._last_state.numpy()
+        if len(_last_state_val.shape) > 0 and _last_state_val.shape[0] > 1:
+            _last_state_val = np.mean(_last_state_val).item()  # → скаляр
+        else:
+            _last_state_val = _last_state_val.item() if _last_state_val.shape == () else _last_state_val[0]
+    
+        _last_P_val = self._last_P.numpy()
+        if len(_last_P_val.shape) == 3 and _last_P_val.shape[0] > 1:
+            _last_P_val = np.mean(_last_P_val, axis=0).tolist()  # → [1, 1]
+        elif len(_last_P_val.shape) == 2:
+            _last_P_val = _last_P_val.tolist()
+        else:
+            _last_P_val = _last_P_val.item() if _last_P_val.shape == () else _last_P_val.tolist()
+    
         state_dict = {
             # === LSTM ВЕСА ===
             'lstm_weights': self.model.get_weights() if self.model is not None else None,
-            
-            # === UKF СОСТОЯНИЕ (основное) ===
-            '_last_state': self._last_state.numpy() if hasattr(self, '_last_state') else None,
-            '_last_P': self._last_P.numpy() if hasattr(self, '_last_P') else None,
+            # === UKF СОСТОЯНИЕ (УСРЕДНЁННОЕ) ===
+            '_last_state': _last_state_val,  # СКАЛЯР (без размерности батча)
+            '_last_P': _last_P_val,          # [1, 1] (без размерности батча)
             '_state_initialized': self._state_initialized.numpy() if hasattr(self, '_state_initialized') else False,
             '_step_counter': self._step_counter.numpy() if hasattr(self, '_step_counter') else 0,
             '_last_anomaly_time': self._last_anomaly_time.numpy() if hasattr(self, '_last_anomaly_time') else -100,
-            
             # === СОСТОЯНИЕ БУФЕРА АНОМАЛИЙ ===
             'anomaly_buffer': self.anomaly_buffer.value().numpy() if hasattr(self, 'anomaly_buffer') else None,
             'buffer_index': self.buffer_index.numpy() if hasattr(self, 'buffer_index') else 0,
             'anomaly_buffer_size': getattr(self, 'anomaly_buffer_size', 100),
-            
-            # === ОБУЧАЕМЫЕ ПАРАМЕТРЫ БАЗОВЫХ ШУМОВ ===
+            # === ОБУЧАЕМЫЕ ПАРАМЕТРЫ ===
             'base_q_logit': self.base_q_logit.numpy() if hasattr(self, 'base_q_logit') else np.log(0.15),
             'base_r_logit': self.base_r_logit.numpy() if hasattr(self, 'base_r_logit') else np.log(1.8),
-            
-            # === ПАРАМЕТРЫ КОНТЕКСТНОЙ ВОЛАТИЛЬНОСТИ ===
             'volatility_sensitivity': self.volatility_sensitivity.numpy() if hasattr(self, 'volatility_sensitivity') else 1.0,
             'student_t_base_dof': self.student_t_base_dof.numpy() if hasattr(self, 'student_t_base_dof') else np.log(2.5),
             'student_t_vol_sensitivity': self.student_t_vol_sensitivity.numpy() if hasattr(self, 'student_t_vol_sensitivity') else 0.3,
-            
-            # === ПАРАМЕТРЫ АДАПТИВНОЙ ИНФЛЯЦИИ ===
             'inflation_base_factor': self.inflation_base_factor.numpy() if hasattr(self, 'inflation_base_factor') else np.log(0.05),
             'inflation_vol_sensitivity': self.inflation_vol_sensitivity.numpy() if hasattr(self, 'inflation_vol_sensitivity') else 0.2,
             'inflation_decay_rate': self.inflation_decay_rate.numpy() if hasattr(self, 'inflation_decay_rate') else 0.95,
-            
-            # === ПАРАМЕТРЫ КАЛИБРОВКИ ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ ===
             'confidence_base': self.confidence_base.numpy() if hasattr(self, 'confidence_base') else 0.90,
             'confidence_vol_sensitivity': self.confidence_vol_sensitivity.numpy() if hasattr(self, 'confidence_vol_sensitivity') else 0.1,
             'max_width_factor_logit': self.max_width_factor_logit.numpy() if hasattr(self, 'max_width_factor_logit') else np.log(1.5),
-            
             # === СОСТОЯНИЕ ДИФФЕРЕНЦИРУЕМОГО UKF ===
             'diff_ukf_state': {
-                'd_raw': self.diff_ukf_component.spec_param.d_raw.numpy() 
+                'd_raw': self.diff_ukf_component.spec_param.d_raw.numpy()
                 if self.use_diff_ukf and hasattr(self, 'diff_ukf_component') and hasattr(self.diff_ukf_component.spec_param, 'd_raw')
                 else np.log(0.1)
             },
-            
-            # === СОСТОЯНИЕ VOLATILITY REGIME SELECTOR (КРИТИЧЕСКИ ВАЖНО) ===
+            # === СОСТОЯНИЕ VOLATILITY REGIME SELECTOR ===
             'regime_selector_state': {
-                'regime_scales': self.regime_selector.regime_scales.numpy() 
+                'regime_scales': self.regime_selector.regime_scales.numpy()
                 if hasattr(self, 'regime_selector') and hasattr(self.regime_selector, 'regime_scales')
                 else np.array([2.96, 4.44, 6.16], dtype=np.float32),
-                
-                'temperature': self.regime_selector.temperature.numpy() 
+                'temperature': self.regime_selector.temperature.numpy()
                 if hasattr(self, 'regime_selector') and hasattr(self.regime_selector, 'temperature')
                 else 0.4,
-                
-                'history': self.regime_selector._vol_history.numpy() 
+                'history': self.regime_selector._vol_history.numpy()
                 if hasattr(self, 'regime_selector') and hasattr(self.regime_selector, '_vol_history')
                 else np.zeros([1, 100], dtype=np.float32),
-                
-                'center_logits': self.regime_selector.center_logits.numpy() 
+                'center_logits': self.regime_selector.center_logits.numpy()
                 if hasattr(self, 'regime_selector') and hasattr(self.regime_selector, 'center_logits') and self.regime_selector.learnable_centers
                 else np.log([0.12, 0.35, 0.75])
             },
-            
             # === СКЕЙЛЕРЫ ===
             'feature_scalers': self.feature_scalers.copy() if hasattr(self, 'feature_scalers') and self.feature_scalers is not None else None,
             'best_scalers': self.best_scalers.copy() if hasattr(self, 'best_scalers') and self.best_scalers is not None else None,
             'scale_groups': self.scale_groups.copy() if hasattr(self, 'scale_groups') and self.scale_groups is not None else None,
-            
-            # === МЕТРИКИ ТРЕКИНГА ЛУЧШИХ ВЕСОВ ===
+            # === МЕТРИКИ ТРЕКИНГА ===
             'best_val_loss': self.best_val_loss,
             'best_epoch': self.best_epoch,
             'patience_counter': self.patience_counter,
-            
-            # === ФЛАГИ КОНФИГУРАЦИИ ===
+            # === ФЛАГИ ===
             'use_diff_ukf': self.use_diff_ukf,
             'num_modes': self.num_modes,
             'state_dim': self.state_dim,
             'seq_len': self.seq_len,
-            
             # === ЭНТРОПИЙНАЯ РЕГУЛЯРИЗАЦИЯ ===
             'lambda_entropy': self.lambda_entropy.numpy() if hasattr(self, 'lambda_entropy') else 0.02,
-            
-            # === АДАПТИВНЫЙ ПОРОГ АНОМАЛИЙ ===
             'threshold_ema': self.threshold_ema.numpy() if hasattr(self, 'threshold_ema') else 3.0,
         }
-        
-        # Валидация сохранённого состояния
-        required_keys = ['lstm_weights', '_last_state', '_last_P', 'base_q_logit', 'base_r_logit', 'regime_selector_state']
-        missing_keys = [k for k in required_keys if state_dict.get(k) is None]
-        if missing_keys:
-            print(f"⚠️  Предупреждение: отсутствуют ключевые компоненты при сохранении: {missing_keys}")
-        
-        print(f"✅ Полное состояние модели сохранено в памяти")
-        print(f"   • LSTM веса: {'Да' if state_dict['lstm_weights'] is not None else 'Нет'}")
-        print(f"   • Состояние фильтра: размер _last_state={state_dict['_last_state'].shape if state_dict['_last_state'] is not None else 'N/A'}")
-        print(f"   • Regime Selector: сохранены все параметры (scales, temperature, history, centers)")
-        print(f"   • Буфер аномалий: размер={state_dict['anomaly_buffer'].shape if state_dict['anomaly_buffer'] is not None else 'N/A'}")
-        
+        print(f"✅ Полное состояние модели сохранено (усреднённое по батчу)")
+        print(f"   • _last_state: скаляр = {_last_state_val:.6f}")
+        print(f"   • _last_P: форма = {[1, 1]}")
         return state_dict
 
     def load_best_weights(self) -> bool:
@@ -4996,31 +5044,29 @@ class LSTMIMMUKF(tf.Module):
                     print(f"   ⚠️ Ошибка при загрузке LSTM весов: {str(e)}")
                     return False
             
-            # === 2. ВОССТАНОВЛЕНИЕ СОСТОЯНИЯ ФИЛЬТРА С ПРОВЕРКОЙ РАЗМЕРНОСТЕЙ ===
-            print("\n🔧 Восстановление состояния фильтра UKF...")
-            
-            # Проверка размерностей ДО восстановления
-            current_state_shape = self._last_state.shape if hasattr(self, '_last_state') else None
-            saved_state_shape = self.best_weights_dict['_last_state'].shape if self.best_weights_dict['_last_state'] is not None else None
-            
-            if current_state_shape != saved_state_shape:
-                print(f"⚠️  НЕСОВПАДЕНИЕ РАЗМЕРНОСТЕЙ:")
-                print(f"   Текущее состояние: {current_state_shape}")
-                print(f"   Сохранённое состояние: {saved_state_shape}")
-                print(f"   → Состояние НЕ будет восстановлено (риск численной нестабильности)")
-                # НЕ создаём новые значения — это нарушит логику фильтрации
-                # Вместо этого оставляем текущее состояние и продолжаем загрузку остальных параметров
+            # === 2. ВОССТАНОВЛЕНИЕ СОСТОЯНИЯ ФИЛЬТРА С УСРЕДНЕНИЕМ ===
+            print("\n🔧 Восстановление состояния фильтра UKF (скалярное)...")
+            # Восстановление _last_state как скаляра [1]
+            saved_state = self.best_weights_dict['_last_state']
+            if np.isscalar(saved_state) or (isinstance(saved_state, np.ndarray) and saved_state.shape == ()):
+                new_state = tf.constant([float(saved_state)], dtype=tf.float32)
             else:
-                try:
-                    self._last_state.assign(self.best_weights_dict['_last_state'])
-                    self._last_P.assign(self.best_weights_dict['_last_P'])
-                    self._state_initialized.assign(self.best_weights_dict['_state_initialized'])
-                    self._step_counter.assign(self.best_weights_dict['_step_counter'])
-                    self._last_anomaly_time.assign(self.best_weights_dict['_last_anomaly_time'])
-                    print("✅ Состояние фильтра восстановлено")
-                except Exception as e:
-                    print(f"   ⚠️ Ошибка при восстановлении состояния фильтра: {str(e)}")
-                    return False
+                new_state = tf.constant([np.mean(saved_state).item()], dtype=tf.float32)
+            self._last_state.assign(new_state)
+            print(f"   ✅ _last_state: восстановлен как скаляр [1] = {new_state.numpy()[0]:.6f}")
+            
+            # Восстановление _last_P как [1, 1, 1]
+            saved_P = self.best_weights_dict['_last_P']
+            if isinstance(saved_P, list):
+                saved_P = np.array(saved_P)
+            if len(saved_P.shape) == 3 and saved_P.shape[0] > 1:
+                new_P = tf.constant(np.mean(saved_P, axis=0).reshape(1, 1, 1), dtype=tf.float32)
+            elif saved_P.shape == (1, 1):
+                new_P = tf.constant(saved_P.reshape(1, 1, 1), dtype=tf.float32)
+            else:
+                new_P = tf.constant(saved_P.reshape(1, 1, 1), dtype=tf.float32)
+            self._last_P.assign(new_P)
+            print(f"   ✅ _last_P: восстановлен как [1, 1, 1]")
             
             # === 3. ВОССТАНОВЛЕНИЕ БУФЕРА АНОМАЛИЙ ===
             print("\n🔧 Восстановление состояния детектора аномалий...")
@@ -5415,8 +5461,27 @@ class LSTMIMMUKF(tf.Module):
             self._step_counter.assign(0)
         else:
             # Используем сохранённое состояние от предыдущего вызова
-            initial_state = tf.reshape(self._last_state, [B, self.state_dim])
-            initial_covariance = self._last_P
+            # ✅ ГАРАНТИРОВАННАЯ ОБРАБОТКА ФОРМЫ [1] ДЛЯ _last_state И [1, 1, 1] ДЛЯ _last_P
+            if not self._state_initialized.numpy():
+                # Инициализация при первом вызове
+                window_std = np.std(X_scaled_np[0, :min(10, self.seq_len), 0])
+                initial_variance = max(window_std ** 2, 0.05)
+                initial_variance = min(initial_variance, 0.5)
+                initial_state_val = np.mean(X_scaled_np[0, :min(5, self.seq_len), 0])
+                initial_state = tf.constant([[initial_state_val]], dtype=tf.float32)
+                initial_covariance = tf.constant([[[initial_variance]]], dtype=tf.float32)
+            else:
+                # ✅ ВСЕГДА расширяем скалярное состояние [1] → [B, 1]
+                initial_state = tf.tile(
+                    tf.reshape(self._last_state, [1, self.state_dim]),
+                    [B, 1]
+                )
+                # ✅ ВСЕГДА расширяем ковариацию [1, 1, 1] → [B, 1, 1]
+                initial_covariance = tf.tile(
+                    tf.reshape(self._last_P, [1, self.state_dim, self.state_dim]),
+                    [B, 1, 1]
+                )
+                
             initial_volatility = tf.constant([0.1], dtype=tf.float32)
         
         # === 5. ПРОГНОЗ НА СЛЕДУЮЩИЙ ШАГ ===
@@ -5959,3 +6024,4 @@ class LSTMIMMUKF(tf.Module):
         plt.savefig(filename, dpi=300, bbox_inches='tight')
         print(f"\nГрафик результатов оценки сохранен: {filename}")
         plt.show()
+        
