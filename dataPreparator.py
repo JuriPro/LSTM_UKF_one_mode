@@ -41,7 +41,7 @@ class HonestDataPreparator:
         seq_len: int = 72,
         min_history_for_features: int = 350,
         buffer_size: int = 50,
-        block_size: int = 200,
+        block_size: int = 100,
         min_windows_per_regime: int = 5,  # ← порог для валидации баланса
         seed: int = 42
     ):
@@ -599,6 +599,16 @@ class HonestDataPreparator:
                 save_path=save_path,
                 save_visualizations=True  # ← можно сделать параметром prepare_datasets если нужно гибкость
             )
+
+        # === ШАГ 4.6: ТЕКСТОВЫЕ ГИСТОГРАММЫ РАСПРЕДЕЛЕНИЯ 'level' ===
+        if save_path is not None:
+            self._save_text_histograms(
+                train_data=train_data,
+                val_data=val_data,
+                test_data=test_data,
+                save_path=save_path,
+                save_histograms=True
+            )            
         
         # ШАГ 5: Масштабирование
         print("\n📏 ШАГ 4: Масштабирование признаков (каузальный подход)...")
@@ -1064,4 +1074,140 @@ class HonestDataPreparator:
             warnings.warn(
                 f"⚠️  Не удалось сохранить визуализации 'level': {str(e)}\n"
                 f"   Продолжаем подготовку данных без графиков."
+            )
+
+    def _save_text_histograms(
+        self,
+        train_data: Dict,
+        val_data: Dict,
+        test_data: Dict,
+        save_path: str,
+        save_histograms: bool = True
+    ):
+        """
+        Сохранение текстовых гистограмм и статистики переменной 'level' для всех сплитов.
+        Вызывается ОДИН раз при первоначальной подготовке данных.
+        
+        Файл сохраняется в ту же директорию, что и .pkl кэш:
+            {save_path}_histograms.txt
+        """
+        if not save_histograms:
+            return
+        
+        try:
+            # Определяем путь для сохранения (без расширения)
+            hist_path = save_path if not save_path.endswith('.pkl') else save_path[:-4]
+            hist_file = f"{hist_path}_histograms.txt"
+            
+            # Создаём директорию если её нет
+            hist_dir = os.path.dirname(hist_path) or '.'
+            os.makedirs(hist_dir, exist_ok=True)
+            
+            print(f"\n📊 Сохранение текстовых гистограмм 'level' в: {hist_file}")
+            
+            with open(hist_file, 'w', encoding='utf-8') as f:
+                # Заголовок
+                f.write("=" * 80 + "\n")
+                f.write("ТЕКСТОВЫЕ ГИСТОГРАММЫ И СТАТИСТИКА ПЕРЕМЕННОЙ 'level'\n")
+                f.write("=" * 80 + "\n")
+                f.write(f"Сгенерировано: {datetime.datetime.now()}\n")
+                f.write(f"Параметры подготовки:\n")
+                f.write(f"  • seq_len: {self.seq_len}\n")
+                f.write(f"  • buffer_size: {self.buffer_size}\n")
+                f.write(f"  • block_size: {self.block_size}\n")
+                f.write("=" * 80 + "\n\n")
+                
+                # Обработка каждого сплита
+                for split_name, split_data, color_code in [
+                    ('TRAIN', train_data, '🟢'),
+                    ('VAL', val_data, '🔵'),
+                    ('TEST', test_data, '🔴')
+                ]:
+                    if split_data['n_samples'] == 0:
+                        continue
+                    
+                    data = split_data['y_target']
+                    n_samples = split_data['n_samples']
+                    
+                    # === СТАТИСТИКА ===
+                    f.write(f"{color_code} СПЛИТ: {split_name} (n={n_samples} образцов)\n")
+                    f.write("-" * 80 + "\n")
+                    f.write("Статистика:\n")
+                    f.write(f"  • Среднее:    {np.mean(data):.6f}\n")
+                    f.write(f"  • Медиана:    {np.median(data):.6f}\n")
+                    f.write(f"  • Стандартное отклонение: {np.std(data):.6f}\n")
+                    f.write(f"  • Минимум:    {np.min(data):.6f}\n")
+                    f.write(f"  • Максимум:   {np.max(data):.6f}\n")
+                    f.write(f"  • Персентили: P10={np.percentile(data, 10):.6f} | "
+                            f"P25={np.percentile(data, 25):.6f} | "
+                            f"P75={np.percentile(data, 75):.6f} | "
+                            f"P90={np.percentile(data, 90):.6f}\n")
+                    f.write("\n")
+                    
+                    # === ГИСТОГРАММА ===
+                    f.write("Гистограмма распределения 'level' (20 бинов):\n")
+                    f.write("Диапазон значений        : Количество  : Нормализовано (%)\n")
+                    f.write("-" * 80 + "\n")
+                    
+                    hist, edges = np.histogram(data, bins=20)
+                    max_count = np.max(hist)
+                    
+                    for i, count in enumerate(hist):
+                        # Нормализованный процент для визуального отображения
+                        norm_pct = (count / max_count) * 100 if max_count > 0 else 0
+                        bar = "█" * int(norm_pct / 5)  # Простая текстовая полоса
+                        
+                        f.write(
+                            f"{edges[i]:>12.4f} — {edges[i+1]:<12.4f} : "
+                            f"{count:>8d}   : {count/n_samples*100:>6.2f}% {bar}\n"
+                        )
+                    
+                    f.write("-" * 80 + "\n\n")
+                
+                # === СРАВНЕНИЕ СПЛИТОВ ===
+                f.write("=" * 80 + "\n")
+                f.write("СРАВНЕНИЕ РАСПРЕДЕЛЕНИЙ МЕЖДУ СПЛИТАМИ\n")
+                f.write("=" * 80 + "\n")
+                
+                splits = [
+                    ('TRAIN', train_data['y_target']),
+                    ('VAL', val_data['y_target']),
+                    ('TEST', test_data['y_target'])
+                ]
+                
+                # KS-тест для количественной оценки различий
+                from scipy import stats
+                
+                f.write("\nКритерий Колмогорова-Смирнова (мера различия распределений):\n")
+                f.write("  Значение < 0.1: распределения очень похожи\n")
+                f.write("  Значение 0.1-0.3: умеренные различия\n")
+                f.write("  Значение > 0.3: существенные различия\n")
+                f.write("-" * 80 + "\n")
+                
+                for i in range(len(splits)):
+                    for j in range(i + 1, len(splits)):
+                        name1, data1 = splits[i]
+                        name2, data2 = splits[j]
+                        ks_stat, p_value = stats.ks_2samp(data1, data2)
+                        f.write(f"{name1:5s} vs {name2:5s} : KS = {ks_stat:.4f} | p-value = {p_value:.4f}\n")
+                
+                f.write("\n" + "=" * 80 + "\n")
+                f.write("КОММЕНТАРИЙ ДЛЯ АНАЛИТИКА:\n")
+                f.write("=" * 80 + "\n")
+                f.write("• Небольшие различия между сплитами — норма для временных рядов (тренды, сезонность).\n")
+                f.write("• Существенные различия (>0.3 по KS) могут указывать на:\n")
+                f.write("  - Недостаточный размер датасета для стабильной стратификации\n")
+                f.write("  - Резкие структурные изменения в данных (кризисы, смена режима рынка)\n")
+                f.write("  - Слишком большой block_size (рекомендуется уменьшить до 100-150)\n")
+                f.write("=" * 80 + "\n")
+            
+            print(f"   ✅ Текстовые гистограммы сохранены: {hist_file}")
+            print(f"   💡 Откройте файл в любом текстовом редакторе для анализа распределений")
+        
+        except Exception as e:
+            import traceback
+            warnings.warn(
+                f"⚠️  Не удалось сохранить текстовые гистограммы: {str(e)}\n"
+                f"   Трассировка: {traceback.format_exc()}\n"
+                f"   Продолжаем подготовку данных без гистограмм."
             )
