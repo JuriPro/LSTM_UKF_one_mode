@@ -953,6 +953,100 @@ class LSTMIMMUKF(tf.Module):
             'velocity', 'acceleration', 'rel_vol_short_long', 'vol_accel_rel', 'rel_entropy'
         ]
 
+    def prepare_honest_datasets(
+        self,
+        full_df: Optional[pd.DataFrame] = None,
+        cache_path: str = './cache/honest_prepared',  # ← Путь БЕЗ расширения .pkl
+        train_ratio: float = 0.60,
+        val_ratio: float = 0.20,
+        force_recompute: bool = False,
+        n_jobs: int = -1,
+        buffer_size: int = 50,
+        block_size: int = 200  # ← Добавлен параметр для согласованности с HonestDataPreparator
+    ) -> Tuple[Dict, Dict, Dict]:
+        """
+        УМНЫЙ ИНТЕРФЕЙС: автоматически проверяет кэш и загружает/готовит данные.
+        
+        Важно: все пути передаются БЕЗ расширения .pkl — оно добавляется автоматически.
+        
+        Возвращает:
+            (train_data, val_data, test_data) — словари с ключами:
+            'X_seq_scaled', 'y_filter', 'y_target_scaled', 'timestamps', 'regime_labels'
+        """
+        import os
+        from dataPreparator import HonestDataPreparator
+        
+        # === ШАГ 1: КОРРЕКТНАЯ ПРОВЕРКА КЭША (с расширением .pkl) ===
+        cache_file_with_ext = f"{cache_path}.pkl"  # ← КРИТИЧЕСКИ ВАЖНО: проверяем именно .pkl файл
+        
+        if not force_recompute and os.path.exists(cache_file_with_ext):
+            print(f"📥 Кэш найден: {cache_file_with_ext}")
+            print("   Загружаем предварительно обработанные данные...")
+            
+            preparator = HonestDataPreparator(
+                model=self,
+                seq_len=self.seq_len,
+                min_history_for_features=self.min_history_for_features,
+                buffer_size=buffer_size,
+                block_size=block_size,  # ← Согласованность параметров
+                seed=42
+            )
+            # Передаём путь БЕЗ расширения — метод сам обработает оба варианта
+            train_data, val_data, test_data = preparator.load_prepared_datasets(cache_path)
+            
+            # Сохраняем для внутреннего использования в fit()
+            self._honest_preparation = {
+                'train_data': train_data,
+                'val_data': val_data,
+                'test_data': test_data,
+                'preparator': preparator,
+                'cache_path': cache_path
+            }
+            
+            print(f"✅ Данные успешно загружены из кэша: {cache_file_with_ext}")
+            return train_data, val_data, test_data
+        
+        # === ШАГ 2: ВАЛИДАЦИЯ ВХОДНЫХ ДАННЫХ ===
+        if full_df is None:
+            raise ValueError(
+                "full_df обязателен при первом запуске (когда кэш не существует). "
+                "При загрузке из кэша передайте только cache_path."
+            )
+        
+        # === ШАГ 3: ПОЛНАЯ ПОДГОТОВКА ===
+        print(f"⚠️  Кэш не найден или требуется пересчёт: {cache_file_with_ext}")
+        print("   Запускаем полную честную подготовку данных (без утечки будущего)...")
+        
+        preparator = HonestDataPreparator(
+            model=self,
+            seq_len=self.seq_len,
+            min_history_for_features=self.min_history_for_features,
+            buffer_size=buffer_size,
+            block_size=block_size,  # ← Согласованность параметров
+            seed=42
+        )
+        
+        train_data, val_data, test_data = preparator.prepare_datasets(
+            df=full_df,
+            save_path=cache_path,  # ← БЕЗ расширения — метод сам добавит .pkl
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            n_jobs=n_jobs,
+            force_recompute=force_recompute
+        )
+        
+        # Сохраняем для внутреннего использования
+        self._honest_preparation = {
+            'train_data': train_data,
+            'val_data': val_data,
+            'test_data': test_data,
+            'preparator': preparator,
+            'cache_path': cache_path
+        }
+        
+        print(f"✅ Данные подготовлены и сохранены в кэш: {cache_file_with_ext}")
+        return train_data, val_data, test_data
+        
     def _build_model(self, input_shape: Tuple[int, int], training: bool = True) -> tf.keras.Model:
         """Архитектура LSTM с расширенным выходом для декомпозиции параметров"""
         l2_reg = tf.keras.regularizers.l2(5e-4)
@@ -3191,495 +3285,6 @@ class LSTMIMMUKF(tf.Module):
                 progress = tf.minimum(1.0, (epoch - warmupepochs) / (totalepochs - warmupepochs))
                 return minlr + 0.5 * (baselr - minlr) * (1.0 + math.cos(math.pi * progress))
 
-    def _stratified_split(self,
-                         df_with_features,
-                         stratify_col='level',
-                         volatility_col='log_vol_short',
-                         train_ratio=0.70,
-                         val_ratio=0.15,
-                         window_size=400,
-                         seed=42):
-        """
-        ✅ V3: ЛУЧШИЙ ПОДХОД - Окна с балансировкой режимов
-
-        Алгоритм:
-        1. Разбить ВЕСЬ датасет на окна (в исходном порядке)
-        2. Для каждого окна вычислить его режим (по среднему vol)
-        3. Раздать окна каждого режима пропорционально train/val/test
-        4. Одновременно сбалансировать по режимам (LOW/MID/HIGH)
-
-        Преимущества:
-        - Простая логика, без граничных случаев
-        - Гарантированное распределение (Train > 0, Val > 0, Test > 0)
-        - Отличная балансировка режимов в каждом сплите
-        - Сохранение временного порядка
-
-        Args:
-            df_with_features: DataFrame с рассчитанными фичами
-            stratify_col: колонка для проверки распределения ('level')
-            volatility_col: колонка для определения режимов ('log_vol_short')
-            train_ratio: доля для обучения (0.70 = 70%)
-            val_ratio: доля для валидации (0.15 = 15%)
-            window_size: размер окна для разбиения (400)
-            seed: случайное зерно (42)
-
-        Returns:
-            (train_df, val_df, test_df)
-        """
-
-        np.random.seed(seed)
-
-        # === ПАРАМЕТРЫ ===
-        test_ratio = 1.0 - train_ratio - val_ratio
-        regime_names = {0: 'LOW', 1: 'MID', 2: 'HIGH'}
-
-        print(f"\n" + "="*80)
-        print(f"📊 СТРАТИФИЦИРОВАННОЕ РАЗДЕЛЕНИЕ V3 (ОКНА С БАЛАНСИРОВКОЙ РЕЖИМОВ)")
-        print(f"="*80)
-        print(f"\n🎯 ЦЕЛЕВОЕ РАЗДЕЛЕНИЕ:")
-        print(f"   Train: {100*train_ratio:.1f}%")
-        print(f"   Val:   {100*val_ratio:.1f}%")
-        print(f"   Test:  {100*test_ratio:.1f}%")
-
-        # === ПОДГОТОВКА ===
-        df = df_with_features.copy()
-        df_clean = df.dropna()
-
-        print(f"\n🧹 Датасет: {len(df)} → {len(df_clean)} примеров (после dropna)")
-
-        # === ШАГ 1: РАЗБИТЬ ВЕСЬ ДАТАСЕТ НА ОКНА ===
-        # Окна идут в исходном порядке - сохраняем временные зависимости!
-
-        print(f"\n🪟 ШАГ 1: РАЗБИЕНИЕ НА ОКНА")
-        print(f"   Размер окна: {window_size} примеров")
-
-        windows_data = []  # List[{'indices': [...], 'regime': int, 'mean_vol': float, 'size': int}]
-
-        # Получить квантили волатильности один раз
-        vol_q33 = df_clean[volatility_col].quantile(0.33)
-        vol_q67 = df_clean[volatility_col].quantile(0.67)
-
-        # ✅ Функция для классификации режима (определи один раз)
-        def classify_regime_vol(vol):
-            """Классифицировать волатильность в режим"""
-            if vol < vol_q33:
-                return 0  # LOW
-            elif vol < vol_q67:
-                return 1  # MID
-            else:
-                return 2  # HIGH
-
-        for i in range(0, len(df_clean), window_size):
-            # Индексы окна в исходном датасете
-            window_indices = df_clean.index[i:i + window_size].tolist()
-
-            # Определить режим окна (по среднему волатильности в окне)
-            window_vol = df_clean.loc[window_indices, volatility_col]
-            mean_vol = window_vol.mean()
-            regime = classify_regime_vol(mean_vol)
-
-            windows_data.append({
-                'indices': window_indices,
-                'regime': regime,
-                'mean_vol': mean_vol,
-                'size': len(window_indices)
-            })
-
-        print(f"   ✅ Создано {len(windows_data)} окон")
-
-        # === ШАГ 2: СОРТИРОВАТЬ ОКНА ПО РЕЖИМУ (для информации) ===
-
-        print(f"\n🎚️ ШАГ 2: РАСПРЕДЕЛЕНИЕ ОКОН ПО РЕЖИМАМ")
-
-        windows_by_regime = {0: [], 1: [], 2: []}
-
-        for w in windows_data:
-            windows_by_regime[w['regime']].append(w)
-
-        for regime_id in [0, 1, 2]:
-            regime_windows = windows_by_regime[regime_id]
-            n_windows = len(regime_windows)
-            total_size = sum(w['size'] for w in regime_windows)
-            pct = 100 * total_size / len(df_clean)
-            print(f"   {regime_names[regime_id]:6s}: {n_windows:3d} окон ({total_size:5d} примеров, {pct:5.1f}%)")
-
-        # === ШАГ 3: РАЗДАТЬ ОКНА ПРОПОРЦИОНАЛЬНО ===
-        # ✅ КОМПРОМИСС: Режимная балансировка с гарантией min 1 окна в каждом сплите
-
-        print(f"\n📋 ШАГ 3: РАЗДАЧА ОКОН ПО СПЛИТАМ")
-
-        train_indices = []
-        val_indices = []
-        test_indices = []
-
-        # Раздаём КАЖДЫЙ РЕЖИМ пропорционально
-        for regime_id in [0, 1, 2]:
-            regime_windows = windows_by_regime[regime_id]
-            n_windows = len(regime_windows)
-
-            if n_windows == 0:
-                continue
-
-            # ✅ КОМПРОМИССНЫЙ РАСЧЁТ:
-            # - Стараемся придерживаться пропорций
-            # - Но гарантируем min 1 в каждом сплите
-
-            if n_windows >= 3:
-                n_train = max(1, int(np.round(n_windows * train_ratio)))
-                n_val = max(1, int(np.round(n_windows * val_ratio)))
-                n_test = max(1, n_windows - n_train - n_val)
-            else:
-                # Для маленьких режимов раздел поровну
-                n_train = 1
-                n_val = 1 if n_windows > 2 else 0
-                n_test = n_windows - n_train - (1 if n_windows > 2 else 0)
-
-            # Раздать окна этого режима
-            for j, window in enumerate(regime_windows):
-                if j < n_train:
-                    train_indices.extend(window['indices'])
-                elif j < n_train + n_val:
-                    val_indices.extend(window['indices'])
-                else:
-                    test_indices.extend(window['indices'])
-
-            # Правильный расчёт размеров
-            train_size = sum(regime_windows[j]['size'] for j in range(n_train))
-            val_size = sum(regime_windows[j]['size'] for j in range(n_train, n_train + n_val))
-            test_size = sum(regime_windows[j]['size'] for j in range(n_train + n_val, n_windows))
-
-            print(f"   {regime_names[regime_id]:6s}: Train {n_train} окон ({train_size:4d} примеров) | "
-                  f"Val {n_val} окон ({val_size:4d} примеров) | "
-                  f"Test {n_test} окон ({test_size:4d} примеров)")
-
-        # === ШАГ 4: ВЕРНУТЬСЯ К ИСХОДНОМУ ПОРЯДКУ ===
-        # Важно для сохранения временных зависимостей!
-
-        train_indices = sorted(train_indices)
-        val_indices = sorted(val_indices)
-        test_indices = sorted(test_indices)
-
-        # === СОЗДАТЬ ФИНАЛЬНЫЕ СПЛИТЫ ===
-
-        train_df = df.loc[train_indices].reset_index(drop=True)
-        val_df = df.loc[val_indices].reset_index(drop=True)
-        test_df = df.loc[test_indices].reset_index(drop=True)
-
-        # === ФИНАЛЬНАЯ ПРОВЕРКА И СТАТИСТИКА ===
-
-        total = len(train_df) + len(val_df) + len(test_df)
-
-        print(f"\n" + "="*80)
-        print(f"✅ РАЗДЕЛЕНИЕ ЗАВЕРШЕНО")
-        print(f"="*80)
-
-        if total > 0:
-            train_pct = 100 * len(train_df) / total
-            val_pct = 100 * len(val_df) / total
-            test_pct = 100 * len(test_df) / total
-
-            # Проверка на близость к целевым значениям (допуск 3%)
-            train_ok = abs(train_pct - 100*train_ratio) < 3
-            val_ok = abs(val_pct - 100*val_ratio) < 3
-            test_ok = abs(test_pct - 100*test_ratio) < 3
-
-            print(f"\n📊 ФИНАЛЬНОЕ РАСПРЕДЕЛЕНИЕ:")
-            print(f"   Train: {len(train_df):5d} ({train_pct:5.1f}%) [target: {100*train_ratio:5.1f}%] {'✅' if train_ok else '⚠️'}")
-            print(f"   Val:   {len(val_df):5d} ({val_pct:5.1f}%) [target: {100*val_ratio:5.1f}%] {'✅' if val_ok else '⚠️'}")
-            print(f"   Test:  {len(test_df):5d} ({test_pct:5.1f}%) [target: {100*test_ratio:5.1f}%] {'✅' if test_ok else '⚠️'}")
-            print(f"   Total: {total:5d}")
-
-            # === ПРОВЕРКА РАСПРЕДЕЛЕНИЯ ЦЕЛЕВОЙ ПЕРЕМЕННОЙ ===
-
-            print(f"\n📈 РАСПРЕДЕЛЕНИЕ {stratify_col}:")
-            print(f"-" * 80)
-
-            stats_list = []
-            for split_name, split_df in [('Train', train_df), ('Val', val_df), ('Test', test_df)]:
-                if len(split_df) > 0:
-                    col_data = split_df[stratify_col]
-                    mean = col_data.mean()
-                    std = col_data.std()
-                    min_val = col_data.min()
-                    max_val = col_data.max()
-                    q25 = col_data.quantile(0.25)
-                    q75 = col_data.quantile(0.75)
-
-                    stats_list.append(mean)
-
-                    print(f"{split_name:<8}: mean={mean:8.2f}, std={std:8.2f}, "
-                          f"q25={q25:8.2f}, q75={q75:8.2f}, "
-                          f"range=[{min_val:8.2f}, {max_val:8.2f}]")
-
-            # Проверка сбалансированности mean
-            if len(stats_list) >= 2:
-                mean_std = np.std(stats_list)
-                overall_std = np.mean([train_df[stratify_col].std(),
-                                       val_df[stratify_col].std() if len(val_df) > 0 else 0,
-                                       test_df[stratify_col].std() if len(test_df) > 0 else 0])
-                if overall_std > 0:
-                    mean_std_pct = 100 * mean_std / overall_std
-                else:
-                    mean_std_pct = 0
-
-                if mean_std_pct < 10:
-                    status = "✅ ОТЛИЧНО"
-                elif mean_std_pct < 20:
-                    status = "✅ ХОРОШО"
-                else:
-                    status = "⚠️ ТРЕБУЕТ ВНИМАНИЯ"
-
-                print(f"   → Std средних: {mean_std:.2f} ({mean_std_pct:.1f}%) {status}")
-
-            # === ПРОВЕРКА РАСПРЕДЕЛЕНИЯ РЕЖИМОВ ===
-
-            print(f"\n🎚️ РАСПРЕДЕЛЕНИЕ РЕЖИМОВ:")
-            print(f"-" * 80)
-
-            # ✅ Переопредели функцию для гарантии области видимости
-            def classify_regime_final(vol):
-                if vol < vol_q33:
-                    return 0
-                elif vol < vol_q67:
-                    return 1
-                else:
-                    return 2
-
-            for split_name, split_df in [('Train', train_df), ('Val', val_df), ('Test', test_df)]:
-                if len(split_df) > 0:
-                    split_clean = split_df.dropna()
-
-                    split_clean_copy = split_clean.copy()
-                    split_clean_copy['regime_check'] = split_clean_copy[volatility_col].apply(classify_regime_final)  # ← Используй эту
-
-                    regime_dist = split_clean_copy['regime_check'].value_counts(normalize=True).sort_index() * 100
-
-                    low_pct = regime_dist.get(0, 0)
-                    mid_pct = regime_dist.get(1, 0)
-                    high_pct = regime_dist.get(2, 0)
-
-                    print(f"{split_name:<8}: LOW={low_pct:5.1f}%, MID={mid_pct:5.1f}%, HIGH={high_pct:5.1f}%")
-
-        print(f"="*80 + "\n")
-
-        # === ВИЗУАЛИЗАЦИЯ ДАТАСЕТОВ ===
-        # Первый график
-        plt.figure()  # создаем новую фигуру
-        train_df.level.plot(title='train_df')
-        plt.savefig('train_df.png')
-        plt.close()  # закрываем текущую фигуру
-
-        # Второй график
-        plt.figure()  # создаем новую фигуру
-        val_df.level.plot(title='val_df')
-        plt.savefig('val_df.png')
-        plt.close()  # закрываем текущую фигуру
-
-        # Третий график
-        plt.figure()  # создаем новую фигуру
-        test_df.level.plot(title='test_df')
-        plt.savefig('test_df.png')
-        plt.close()  # закрываем текущую фигуру
-
-        return train_df, val_df, test_df
-
-    def _prepare_datasets(self, train_df, val_df, test_df):
-        """Оптимизированная подготовка датасетов для максимальной загрузки GPU"""
-        print("\n" + "=" * 80)
-        print("🔧 ОПТИМИЗИРОВАННАЯ ПОДГОТОВКА ДАТАСЕТОВ ДЛЯ МАКСИМАЛЬНОЙ ЗАГРУЗКИ GPU")
-        print("=" * 80)
-
-        full_df = pd.concat([train_df, val_df, test_df], ignore_index=True)
-        print(f"✅ Объединены train ({len(train_df)}) + val ({len(val_df)}) "
-                      f"+ test ({len(test_df)})")
-
-        print(f"📊 Полный датасет: {len(full_df)} примеров")
-
-        df_with_features = self.prepare_features(full_df, mode='batch')
-        print(f"✅ Фичи рассчитаны: {df_with_features.shape[1]} колонок")
-
-        print("\n🔄 ЭТАП 2: Стратифицированное разделение...")
-        print("-" * 80)
-
-        train_features, val_features, test_features = self._stratified_split(
-            df_with_features,
-            stratify_col='level',
-            volatility_col='log_vol_short',
-            train_ratio=0.60,
-            val_ratio=0.2,
-            seed=42
-        )
-
-        print(f"✅ Разделение завершено:")
-        print(f"   Train: {len(train_features)}")
-        print(f"   Val:   {len(val_features)}")
-        print(f"   Test:  {len(test_features)}")
-
-        # === 2. ГРУППИРОВКА ПРИЗНАКОВ ДЛЯ МАСШТАБИРОВАНИЯ ===
-        self.scale_groups = {
-            'robust': ['level', 'velocity', 'acceleration', 'energy', 'st_comp_diff',
-                       'extreme_pos_momentum', 'tail_weight_indicator', 'log_vol_short',
-                       'rel_vol_short_long', 'vol_accel_rel', 'rel_entropy'],
-            'standard': ['log_vol', 'amplitude', 'yz', 'gc', 'p', 'rs', 'ht'],
-            'minmax': ['percentile_pos'],
-            'none': ['asymmetry_ratio', 'percentile_pos_fisher', 'skew']
-        }
-
-        # Добавление пропущенных признаков в 'robust' группу
-        all_grouped = {f for group in self.scale_groups.values() for f in group}
-        missing = [f for f in self.feature_columns if f not in all_grouped]
-        if missing:
-            print(f"⚠️  Добавление пропущенных признаков в 'robust': {missing}")
-            self.scale_groups['robust'].extend(missing)
-
-        # === 3. ИНИЦИАЛИЗАЦИЯ И ОБУЧЕНИЕ СКЕЙЛЕРОВ ===
-        print("\n📊 Инициализация и обучение скейлеров на CPU...")
-        self.feature_scalers = {
-            'robust': RobustScaler(quantile_range=(5, 95)),
-            'standard': StandardScaler(),
-            'minmax': MinMaxScaler(feature_range=(0, 1)),
-            'none': None,
-            'Y': PowerTransformer(method='yeo-johnson', standardize=True)
-        }
-
-        # Обучение скейлеров признаков
-        for group_name, features in self.scale_groups.items():
-            if self.feature_scalers.get(group_name) is not None:
-                valid_features = [f for f in features if f in train_features.columns]
-                if valid_features:
-                    self.feature_scalers[group_name].fit(train_features[valid_features].values)
-                    print(f"✅ {group_name} скейлер обучен на {len(valid_features)} признаках")
-
-        # Обучение скейлера целевой переменной
-        self.feature_scalers['Y'].fit(train_features[['level']].values)
-        print("✅ Скейлер 'Y' обучен на целевой переменной 'level'")
-
-        # === 4. МАСШТАБИРОВАНИЕ И СОЗДАНИЕ ПОСЛЕДОВАТЕЛЬНОСТЕЙ ===
-        print("\n🔄 Масштабирование данных и создание последовательностей...")
-        datasets = {}
-        for name, (features, y_level_orig) in [('train', (train_features, train_features['level'].values)),
-                                               ('val', (val_features, val_features['level'].values))]:
-            # Масштабирование признаков
-            X_scaled = self._scale_features(features)
-            # Масштабирование целевой переменной
-            y_scaled = self.feature_scalers['Y'].transform(y_level_orig.reshape(-1, 1)).flatten().astype(np.float32)
-            # Создание последовательностей
-            X_seq, y_target = self._create_sequences(X_scaled.values, y_scaled)
-            y_for_filtering = np.array([y_scaled[i:i+self.seq_len] for i in range(len(X_seq))], dtype=np.float32)
-
-            datasets[name] = (X_seq, y_for_filtering, y_target)
-
-            if name == 'train':
-                print(f"   ✅ Обучающие последовательности: X={X_seq.shape}, y_filter={y_for_filtering.shape}, y_target={y_target.shape}")
-            else:
-                print(f"   ✅ Валидационные последовательности: X={X_seq.shape}, y_filter={y_for_filtering.shape}, y_target={y_target.shape}")
-
-        # === 5. СОЗДАНИЕ TF.DATA PIPELINE ===
-        print("\n⚡ Настройка tf.data pipeline с оптимальным prefetch и batching...")
-
-        def preprocess_batch(X, y_filt, y_tgt):
-            return (
-                tf.cast(X, tf.float32),
-                tf.cast(y_filt, tf.float32),
-                tf.cast(y_tgt, tf.float32)
-            )
-
-        # Автоматический подбор batch_size
-        batch_size = 64
-        gpus = tf.config.list_physical_devices('GPU')
-        if gpus:
-            print(f"✅ Обнаружено GPU: {len(gpus)}")
-            try:
-                gpu_details = tf.config.experimental.get_device_details(gpus[0])
-                if hasattr(gpu_details, 'memory_limit'):
-                    memory_limit = gpu_details['memory_limit']
-                    batch_size = min(128, max(32, memory_limit // (1024 * 1024 * 2)))
-            except Exception:
-                pass
-
-        print(f"   📦 Batch size: {batch_size}")
-
-        # Создание датасетов
-        train_ds = tf.data.Dataset.from_tensor_slices(datasets['train'])
-        val_ds = tf.data.Dataset.from_tensor_slices(datasets['val'])
-
-        for ds_name, ds in [('train', train_ds), ('val', val_ds)]:
-            ds = ds.map(preprocess_batch, num_parallel_calls=tf.data.AUTOTUNE)
-            ds = ds.batch(batch_size, drop_remainder=True)
-            ds = ds.prefetch(tf.data.AUTOTUNE)
-            if ds_name == 'train':
-                train_ds = ds
-            else:
-                val_ds = ds
-
-        print(f"✅ Обучающий датасет: {len(train_ds)} батчей")
-        print(f"✅ Валидационный датасет: {len(val_ds)} батчей")
-
-        # Кэширование валидации в памяти
-        print("\n💾 Кэширование валидационного набора...")
-        val_ds = val_ds.cache()
-
-        print("\n" + "=" * 80)
-        print("✅ ОПТИМИЗИРОВАННАЯ ПОДГОТОВКА ДАТАСЕТОВ ЗАВЕРШЕНА")
-        print("=" * 80)
-
-        return train_ds, val_ds
-
-    def _create_sequences(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        n_samples = len(X) - self.seq_len
-
-        # ✅ ПРАВИЛЬНО: y СДВИНУТА на forecast_horizon=1 timesteps в будущее!
-        X_seq = np.array([X[i:i + self.seq_len] for i in range(n_samples)], dtype=np.float32)
-        # Вариант B: предсказываем только один шаг вперед (скалярное значение)
-        y_seq = np.array([y[i + self.seq_len] for i in range(n_samples)], dtype=np.float32)
-
-        return X_seq, y_seq
-
-    def _scale_features(self, features_df):
-        """✅ ОПТИМАЛЬНАЯ ВЕРСИЯ: Применение скейлеров с сохранением группировки"""
-        scaled_df = pd.DataFrame(index=features_df.index)
-
-        # ✅ ГРУППИРОВКА ИСПОЛЬЗУЕТСЯ ЗДЕСЬ ДЛЯ ПРИМЕНЕНИЯ
-        # 1. Признаки для RobustScaler
-        for group_name, features in self.scale_groups.items():
-            if group_name in self.feature_scalers and self.feature_scalers[group_name] is not None:
-                valid_features = [f for f in features if f in features_df.columns]
-                if valid_features:
-                    scaled_values = self.feature_scalers[group_name].transform(features_df[valid_features].values)
-                    for i, col in enumerate(valid_features):
-                        scaled_df[col] = scaled_values[:, i]
-                    # print(f"  ✅ {group_name} скейлер применен к {len(valid_features)} признакам")
-
-        # 2. Признаки без масштабирования
-        if 'none' in self.scale_groups:
-            for col in self.scale_groups['none']:
-                if col in features_df.columns:
-                    scaled_df[col] = features_df[col].values
-                    # Численная стабильность
-                    if col == 'asymmetry_ratio':
-                        scaled_df[col] = np.clip(scaled_df[col], 0.1, 3.0)
-                    elif col == 'percentile_pos_fisher':
-                        scaled_df[col] = np.clip(scaled_df[col], -5.0, 5.0)
-                    # print(f"  ✅ {col}: семантика сохранена (без масштабирования)")
-
-        # 3. Обработка пропущенных признаков
-        missing_cols = [col for col in self.feature_columns if col not in scaled_df.columns]
-        if missing_cols:
-            print(f"  ⚠️ Найдены нераспределенные признаки: {', '.join(missing_cols)}")
-            for col in missing_cols:
-                if col in features_df.columns:
-                    # Стратегия по умолчанию - RobustScaler
-                    if 'robust' in self.feature_scalers and self.feature_scalers['robust'] is not None:
-                        scaled_df[col] = self.feature_scalers['robust'].transform(features_df[[col]].values)[:, 0]
-                    else:
-                        scaled_df[col] = features_df[col].values
-
-        # 4. Обработка ошибок
-        scaled_df = scaled_df.replace([np.inf, -np.inf], np.nan)
-        scaled_df = scaled_df.fillna(0.0)
-
-        return scaled_df
-
     def prepare_features(self, df: pd.DataFrame, mode='batch', include_ground_truth=False) -> pd.DataFrame:
         """
         Подготовка признаков с фокусом на многошкальные оценки волатильности
@@ -3946,23 +3551,40 @@ class LSTMIMMUKF(tf.Module):
 
         return features_df.astype(np.float32)
 
-    def fit(self, train_features, val_features, test_features, epochs=50, min_epochs=5,
+    def fit(self, train_features, val_features, epochs=50, min_epochs=5,
             patience=15, save_best_weights=True, early_stopping=True, log_dir=None):
         """Оптимизированный метод обучения для адаптивной UKF с контекстной волатильностью"""
         print("=" * 80)
         print("🚀 ОБУЧЕНИЕ LSTM-АДАПТИВНОЙ UKF МОДЕЛИ С КОНТЕКСТНОЙ ВОЛАТИЛЬНОСТЬЮ")
         print("=" * 80)
-
+        
         # 0. Сброс отслеживания лучших весов
         self.reset_best_weights_tracking()
         print("🔄 Отслеживание лучших весов сброшено")
-
-        # 1. Подготовка датасетов
+        
+        # 1. ПОДГОТОВКА ДАТАСЕТОВ — УМНАЯ ЛОГИКА С АВТОМАТИЧЕСКИМ КЭШИРОВАНИЕМ
         print("\n📊 Подготовка оптимизированных датасетов...")
-        train_ds, val_ds = self._prepare_datasets(train_features, val_features, test_features)
-        log_interval = max(1, len(train_ds) // 10)  # логируем ~10 раз за эпоху
+        
+        # === КЛЮЧЕВАЯ ПРОВЕРКА: есть ли честно подготовленные данные? ===
+        if hasattr(self, '_honest_preparation') and self._honest_preparation is not None:
+            # Используем предварительно обработанные данные БЕЗ утечки будущего
+            train_data = self._honest_preparation['train_data']
+            val_data = self._honest_preparation['val_data']
+            preparator = self._honest_preparation.get('preparator')
+            
+            if preparator is not None:
+                # Создаём оптимизированные tf.data.Dataset напрямую
+                train_ds, val_ds = preparator.create_tf_datasets(train_data, val_data, batch_size=64)
+        else:
+            raise RuntimeError(
+                "❌ Устаревшая логика подготовки данных (_prepare_datasets) УДАЛЕНА из-за утечки будущего!\n"
+                "Используйте:\n"
+                " train_data, val_data, test_data = model.prepare_or_load_honest_datasets(full_df, './cache/my_data')\n"
+                "   model.fit_from_prepared(train_data, val_data, test_data, epochs=50)\n"
+            )
+        
+        log_interval = max(1, len(train_ds) // 10)
         print("✅ Оптимизированные датасеты успешно подготовлены")
-
         # 2. Инициализация модели на GPU
         print("\n🔧 Инициализация LSTM модели на GPU...")
         for X_batch, y_for_filtering_batch, y_target_batch in train_ds.take(1):
