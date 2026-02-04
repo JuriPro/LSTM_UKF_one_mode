@@ -3551,6 +3551,93 @@ class LSTMIMMUKF(tf.Module):
 
         return features_df.astype(np.float32)
 
+    def _scale_features(self, features_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Масштабирование признаков для онлайн-прогнозирования.
+        Применяет сохранённые скейлеры к одиночному окну признаков.
+        
+        Args:
+            features_df: DataFrame с признаками формы [seq_len, n_features]
+        
+        Returns:
+            scaled_df: Масштабированный DataFrame той же формы
+        """
+        if self.feature_scalers is None or not hasattr(self, 'feature_scalers'):
+            raise ValueError(
+                "Скейлеры не загружены! "
+                "Выполните подготовку данных через prepare_honest_datasets() "
+                "или загрузите модель с сохранёнными скейлерами через load()."
+            )
+        
+        # Создаём результирующий DataFrame
+        scaled_df = pd.DataFrame(
+            index=features_df.index,
+            columns=self.feature_columns,
+            dtype=np.float32
+        )
+        
+        # 1. Масштабирование по группам
+        for group_name, features in self.scale_groups.items():
+            valid_features = [f for f in features if f in features_df.columns]
+            if not valid_features:
+                continue
+            
+            if group_name == 'none':
+                # Признаки без масштабирования — копируем с клиппированием для стабильности
+                for col in valid_features:
+                    values = features_df[col].values.astype(np.float32)
+                    # Специфичные ограничения для семантических признаков
+                    if col == 'asymmetry_ratio':
+                        values = np.clip(values, 0.1, 3.0)
+                    elif col == 'percentile_pos_fisher':
+                        values = np.clip(values, -5.0, 5.0)
+                    scaled_df[col] = values
+            else:
+                # Масштабируемые признаки
+                scaler = self.feature_scalers.get(group_name)
+                if scaler is None:
+                    # Резерв: копируем без масштабирования если скейлер отсутствует
+                    for col in valid_features:
+                        scaled_df[col] = features_df[col].values.astype(np.float32)
+                    continue
+                
+                # Применяем скейлер (требует 2D массив [n_samples, n_features])
+                try:
+                    values_2d = features_df[valid_features].values.astype(np.float32)
+                    scaled_values_2d = scaler.transform(values_2d)
+                    for i, col in enumerate(valid_features):
+                        scaled_df[col] = scaled_values_2d[:, i]
+                except Exception as e:
+                    print(f"⚠️ Ошибка масштабирования группы '{group_name}' для {valid_features}: {e}")
+                    # Резервный вариант при ошибке
+                    for col in valid_features:
+                        scaled_df[col] = features_df[col].values.astype(np.float32)
+        
+        # 2. Обработка пропущенных признаков (защита от неполного покрытия группами)
+        missing_cols = [col for col in self.feature_columns 
+                       if col not in scaled_df.columns or scaled_df[col].isna().any()]
+        if missing_cols:
+            print(f"⚠️ Нераспределённые признаки: {', '.join(missing_cols)}")
+            for col in missing_cols:
+                if col in features_df.columns:
+                    # Стратегия по умолчанию: используем RobustScaler
+                    if 'robust' in self.feature_scalers and self.feature_scalers['robust'] is not None:
+                        try:
+                            values_2d = features_df[[col]].values.astype(np.float32)
+                            scaled_values_2d = self.feature_scalers['robust'].transform(values_2d)
+                            scaled_df[col] = scaled_values_2d[:, 0]
+                        except:
+                            scaled_df[col] = features_df[col].values.astype(np.float32)
+                    else:
+                        scaled_df[col] = features_df[col].values.astype(np.float32)
+        
+        # 3. Финальная обработка численной стабильности
+        scaled_df = scaled_df.replace([np.inf, -np.inf], np.nan)
+        scaled_df = scaled_df.fillna(0.0)
+        scaled_df = scaled_df.astype(np.float32)
+        
+        return scaled_df
+        
     def fit(self, train_features, val_features, epochs=50, min_epochs=5,
             patience=15, save_best_weights=True, early_stopping=True, log_dir=None):
         """Оптимизированный метод обучения для адаптивной UKF с контекстной волатильностью"""
