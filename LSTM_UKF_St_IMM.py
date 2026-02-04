@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, PowerTransformer
-from typing import Tuple, Dict, Optional, List, Any
+from typing import Tuple, Dict, Optional, List, Union, Any
 
 # Evaluate
 from tqdm.auto import tqdm
@@ -4233,6 +4233,76 @@ class LSTMIMMUKF(tf.Module):
 
         return original_values.flatten()
 
+    def inverse_transform_std(self, scaled_std: Union[float, np.ndarray, tf.Tensor]) -> Union[float, np.ndarray]:
+        """
+        Обратное преобразование стандартного отклонения из скалированного в исходный масштаб.
+        Поддерживает все типы скейлеров: StandardScaler, RobustScaler, MinMaxScaler, PowerTransformer.
+        """
+        if self.feature_scalers is None or 'Y' not in self.feature_scalers:
+            raise ValueError("⚠️ Скейлеры не инициализированы!")
+        
+        scaler = self.feature_scalers['Y']
+        
+        # Преобразуем Tensor в numpy если нужно
+        is_tensor = isinstance(scaled_std, tf.Tensor)
+        if is_tensor:
+            scaled_std = scaled_std.numpy()
+        
+        # Сохраняем исходную размерность
+        original_shape = None
+        if isinstance(scaled_std, np.ndarray):
+            original_shape = scaled_std.shape
+            scaled_std_flat = scaled_std.flatten()
+        else:
+            scaled_std_flat = np.array([scaled_std])
+        
+        # Определяем тип скейлера
+        scaler_type = type(scaler).__name__
+        
+        if scaler_type in ['StandardScaler', 'RobustScaler']:
+            if hasattr(scaler, 'scale_'):
+                scale_factor = scaler.scale_[0] if hasattr(scaler.scale_, '__len__') else scaler.scale_
+                original_std_flat = scaled_std_flat * scale_factor
+            else:
+                raise ValueError(f"⚠️ Скейлер {scaler_type} не имеет 'scale_'")
+        
+        elif scaler_type == 'MinMaxScaler':
+            if hasattr(scaler, 'data_max_') and hasattr(scaler, 'data_min_'):
+                data_max = scaler.data_max_[0] if hasattr(scaler.data_max_, '__len__') else scaler.data_max_
+                data_min = scaler.data_min_[0] if hasattr(scaler.data_min_, '__len__') else scaler.data_min_
+                data_range = data_max - data_min
+                original_std_flat = scaled_std_flat * data_range
+            else:
+                raise ValueError(f"⚠️ MinMaxScaler не имеет 'data_max_' или 'data_min_'")
+        
+        elif scaler_type == 'PowerTransformer':
+            test_scaled = np.array([[0.0], [1.0]])
+            test_original = scaler.inverse_transform(test_scaled)
+            scale_factor = abs(test_original[1, 0] - test_original[0, 0])
+            original_std_flat = scaled_std_flat * scale_factor
+        
+        else:
+            # Универсальный численный подход
+            test_scaled = np.array([[0.0], [1.0]])
+            try:
+                test_original = scaler.inverse_transform(test_scaled)
+                scale_factor = abs(test_original[1, 0] - test_original[0, 0])
+                original_std_flat = scaled_std_flat * scale_factor
+            except Exception as e:
+                print(f"⚠️ Ошибка численной оценки: {e}")
+                original_std_flat = scaled_std_flat
+        
+        # Восстанавливаем размерность
+        if original_shape is not None:
+            original_std = original_std_flat.reshape(original_shape)
+        else:
+            original_std = original_std_flat[0]
+        
+        if is_tensor:
+            original_std = tf.constant(original_std, dtype=tf.float32)
+        
+        return original_std        
+
     def save(self, path: str):
         """Сохранение модели с гарантированной канонической формой состояния фильтра [1] / [1, 1]"""
         import os
@@ -5262,17 +5332,17 @@ class LSTMIMMUKF(tf.Module):
         ci_lower_original = self.inverse_transform_target(ci_lower_scaled.numpy())
         ci_upper_original = self.inverse_transform_target(ci_upper_scaled.numpy())
         
-        # Стандартное отклонение в исходном масштабе
-        if self.feature_scalers is not None and 'Y' in self.feature_scalers:
-            if hasattr(self.feature_scalers['Y'], 'scale_'):
+        # Стандартное отклонение в исходном масштабе (УНИВЕРСАЛЬНОЕ ПРЕОБРАЗОВАНИЕ)
+        try:
+            std_dev_original = self.inverse_transform_std(std_dev_scaled.numpy())
+        except Exception as e:
+            print(f"⚠️ Ошибка преобразования std_dev: {e}")
+            # Резервный вариант: используем масштаб из скейлера
+            if self.feature_scalers is not None and 'Y' in self.feature_scalers and hasattr(self.feature_scalers['Y'], 'scale_'):
                 scale_factor = self.feature_scalers['Y'].scale_
                 std_dev_original = std_dev_scaled.numpy() * scale_factor
             else:
-                # Резервный вариант: оценка масштаба из данных
-                y_range = np.ptp(df['Close'].values[-self.seq_len:]) if 'Close' in df.columns else 1.0
-                std_dev_original = std_dev_scaled.numpy() * (y_range / 2.0)
-        else:
-            std_dev_original = std_dev_scaled.numpy()
+                std_dev_original = std_dev_scaled.numpy()
         
         # === 7. ФОРМИРОВАНИЕ РЕЗУЛЬТАТА ===
         # Временная метка последней точки истории (момент прогноза)
@@ -5530,6 +5600,54 @@ class LSTMIMMUKF(tf.Module):
             print(f"   💦 Средний adaptive inflation: {metrics['InflationMean']:.4f} ± {metrics['InflationStd']:.4f}")
             print(f"   ⚖️ Ошибка калибровки: {metrics['CalibrationError']:.4f}")
             print("=" * 60)
+
+            # ============================================================
+            # 🔍 КРИТИЧЕСКАЯ ПРОВЕРКА: убедимся, что данные в ИСХОДНОМ масштабе
+            # ============================================================
+            print("\n" + "=" * 80)
+            print("🔍 ПРОВЕРКА МАСШТАБА ДАННЫХ ПЕРЕД ПОСТРОЕНИЕМ ГРАФИКОВ")
+            print("=" * 80)
+            
+            # Проверка: исходные данные должны иметь разумный масштаб (не [-3, 3])
+            true_min, true_max = np.min(true_values_original), np.max(true_values_original)
+            pred_min, pred_max = np.min(pred_values_original), np.max(pred_values_original)
+            
+            print(f"Истинные значения:  min={true_min:.4f}, max={true_max:.4f}")
+            print(f"Прогнозы:           min={pred_min:.4f}, max={pred_max:.4f}")
+            
+            # Эвристика: если диапазон < 10 и центрирован около 0 → скорее всего скалированный масштаб
+            is_likely_scaled = (true_max - true_min < 10.0) and (abs(true_min) < 5.0) and (abs(true_max) < 5.0)
+            
+            if is_likely_scaled:
+                print("⚠️  ВНИМАНИЕ: Данные выглядят как СКАЛИРОВАННЫЕ (диапазон [-5, 5])!")
+                print("   Возможные причины:")
+                print("   1. Скейлеры не загружены (feature_scalers is None)")
+                print("   2. inverse_transform_target не применялся")
+                print("   3. Ошибка в обратном преобразовании")
+                
+                # Дополнительная диагностика
+                if self.feature_scalers is None:
+                    print("   ❌ feature_scalers = None")
+                elif 'Y' not in self.feature_scalers:
+                    print("   ❌ 'Y' отсутствует в feature_scalers")
+                else:
+                    print(f"   ✅ feature_scalers['Y'] загружен: {type(self.feature_scalers['Y']).__name__}")
+                
+                # Принудительная проверка inverse_transform
+                test_val = np.array([[0.0]])
+                try:
+                    test_original = self.inverse_transform_target(test_val)
+                    print(f"   ✅ inverse_transform_target работает: 0.0 → {test_original[0]:.4f}")
+                except Exception as e:
+                    print(f"   ❌ inverse_transform_target ошибка: {e}")
+                
+                raise RuntimeError(
+                    "Графики будут построены в СКАЛИРОВАННОМ масштабе! "
+                    "Убедитесь, что скейлеры загружены и inverse_transform_target работает корректно."
+                )
+            else:
+                print("✅ Данные в ИСХОДНОМ масштабе (диапазон реалистичен для финансовых данных)")
+            print("=" * 80 + "\n")
             
             # === 11. ОТРИСОВКА ГРАФИКОВ ПРИ НЕОБХОДИМОСТИ ===
             if plot:
