@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, PowerTransformer
-from typing import Tuple, Dict, Optional, List, Union, Any
+from typing import Tuple, Dict, Optional, List, Any
 
 # Evaluate
 from tqdm.auto import tqdm
@@ -2291,7 +2291,7 @@ class LSTMIMMUKF(tf.Module):
 
     @tf.function
     def compute_loss(self, predictions, targets, volatility_levels, inflation_factors,
-                     ukf_params, calibration_loss, entropy_loss=0.0):
+                     ukf_params, calibration_loss, entropy_loss=0.0, training: bool = False):
         """
         ✅ ИСПРАВЛЕННАЯ Функция потерь с правильными целями и штрафами
 
@@ -2309,9 +2309,25 @@ class LSTMIMMUKF(tf.Module):
         mse_loss = tf.reduce_mean(tf.square(predictions - targets))
 
         # === 2. ПЛАВНОСТЬ ПАРАМЕТРОВ ===
-        smoothness_loss = 0.0
-        if hasattr(self, 'last_ukf_params') and self.last_ukf_params is not None:
-            smoothness_loss = 0.001 * tf.reduce_mean(tf.square(ukf_params - self.last_ukf_params))
+        smoothness_loss = tf.constant(0.0, dtype=tf.float32)
+        if training and hasattr(self, 'last_ukf_params') and self.last_ukf_params is not None:
+            if isinstance(ukf_params, dict) and isinstance(self.last_ukf_params, dict):
+                # Вычисляем разность по каждому ключу словаря
+                diffs = []
+                for key in ukf_params.keys():
+                    if key in self.last_ukf_params and isinstance(ukf_params[key], tf.Tensor):
+                        diff = ukf_params[key] - self.last_ukf_params[key]
+                        diffs.append(tf.square(diff))
+                
+                if diffs:
+                    # Конкатенируем все разности и усредняем
+                    all_diffs = tf.concat([tf.reshape(d, [-1]) for d in diffs], axis=0)
+                    smoothness_loss = tf.constant(0.001, dtype=tf.float32) * tf.reduce_mean(all_diffs)
+            elif isinstance(ukf_params, tf.Tensor) and isinstance(self.last_ukf_params, tf.Tensor):
+                # Обратная совместимость для старой тензорной структуры
+                smoothness_loss = tf.constant(0.001, dtype=tf.float32) * tf.reduce_mean(
+                    tf.square(ukf_params - self.last_ukf_params)
+                )
 
         # === 3. СТАБИЛЬНОСТЬ ИНФЛЯЦИИ ===
         # Штраф за отклонение от базового значения 1.0
@@ -2602,7 +2618,8 @@ class LSTMIMMUKF(tf.Module):
                     inflation_factors,
                     ukf_params,
                     calibration_loss,
-                    entropy_loss
+                    entropy_loss,
+                    training=True
                 )
     
                 # Нормализация потери по размеру батча и времени
@@ -3238,7 +3255,8 @@ class LSTMIMMUKF(tf.Module):
                 inflation_factors,
                 ukf_params,
                 calibration_loss,
-                entropy_loss
+                entropy_loss,
+                training=False
             )
     
             # Нормализация потери
@@ -3595,93 +3613,6 @@ class LSTMIMMUKF(tf.Module):
 
         return features_df.astype(np.float32)
 
-    def _scale_features(self, features_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Масштабирование признаков для онлайн-прогнозирования.
-        Применяет сохранённые скейлеры к одиночному окну признаков.
-        
-        Args:
-            features_df: DataFrame с признаками формы [seq_len, n_features]
-        
-        Returns:
-            scaled_df: Масштабированный DataFrame той же формы
-        """
-        if self.feature_scalers is None or not hasattr(self, 'feature_scalers'):
-            raise ValueError(
-                "Скейлеры не загружены! "
-                "Выполните подготовку данных через prepare_honest_datasets() "
-                "или загрузите модель с сохранёнными скейлерами через load()."
-            )
-        
-        # Создаём результирующий DataFrame
-        scaled_df = pd.DataFrame(
-            index=features_df.index,
-            columns=self.feature_columns,
-            dtype=np.float32
-        )
-        
-        # 1. Масштабирование по группам
-        for group_name, features in self.scale_groups.items():
-            valid_features = [f for f in features if f in features_df.columns]
-            if not valid_features:
-                continue
-            
-            if group_name == 'none':
-                # Признаки без масштабирования — копируем с клиппированием для стабильности
-                for col in valid_features:
-                    values = features_df[col].values.astype(np.float32)
-                    # Специфичные ограничения для семантических признаков
-                    if col == 'asymmetry_ratio':
-                        values = np.clip(values, 0.1, 3.0)
-                    elif col == 'percentile_pos_fisher':
-                        values = np.clip(values, -5.0, 5.0)
-                    scaled_df[col] = values
-            else:
-                # Масштабируемые признаки
-                scaler = self.feature_scalers.get(group_name)
-                if scaler is None:
-                    # Резерв: копируем без масштабирования если скейлер отсутствует
-                    for col in valid_features:
-                        scaled_df[col] = features_df[col].values.astype(np.float32)
-                    continue
-                
-                # Применяем скейлер (требует 2D массив [n_samples, n_features])
-                try:
-                    values_2d = features_df[valid_features].values.astype(np.float32)
-                    scaled_values_2d = scaler.transform(values_2d)
-                    for i, col in enumerate(valid_features):
-                        scaled_df[col] = scaled_values_2d[:, i]
-                except Exception as e:
-                    print(f"⚠️ Ошибка масштабирования группы '{group_name}' для {valid_features}: {e}")
-                    # Резервный вариант при ошибке
-                    for col in valid_features:
-                        scaled_df[col] = features_df[col].values.astype(np.float32)
-        
-        # 2. Обработка пропущенных признаков (защита от неполного покрытия группами)
-        missing_cols = [col for col in self.feature_columns 
-                       if col not in scaled_df.columns or scaled_df[col].isna().any()]
-        if missing_cols:
-            print(f"⚠️ Нераспределённые признаки: {', '.join(missing_cols)}")
-            for col in missing_cols:
-                if col in features_df.columns:
-                    # Стратегия по умолчанию: используем RobustScaler
-                    if 'robust' in self.feature_scalers and self.feature_scalers['robust'] is not None:
-                        try:
-                            values_2d = features_df[[col]].values.astype(np.float32)
-                            scaled_values_2d = self.feature_scalers['robust'].transform(values_2d)
-                            scaled_df[col] = scaled_values_2d[:, 0]
-                        except:
-                            scaled_df[col] = features_df[col].values.astype(np.float32)
-                    else:
-                        scaled_df[col] = features_df[col].values.astype(np.float32)
-        
-        # 3. Финальная обработка численной стабильности
-        scaled_df = scaled_df.replace([np.inf, -np.inf], np.nan)
-        scaled_df = scaled_df.fillna(0.0)
-        scaled_df = scaled_df.astype(np.float32)
-        
-        return scaled_df
-        
     def fit(self, train_features, val_features, epochs=50, min_epochs=5,
             patience=15, save_best_weights=True, early_stopping=True, log_dir=None):
         """Оптимизированный метод обучения для адаптивной UKF с контекстной волатильностью"""
@@ -4276,76 +4207,6 @@ class LSTMIMMUKF(tf.Module):
         original_values = self.feature_scalers['Y'].inverse_transform(scaled_values)
 
         return original_values.flatten()
-
-    def inverse_transform_std(self, scaled_std: Union[float, np.ndarray, tf.Tensor]) -> Union[float, np.ndarray]:
-        """
-        Обратное преобразование стандартного отклонения из скалированного в исходный масштаб.
-        Поддерживает все типы скейлеров: StandardScaler, RobustScaler, MinMaxScaler, PowerTransformer.
-        """
-        if self.feature_scalers is None or 'Y' not in self.feature_scalers:
-            raise ValueError("⚠️ Скейлеры не инициализированы!")
-        
-        scaler = self.feature_scalers['Y']
-        
-        # Преобразуем Tensor в numpy если нужно
-        is_tensor = isinstance(scaled_std, tf.Tensor)
-        if is_tensor:
-            scaled_std = scaled_std.numpy()
-        
-        # Сохраняем исходную размерность
-        original_shape = None
-        if isinstance(scaled_std, np.ndarray):
-            original_shape = scaled_std.shape
-            scaled_std_flat = scaled_std.flatten()
-        else:
-            scaled_std_flat = np.array([scaled_std])
-        
-        # Определяем тип скейлера
-        scaler_type = type(scaler).__name__
-        
-        if scaler_type in ['StandardScaler', 'RobustScaler']:
-            if hasattr(scaler, 'scale_'):
-                scale_factor = scaler.scale_[0] if hasattr(scaler.scale_, '__len__') else scaler.scale_
-                original_std_flat = scaled_std_flat * scale_factor
-            else:
-                raise ValueError(f"⚠️ Скейлер {scaler_type} не имеет 'scale_'")
-        
-        elif scaler_type == 'MinMaxScaler':
-            if hasattr(scaler, 'data_max_') and hasattr(scaler, 'data_min_'):
-                data_max = scaler.data_max_[0] if hasattr(scaler.data_max_, '__len__') else scaler.data_max_
-                data_min = scaler.data_min_[0] if hasattr(scaler.data_min_, '__len__') else scaler.data_min_
-                data_range = data_max - data_min
-                original_std_flat = scaled_std_flat * data_range
-            else:
-                raise ValueError(f"⚠️ MinMaxScaler не имеет 'data_max_' или 'data_min_'")
-        
-        elif scaler_type == 'PowerTransformer':
-            test_scaled = np.array([[0.0], [1.0]])
-            test_original = scaler.inverse_transform(test_scaled)
-            scale_factor = abs(test_original[1, 0] - test_original[0, 0])
-            original_std_flat = scaled_std_flat * scale_factor
-        
-        else:
-            # Универсальный численный подход
-            test_scaled = np.array([[0.0], [1.0]])
-            try:
-                test_original = scaler.inverse_transform(test_scaled)
-                scale_factor = abs(test_original[1, 0] - test_original[0, 0])
-                original_std_flat = scaled_std_flat * scale_factor
-            except Exception as e:
-                print(f"⚠️ Ошибка численной оценки: {e}")
-                original_std_flat = scaled_std_flat
-        
-        # Восстанавливаем размерность
-        if original_shape is not None:
-            original_std = original_std_flat.reshape(original_shape)
-        else:
-            original_std = original_std_flat[0]
-        
-        if is_tensor:
-            original_std = tf.constant(original_std, dtype=tf.float32)
-        
-        return original_std        
 
     def save(self, path: str):
         """Сохранение модели с гарантированной канонической формой состояния фильтра [1] / [1, 1]"""
@@ -5275,23 +5136,6 @@ class LSTMIMMUKF(tf.Module):
         # ✅ ПРАВИЛЬНО: используем ВСЮ переданную историю для расчёта признаков
         # Это гарантирует корректную декомпозицию EMD и стабильные оценки волатильности
         features_df = self.prepare_features(df, mode='batch')
-
-
-        # DEBUG
-        if 'level' in features_df.columns:
-            level_series = features_df['level']
-            level_min = level_series.min()
-            level_max = level_series.max()
-
-            if level_min <= 0:
-                zero_count = (level_series <= 0).sum()
-                zero_indices = level_series[level_series <= 0].index.tolist()[:5]  # первые 5 индексов
-                print(f"⚠️  КРИТИЧЕСКАЯ ОШИБКА: level содержит неположительные значения!")
-                print(f"   • Минимальное значение: {level_min:.6f}")
-                print(f"   • Максимальное значение: {level_max:.6f}")
-                print(f"   • Количество проблемных значений: {zero_count} из {len(level_series)}")
-                print(f"   • Примеры индексов: {zero_indices}")
-                print(f"   • Источник данных: {df.index[0]} → {df.index[-1]}")
         
         # Проверка достаточности признаков после расчёта
         if len(features_df) < self.seq_len:
@@ -5393,17 +5237,17 @@ class LSTMIMMUKF(tf.Module):
         ci_lower_original = self.inverse_transform_target(ci_lower_scaled.numpy())
         ci_upper_original = self.inverse_transform_target(ci_upper_scaled.numpy())
         
-        # Стандартное отклонение в исходном масштабе (УНИВЕРСАЛЬНОЕ ПРЕОБРАЗОВАНИЕ)
-        try:
-            std_dev_original = self.inverse_transform_std(std_dev_scaled.numpy())
-        except Exception as e:
-            print(f"⚠️ Ошибка преобразования std_dev: {e}")
-            # Резервный вариант: используем масштаб из скейлера
-            if self.feature_scalers is not None and 'Y' in self.feature_scalers and hasattr(self.feature_scalers['Y'], 'scale_'):
+        # Стандартное отклонение в исходном масштабе
+        if self.feature_scalers is not None and 'Y' in self.feature_scalers:
+            if hasattr(self.feature_scalers['Y'], 'scale_'):
                 scale_factor = self.feature_scalers['Y'].scale_
                 std_dev_original = std_dev_scaled.numpy() * scale_factor
             else:
-                std_dev_original = std_dev_scaled.numpy()
+                # Резервный вариант: оценка масштаба из данных
+                y_range = np.ptp(df['Close'].values[-self.seq_len:]) if 'Close' in df.columns else 1.0
+                std_dev_original = std_dev_scaled.numpy() * (y_range / 2.0)
+        else:
+            std_dev_original = std_dev_scaled.numpy()
         
         # === 7. ФОРМИРОВАНИЕ РЕЗУЛЬТАТА ===
         # Временная метка последней точки истории (момент прогноза)
@@ -5661,54 +5505,6 @@ class LSTMIMMUKF(tf.Module):
             print(f"   💦 Средний adaptive inflation: {metrics['InflationMean']:.4f} ± {metrics['InflationStd']:.4f}")
             print(f"   ⚖️ Ошибка калибровки: {metrics['CalibrationError']:.4f}")
             print("=" * 60)
-
-            # ============================================================
-            # 🔍 КРИТИЧЕСКАЯ ПРОВЕРКА: убедимся, что данные в ИСХОДНОМ масштабе
-            # ============================================================
-            print("\n" + "=" * 80)
-            print("🔍 ПРОВЕРКА МАСШТАБА ДАННЫХ ПЕРЕД ПОСТРОЕНИЕМ ГРАФИКОВ")
-            print("=" * 80)
-            
-            # Проверка: исходные данные должны иметь разумный масштаб (не [-3, 3])
-            true_min, true_max = np.min(true_values_original), np.max(true_values_original)
-            pred_min, pred_max = np.min(pred_values_original), np.max(pred_values_original)
-            
-            print(f"Истинные значения:  min={true_min:.4f}, max={true_max:.4f}")
-            print(f"Прогнозы:           min={pred_min:.4f}, max={pred_max:.4f}")
-            
-            # Эвристика: если диапазон < 10 и центрирован около 0 → скорее всего скалированный масштаб
-            is_likely_scaled = (true_max - true_min < 10.0) and (abs(true_min) < 5.0) and (abs(true_max) < 5.0)
-            
-            if is_likely_scaled:
-                print("⚠️  ВНИМАНИЕ: Данные выглядят как СКАЛИРОВАННЫЕ (диапазон [-5, 5])!")
-                print("   Возможные причины:")
-                print("   1. Скейлеры не загружены (feature_scalers is None)")
-                print("   2. inverse_transform_target не применялся")
-                print("   3. Ошибка в обратном преобразовании")
-                
-                # Дополнительная диагностика
-                if self.feature_scalers is None:
-                    print("   ❌ feature_scalers = None")
-                elif 'Y' not in self.feature_scalers:
-                    print("   ❌ 'Y' отсутствует в feature_scalers")
-                else:
-                    print(f"   ✅ feature_scalers['Y'] загружен: {type(self.feature_scalers['Y']).__name__}")
-                
-                # Принудительная проверка inverse_transform
-                test_val = np.array([[0.0]])
-                try:
-                    test_original = self.inverse_transform_target(test_val)
-                    print(f"   ✅ inverse_transform_target работает: 0.0 → {test_original[0]:.4f}")
-                except Exception as e:
-                    print(f"   ❌ inverse_transform_target ошибка: {e}")
-                
-                raise RuntimeError(
-                    "Графики будут построены в СКАЛИРОВАННОМ масштабе! "
-                    "Убедитесь, что скейлеры загружены и inverse_transform_target работает корректно."
-                )
-            else:
-                print("✅ Данные в ИСХОДНОМ масштабе (диапазон реалистичен для финансовых данных)")
-            print("=" * 80 + "\n")
             
             # === 11. ОТРИСОВКА ГРАФИКОВ ПРИ НЕОБХОДИМОСТИ ===
             if plot:
