@@ -962,10 +962,18 @@ class LSTMIMMUKF(tf.Module):
         force_recompute: bool = False,
         n_jobs: int = -1,
         buffer_size: int = 50,
-        block_size: int = 200  # ← Добавлен параметр для согласованности с HonestDataPreparator
+        block_size: int = 200,  # ← Используется при adaptive_blocks=False
+        adaptive_blocks: bool = False,  # ← НОВЫЙ ПАРАМЕТР (по умолчанию выключен для обратной совместимости)
+        min_regime_per_block: int = 3,  # ← Мин. окон каждого режима в адаптивном блоке
+        max_block_size: int = 300       # ← Макс. размер адаптивного блока (защита)
     ) -> Tuple[Dict, Dict, Dict]:
         """
-        УМНЫЙ ИНТЕРФЕЙС: автоматически проверяет кэш и загружает/готовит данные.
+        УМНЫЙ ИНТЕРФЕЙС: автоматически проверяет кэш и загружает/готовит данные с поддержкой адаптивной стратификации.
+        
+        🔑 КЛЮЧЕВЫЕ РЕЖИМЫ РАБОТЫ:
+        • Режим 1 (классический): adaptive_blocks=False → используется фиксированный block_size
+        • Режим 2 (адаптивный):   adaptive_blocks=True  → блоки формируются динамически до достижения 
+                                  баланса режимов (минимум min_regime_per_block окон каждого режима)
         
         Важно: все пути передаются БЕЗ расширения .pkl — оно добавляется автоматически.
         
@@ -983,14 +991,21 @@ class LSTMIMMUKF(tf.Module):
             print(f"📥 Кэш найден: {cache_file_with_ext}")
             print("   Загружаем предварительно обработанные данные...")
             
+            # Создаём подготовщик с ТЕМИ ЖЕ ПАРАМЕТРАМИ, что и при сохранении
+            # (валидация метаданных внутри load_prepared_datasets проверит согласованность)
             preparator = HonestDataPreparator(
                 model=self,
                 seq_len=self.seq_len,
                 min_history_for_features=self.min_history_for_features,
                 buffer_size=buffer_size,
-                block_size=block_size,  # ← Согласованность параметров
+                block_size=block_size,
+                min_windows_per_regime=5,  # ← фиксированный порог валидации (не влияет на адаптивность)
+                adaptive_blocks=adaptive_blocks,  # ← критически важно для согласованности
+                min_regime_per_block=min_regime_per_block,
+                max_block_size=max_block_size,
                 seed=42
             )
+            
             # Передаём путь БЕЗ расширения — метод сам обработает оба варианта
             train_data, val_data, test_data = preparator.load_prepared_datasets(cache_path)
             
@@ -1000,10 +1015,22 @@ class LSTMIMMUKF(tf.Module):
                 'val_data': val_data,
                 'test_data': test_data,
                 'preparator': preparator,
-                'cache_path': cache_path
+                'cache_path': cache_path,
+                'adaptive_blocks': adaptive_blocks,
+                'block_size': block_size,
+                'min_regime_per_block': min_regime_per_block,
+                'max_block_size': max_block_size
             }
             
+            # Информируем пользователя о режиме стратификации
+            strat_method = preparator._last_stratification_method if hasattr(preparator, '_last_stratification_method') else 'unknown'
             print(f"✅ Данные успешно загружены из кэша: {cache_file_with_ext}")
+            print(f"   • Стратификация: {'АДАПТИВНАЯ' if adaptive_blocks else 'ФИКСИРОВАННАЯ'}")
+            if adaptive_blocks:
+                print(f"   • Мин. окон на режим в блоке: {min_regime_per_block}")
+                print(f"   • Макс. размер блока: {max_block_size}")
+            else:
+                print(f"   • Размер блока: {block_size}")
             return train_data, val_data, test_data
         
         # === ШАГ 2: ВАЛИДАЦИЯ ВХОДНЫХ ДАННЫХ ===
@@ -1015,14 +1042,19 @@ class LSTMIMMUKF(tf.Module):
         
         # === ШАГ 3: ПОЛНАЯ ПОДГОТОВКА ===
         print(f"⚠️  Кэш не найден или требуется пересчёт: {cache_file_with_ext}")
-        print("   Запускаем полную честную подготовку данных (без утечки будущего)...")
+        print(f"   Запускаем полную честную подготовку данных (без утечки будущего)...")
+        print(f"   • Стратификация: {'АДАПТИВНАЯ' if adaptive_blocks else 'ФИКСИРОВАННАЯ'}")
         
         preparator = HonestDataPreparator(
             model=self,
             seq_len=self.seq_len,
             min_history_for_features=self.min_history_for_features,
             buffer_size=buffer_size,
-            block_size=block_size,  # ← Согласованность параметров
+            block_size=block_size,
+            min_windows_per_regime=5,  # ← фиксированный порог валидации
+            adaptive_blocks=adaptive_blocks,
+            min_regime_per_block=min_regime_per_block,
+            max_block_size=max_block_size,
             seed=42
         )
         
@@ -1032,7 +1064,8 @@ class LSTMIMMUKF(tf.Module):
             train_ratio=train_ratio,
             val_ratio=val_ratio,
             n_jobs=n_jobs,
-            force_recompute=force_recompute
+            force_recompute=force_recompute,
+            use_adaptive=adaptive_blocks  # ← явное переопределение на уровне вызова (опционально)
         )
         
         # Сохраняем для внутреннего использования
@@ -1041,10 +1074,21 @@ class LSTMIMMUKF(tf.Module):
             'val_data': val_data,
             'test_data': test_data,
             'preparator': preparator,
-            'cache_path': cache_path
+            'cache_path': cache_path,
+            'adaptive_blocks': adaptive_blocks,
+            'block_size': block_size,
+            'min_regime_per_block': min_regime_per_block,
+            'max_block_size': max_block_size
         }
         
         print(f"✅ Данные подготовлены и сохранены в кэш: {cache_file_with_ext}")
+        print(f"   • Стратификация: {'АДАПТИВНАЯ' if adaptive_blocks else 'ФИКСИРОВАННАЯ'}")
+        if adaptive_blocks:
+            print(f"   • Мин. окон на режим в блоке: {min_regime_per_block}")
+            print(f"   • Макс. размер блока: {max_block_size}")
+        else:
+            print(f"   • Размер блока: {block_size}")
+        
         return train_data, val_data, test_data
         
     def _build_model(self, input_shape: Tuple[int, int], training: bool = True) -> tf.keras.Model:
@@ -5231,6 +5275,23 @@ class LSTMIMMUKF(tf.Module):
         # ✅ ПРАВИЛЬНО: используем ВСЮ переданную историю для расчёта признаков
         # Это гарантирует корректную декомпозицию EMD и стабильные оценки волатильности
         features_df = self.prepare_features(df, mode='batch')
+
+
+        # DEBUG
+        if 'level' in features_df.columns:
+            level_series = features_df['level']
+            level_min = level_series.min()
+            level_max = level_series.max()
+
+            if level_min <= 0:
+                zero_count = (level_series <= 0).sum()
+                zero_indices = level_series[level_series <= 0].index.tolist()[:5]  # первые 5 индексов
+                print(f"⚠️  КРИТИЧЕСКАЯ ОШИБКА: level содержит неположительные значения!")
+                print(f"   • Минимальное значение: {level_min:.6f}")
+                print(f"   • Максимальное значение: {level_max:.6f}")
+                print(f"   • Количество проблемных значений: {zero_count} из {len(level_series)}")
+                print(f"   • Примеры индексов: {zero_indices}")
+                print(f"   • Источник данных: {df.index[0]} → {df.index[-1]}")
         
         # Проверка достаточности признаков после расчёта
         if len(features_df) < self.seq_len:
