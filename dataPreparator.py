@@ -42,7 +42,7 @@ class HonestDataPreparator:
         buffer_size: int = 50,
         block_size: int = 100,
         min_windows_per_regime: int = 5,
-        adaptive_blocks: bool = False,    # ← НОВЫЙ ПАРАМЕТР (по умолчанию выключен)
+        adaptive_blocks: bool = True,    # ← НОВЫЙ ПАРАМЕТР
         min_regime_per_block: int = 3,    # ← только для адаптивного режима
         max_block_size: int = 300,        # ← только для адаптивного режима
         seed: int = 42
@@ -1197,7 +1197,7 @@ class HonestDataPreparator:
                 if split_data['n_samples'] == 0:
                     continue
                 
-                plt.figure(figsize=(15, 6))
+                plt.figure(figsize=(7, 3))
                 plt.plot(
                     split_data['timestamps'],
                     split_data['y_target'],
@@ -1220,7 +1220,7 @@ class HonestDataPreparator:
                 print(f"   ✅ {split_name.upper()}: {output_file}")
             
             # График всех сплитов вместе
-            plt.figure(figsize=(20, 7))
+            plt.figure(figsize=(7, 3))
             plt.plot(
                 train_data['timestamps'],
                 train_data['y_target'],
