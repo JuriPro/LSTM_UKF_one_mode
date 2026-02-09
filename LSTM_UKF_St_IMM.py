@@ -44,13 +44,12 @@ class SpectralCovarianceParam(tf.Module):
             name='d_raw'
         )
         self._min_eigenvalue = 0.01  # Снижаем минимальное значение для гибкости
-        self._max_eigenvalue = 8.0   # Увеличиваем максимальное значение в 2 раза для адаптации к волатильности
+        self._max_eigenvalue = 20.0   # Увеличиваем максимальное значение в 2 раза для адаптации к волатильности
 
     def get_P_and_sqrt(self):
         """Вычисляет P и sqrt(P) для скалярного случая (state_dim=1)"""
         # Применяем softplus для гарантии положительности
         d_pos = tf.nn.softplus(self.d_raw) + self._min_eigenvalue
-        # Обрезаем для численной стабильности
         d_pos = tf.clip_by_value(d_pos, self._min_eigenvalue, self._max_eigenvalue)
         # Для скалярного случая ковариационная матрица - просто число
         P = tf.reshape(d_pos, [1, 1])
@@ -503,7 +502,7 @@ class DifferentiableUKF(tf.Module):
         # ✅ Вычисление масштаба для сигма-точек
         base_scale = tf.sqrt(n + lam)  # [B]
         scale = base_scale * relax_factor  # [B]
-        P_sqrt_val = tf.sqrt(tf.maximum(P_scalar, 1e-8))
+        P_sqrt_val = tf.sqrt(tf.maximum(P_scalar, 1e-6))
         scaled_offset = P_sqrt_val * scale  # [B]
 
         # ✅ Генерация сигма-точек для каждого элемента батча
@@ -536,14 +535,15 @@ class DifferentiableUKF(tf.Module):
         P_pred_scalar = tf.reduce_sum(weighted_var, axis=1) + Q_scalar  # [B]
 
         # ✅ Добавляем синхронизацию с ограничениями из SpectralCovarianceParam
-        min_P = 0.01  # Синхронизировано с _min_eigenvalue
-        max_P = 8.0   # Синхронизировано с _max_eigenvalue
+        min_P = 0.01
+        max_P_dynamic = 2.0 + 3.0 * tf.nn.sigmoid(Q_scalar)  # vol-driven [2,5]
+        max_P = tf.minimum(self.spec_param._max_eigenvalue, max_P_dynamic)
 
         # ✅ Финальная форма ковариации
-        P_pred = tf.reshape(P_pred_scalar, [batch_size, 1, 1])  # [B, 1, 1]
-
-        # ✅ СИНХРОНИЗИРОВАННОЕ ОГРАНИЧЕНИЕ
-        P_pred = tf.clip_by_value(P_pred, min_P, max_P)  # ← ПРАВИЛЬНОЕ ОГРАНИЧЕНИЕ
+        P_pred = tf.clip_by_value(
+            tf.reshape(P_pred_scalar, [batch_size, 1, 1]), 
+            min_P, max_P
+        )
 
         # ✅ Явное указание размерностей для JIT
         x_pred = tf.ensure_shape(x_pred, [None, 1])
@@ -777,14 +777,14 @@ class LSTMIMMUKF(tf.Module):
                 tf.math.log(0.15),  # СНИЖЕНО для меньшего Q (было 0.869)
                 trainable=True,
                 dtype=tf.float32,
-                constraint=lambda x: tf.clip_by_value(x, tf.math.log(0.1), tf.math.log(1.0)),  # ← ДОБАВЛЕНО CONSTRAINT
+                constraint=lambda x: tf.clip_by_value(x, tf.math.log(0.05), tf.math.log(10.0)),  # ← ДОБАВЛЕНО CONSTRAINT
                 name='base_q_logit'
             )
             self.base_r_logit = tf.Variable(
                 tf.math.log(1.8),  # УВЕЛИЧЕНО для большего R (было 0.499)
                 trainable=True,
                 dtype=tf.float32,
-                constraint=lambda x: tf.clip_by_value(x, tf.math.log(1.0), tf.math.log(2.5)),  # ← ДОБАВЛЕНО CONSTRAINT
+                constraint=lambda x: tf.clip_by_value(x, tf.math.log(0.5), tf.math.log(8.0)),  # ← ДОБАВЛЕНО CONSTRAINT
                 name='base_r_logit'
             )
 
