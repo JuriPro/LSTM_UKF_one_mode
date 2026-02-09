@@ -2380,7 +2380,7 @@ class LSTMIMMUKF(tf.Module):
 
     @tf.function
     def compute_loss(self, predictions, targets, volatility_levels, inflation_factors,
-                     ukf_params, calibration_loss, entropy_loss=0.0, training: bool = False):
+                     ukf_params, calibration_loss, entropy_loss=0.0, regime_info=None, training: bool = False):
         """
         ✅ ИСПРАВЛЕННАЯ Функция потерь с правильными целями и штрафами
 
@@ -2475,8 +2475,10 @@ class LSTMIMMUKF(tf.Module):
                 )
 
         # === 7. ✅ ИСПРАВЛЕННАЯ ЭНТРОПИЙНАЯ РЕГУЛЯРИЗАЦИЯ ===
-        current_vol = tf.reshape(volatility_levels[:, -1, :], [-1])  # [B] последний временной шаг
-        regime_info = self.regime_selector.assign_soft_regimes(current_vol)
+        if regime_info is None:  # Защита для обратной совместимости
+            current_vol = tf.reshape(volatility_levels[:, -1, :], [-1])
+            regime_info = self.regime_selector.assign_soft_regimes(current_vol)
+
         current_entropy = tf.reduce_mean(regime_info['entropy'])
 
         # Максимальная энтропия для softmax(3 режимов)
@@ -2513,9 +2515,6 @@ class LSTMIMMUKF(tf.Module):
             entropy_penalty +                   # ✅ Исправленная энтропийная регуляризация
             self.lambda_entropy * entropy_loss * 2.0  # Энтропия скрытых состояний LSTM
         )
-
-        # ✅ ИСПРАВЛЕНО: Явно суммируем все компоненты
-        total_loss = total_loss + 0.5 * entropy_penalty
 
         # === ЗАЩИТА ОТ NaN/Inf ===
         total_loss = tf.where(
@@ -2694,9 +2693,10 @@ class LSTMIMMUKF(tf.Module):
                 width_penalty += 3.0 * tf.square(tf.maximum(target_width_ratio * 0.7 - width_ratio, 0.0))
     
                 # === ШТРАФ ЗА АСИММЕТРИЧНОСТЬ ===
-                asymmetry = (ci_max - forecast) / (forecast - ci_min + 1e-8)
-                asymmetry_penalty = 0.5 * tf.reduce_mean(tf.square(tf.math.log(asymmetry + 1e-8)))
-    
+                # калибровка ДИ через _calibrate_confidence_interval() уже учитывает асимметрию через параметры asymmetry_pos/
+                # asymmetry_neg.
+                asymmetry_penalty = 0
+
                 calibration_loss = undercoverage_penalty + width_penalty + asymmetry_penalty
     
                 # 7. РАСЧЕТ ИТОГОВОЙ ПОТЕРИ
@@ -2708,6 +2708,7 @@ class LSTMIMMUKF(tf.Module):
                     ukf_params,
                     calibration_loss,
                     entropy_loss,
+                    regime_info=regime_info,
                     training=True
                 )
     
@@ -3277,11 +3278,11 @@ class LSTMIMMUKF(tf.Module):
             )
     
             # 6. РАСЧЕТ КАЛИБРОВКИ ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ
-            # Адаптивное целевое покрытие (0.75-0.85 в зависимости от волатильности)
-            base_confidence = 0.80
-            confidence_range = 0.10
-            confidence_ceil = tf.fill(tf.shape(final_volatility), base_confidence + confidence_range/2)  # 0.85
-            confidence_floor = tf.fill(tf.shape(final_volatility), base_confidence - confidence_range/2)  # 0.75
+            # СОГЛАСОВАННОЕ целевое покрытие (80.5%-95.5% как в train_step)
+            base_confidence = 0.88  # ← СИНХРОНИЗИРОВАНО С train_step
+            confidence_range = 0.15  # ← СИНХРОНИЗИРОВАНО С train_step
+            confidence_ceil = tf.fill(tf.shape(final_volatility), base_confidence + confidence_range/2)  # 0.955
+            confidence_floor = tf.fill(tf.shape(final_volatility), base_confidence - confidence_range/2)  # 0.805
             target_coverage = confidence_ceil - (confidence_ceil - confidence_floor) * final_volatility
     
             # Настройка параметров Student-t для асимметричной калибровки
@@ -3346,6 +3347,7 @@ class LSTMIMMUKF(tf.Module):
                 ukf_params,
                 calibration_loss,
                 entropy_loss,
+                regime_info=regime_info,
                 training=False
             )
     
@@ -3702,6 +3704,51 @@ class LSTMIMMUKF(tf.Module):
                 return features_df.tail(self.seq_len).astype(np.float32)
 
         return features_df.astype(np.float32)
+
+    def _scale_features(self, features_df):
+        """✅ ОПТИМАЛЬНАЯ ВЕРСИЯ: Применение скейлеров с сохранением группировки"""
+        scaled_df = pd.DataFrame(index=features_df.index)
+        
+        # ✅ ГРУППИРОВКА ИСПОЛЬЗУЕТСЯ ЗДЕСЬ ДЛЯ ПРИМЕНЕНИЯ
+        # 1. Признаки для RobustScaler
+        for group_name, features in self.scale_groups.items():
+            if group_name in self.feature_scalers and self.feature_scalers[group_name] is not None:
+                valid_features = [f for f in features if f in features_df.columns]
+                if valid_features:
+                    scaled_values = self.feature_scalers[group_name].transform(features_df[valid_features].values)
+                    for i, col in enumerate(valid_features):
+                        scaled_df[col] = scaled_values[:, i]
+                    print(f"  ✅ {group_name} скейлер применен к {len(valid_features)} признакам")
+        
+        # 2. Признаки без масштабирования
+        if 'none' in self.scale_groups:
+            for col in self.scale_groups['none']:
+                if col in features_df.columns:
+                    scaled_df[col] = features_df[col].values
+                    # Численная стабильность
+                    if col == 'asymmetry_ratio':
+                        scaled_df[col] = np.clip(scaled_df[col], 0.1, 3.0)
+                    elif col == 'percentile_pos_fisher':
+                        scaled_df[col] = np.clip(scaled_df[col], -5.0, 5.0)
+                    print(f"  ✅ {col}: семантика сохранена (без масштабирования)")
+        
+        # 3. Обработка пропущенных признаков
+        missing_cols = [col for col in self.feature_columns if col not in scaled_df.columns]
+        if missing_cols:
+            print(f"  ⚠️ Найдены нераспределенные признаки: {', '.join(missing_cols)}")
+            for col in missing_cols:
+                if col in features_df.columns:
+                    # Стратегия по умолчанию - RobustScaler
+                    if 'robust' in self.feature_scalers and self.feature_scalers['robust'] is not None:
+                        scaled_df[col] = self.feature_scalers['robust'].transform(features_df[[col]].values)[:, 0]
+                    else:
+                        scaled_df[col] = features_df[col].values
+        
+        # 4. Обработка ошибок
+        scaled_df = scaled_df.replace([np.inf, -np.inf], np.nan)
+        scaled_df = scaled_df.fillna(0.0)
+        
+        return scaled_df        
 
     def fit(self, train_features, val_features, epochs=50, min_epochs=5,
             patience=15, save_best_weights=True, early_stopping=True, log_dir=None):
@@ -5111,6 +5158,7 @@ class LSTMIMMUKF(tf.Module):
         # ❌ НЕПРАВИЛЬНО: tf.squeeze() → может вернуть скаляр [] при B=1
         # ✅ ПРАВИЛЬНО: гарантируем векторную форму [B] через reshape
         final_inflation = tf.reshape(inflation_factors[:, -1, :], [-1])   # [B] - ГАРАНТИРОВАННО вектор
+        final_volatility = tf.reshape(volatility_levels[:, -1, :], [-1])  # [B] - ГАРАНТИРОВАННО вектор
         
         # === 5. ЯВНЫЙ PREDICT НА СЛЕДУЮЩИЙ ШАГ ===
         t_last = T - 1
