@@ -802,28 +802,59 @@ class HonestDataPreparator:
                     'min_windows_per_regime': self.min_windows_per_regime
                 }
             )
+            
+        # === ШАГ 4.7: СОХРАНЕНИЕ СЫРЫХ OHLC ДАННЫХ ДЛЯ ТЕСТОВОГО СПЛИТА ===
+        print("\n💾 ШАГ 4.7: Сохранение сырых OHLC данных для тестового сплита...")
+        try:
+            test_data['raw_ohlc'] = self._extract_raw_test_ohlc(df, test_windows)
+            print(f"✅ Сохранены сырые OHLC данные для теста:")
+            print(f"   • Всего точек с буфером: {len(test_data['raw_ohlc'])}")
+            print(f"   • Тестовый период: {test_data['raw_ohlc'].attrs['test_start_idx']} — {test_data['raw_ohlc'].attrs['test_end_idx']}")
+            print(f"   • Колонки: {list(test_data['raw_ohlc'].columns)}")
+        except Exception as e:
+            warnings.warn(f"⚠️  Не удалось сохранить сырые OHLC данные: {str(e)}")
+            test_data['raw_ohlc'] = None
         
         # ШАГ 5: Масштабирование
-        print("\n📏 ШАГ 4: Масштабирование признаков (каузальный подход)...")
+        print("\n📏 ШАГ 5: Масштабирование признаков и целевых переменных (каузальный подход)...")
         train_data['X_seq_scaled'] = self._scale_features_batch(train_data['X_seq'], fit=True)
         val_data['X_seq_scaled'] = self._scale_features_batch(val_data['X_seq'], fit=False)
         test_data['X_seq_scaled'] = self._scale_features_batch(test_data['X_seq'], fit=False)
         
+        # 🔑 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: масштабируем ВСЕ целевые переменные единым скейлером
         y_scaler = PowerTransformer(method='yeo-johnson', standardize=True)
+        # Масштабируем целевую переменную
         y_train_scaled = y_scaler.fit_transform(train_data['y_target'].reshape(-1, 1)).flatten()
         y_val_scaled = y_scaler.transform(val_data['y_target'].reshape(-1, 1)).flatten()
         y_test_scaled = y_scaler.transform(test_data['y_target'].reshape(-1, 1)).flatten()
         
+        # 🔑 МАСШТАБИРУЕМ y_filter (наблюдения для фильтрации внутри окна)!
+        y_filter_train_scaled = y_scaler.transform(
+            train_data['y_filter'].reshape(-1, 1)  # ← КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ
+        ).reshape(train_data['y_filter'].shape)
+        
+        y_filter_val_scaled = y_scaler.transform(
+            val_data['y_filter'].reshape(-1, 1)
+        ).reshape(val_data['y_filter'].shape)
+        
+        y_filter_test_scaled = y_scaler.transform(
+            test_data['y_filter'].reshape(-1, 1)
+        ).reshape(test_data['y_filter'].shape)
+        
         train_data['y_target_scaled'] = y_train_scaled
         val_data['y_target_scaled'] = y_val_scaled
         test_data['y_target_scaled'] = y_test_scaled
+        train_data['y_filter_scaled'] = y_filter_train_scaled  # ← НОВОЕ ПОЛЕ
+        val_data['y_filter_scaled'] = y_filter_val_scaled      # ← НОВОЕ ПОЛЕ
+        test_data['y_filter_scaled'] = y_filter_test_scaled    # ← НОВОЕ ПОЛЕ
+        
         self.model.feature_scalers['Y'] = y_scaler
         
         print("✅ Масштабирование завершено")
         
         # ШАГ 6: Сохранение
         if save_path is not None:
-            print(f"\n💾 ШАГ 5: Сохранение в ЕДИНЫЙ файл: {save_path}.pkl")
+            print(f"\n💾 ШАГ 6: Сохранение в ЕДИНЫЙ файл: {save_path}.pkl")
             self.save_prepared_datasets(
                 save_path,
                 train_data, val_data, test_data,
@@ -887,7 +918,7 @@ class HonestDataPreparator:
         metadata: Dict[str, Any]
     ) -> None:
         """
-        Сохранение в едином .pkl файле.
+        Сохранение в едином .pkl файле с сырыми OHLC данными тестового сплита.
         """
         if save_path.endswith('.pkl'):
             actual_path = save_path
@@ -896,14 +927,32 @@ class HonestDataPreparator:
         
         os.makedirs(os.path.dirname(actual_path) if os.path.dirname(actual_path) else '.', exist_ok=True)
         
+        # Подготовка сырых OHLC данных для сериализации
+        raw_ohlc_serializable = None
+        if test_df.get('raw_ohlc') is not None:
+            raw_ohlc_df = test_df['raw_ohlc'].copy()
+            # Сохраняем атрибуты как отдельный словарь (attrs не сериализуются напрямую)
+            raw_ohlc_attrs = {
+                'test_start_idx': raw_ohlc_df.attrs.get('test_start_idx'),
+                'test_end_idx': raw_ohlc_df.attrs.get('test_end_idx'),
+                'buffer_start': raw_ohlc_df.attrs.get('buffer_start'),
+                'buffer_end': raw_ohlc_df.attrs.get('buffer_end')
+            }
+            raw_ohlc_serializable = {
+                'data': raw_ohlc_df,
+                'attrs': raw_ohlc_attrs
+            }
+        
         cache_data = {
             'train': {
                 'X_seq': train_df['X_seq'],
                 'X_seq_scaled': train_df['X_seq_scaled'],
                 'y_filter': train_df['y_filter'],
+                'y_filter_scaled': train_df['y_filter_scaled'],
                 'y_target': train_df['y_target'],
                 'y_target_scaled': train_df['y_target_scaled'],
                 'timestamps': train_df['timestamps'],
+                'window_indices': train_df['window_indices'],
                 'regime_labels': train_df['regime_labels'],
                 'n_samples': train_df['n_samples']
             },
@@ -911,9 +960,11 @@ class HonestDataPreparator:
                 'X_seq': val_df['X_seq'],
                 'X_seq_scaled': val_df['X_seq_scaled'],
                 'y_filter': val_df['y_filter'],
+                'y_filter_scaled': val_df['y_filter_scaled'],
                 'y_target': val_df['y_target'],
                 'y_target_scaled': val_df['y_target_scaled'],
                 'timestamps': val_df['timestamps'],
+                'window_indices': val_df['window_indices'],
                 'regime_labels': val_df['regime_labels'],
                 'n_samples': val_df['n_samples']
             },
@@ -921,11 +972,14 @@ class HonestDataPreparator:
                 'X_seq': test_df['X_seq'],
                 'X_seq_scaled': test_df['X_seq_scaled'],
                 'y_filter': test_df['y_filter'],
+                'y_filter_scaled': test_df['y_filter_scaled'],
                 'y_target': test_df['y_target'],
                 'y_target_scaled': test_df['y_target_scaled'],
                 'timestamps': test_df['timestamps'],
+                'window_indices': test_df['window_indices'],
                 'regime_labels': test_df['regime_labels'],
-                'n_samples': test_df['n_samples']
+                'n_samples': test_df['n_samples'],
+                'raw_ohlc': raw_ohlc_serializable  # ← СЫРЫЕ OHLC ДАННЫЕ
             },
             'scalers': self.model.feature_scalers.copy() if self.model.feature_scalers else None,
             'scale_groups': self.model.scale_groups.copy() if hasattr(self.model, 'scale_groups') else None,
@@ -940,11 +994,21 @@ class HonestDataPreparator:
         print(f"   • Train: {train_df['n_samples']} образцов")
         print(f"   • Val:   {val_df['n_samples']} образцов")
         print(f"   • Test:  {test_df['n_samples']} образцов")
+        if raw_ohlc_serializable is not None:
+            print(f"   • Сырые OHLC (с буфером): {len(raw_ohlc_serializable['data'])} точек")
     
     def load_prepared_datasets(self, load_path: str) -> Tuple[Dict, Dict, Dict]:
         """
-        🔑 Загрузка с поддержкой путей как с расширением (.pkl), так и без.
+        Загрузка предварительно обработанных данных из единого .pkl файла.
+        Восстанавливает ВСЕ артефакты: скейлеры, квантили волатильности, метаданные и СЫРЫЕ OHLC данные.
+        
+        Args:
+            load_path: путь к файлу (с расширением .pkl или без)
+        
+        Returns:
+            train_data, val_data, test_data — словари с данными и метаинформацией
         """
+        # 🔑 Нормализация пути: принимаем как с .pkl, так и без
         if load_path.endswith('.pkl'):
             actual_path = load_path
         else:
@@ -952,7 +1016,7 @@ class HonestDataPreparator:
         
         if not os.path.exists(actual_path):
             raise FileNotFoundError(
-                f"Файл не найден: {actual_path}\n"
+                f"❌ Файл не найден: {actual_path}\n"
                 f"Проверьте:\n"
                 f"  1. Существует ли директория '{os.path.dirname(actual_path) or '.'}'\n"
                 f"  2. Корректность пути к кэшу (без двойного .pkl)\n"
@@ -965,14 +1029,16 @@ class HonestDataPreparator:
         
         metadata = cached.get('metadata', {})
         
-        # 🔑 ВАЛИДАЦИЯ ПАРАМЕТРОВ МОДЕЛИ
+        # 🔑 ВАЛИДАЦИЯ ПАРАМЕТРОВ МОДЕЛИ ПРОТИВ КЭША
+        print("\n🔍 Валидация параметров модели против кэшированных данных...")
         required_params = ['seq_len', 'min_history_for_features', 'buffer_size']
         mismatches = []
+        
         for param in required_params:
             cache_val = metadata.get(param)
             model_val = getattr(self, param, None)
             if cache_val is not None and model_val is not None and cache_val != model_val:
-                mismatches.append(f"{param}: model={model_val}, cache={cache_val}")
+                mismatches.append(f"  • {param}: model={model_val}, cache={cache_val}")
         
         # Для адаптивного режима проверяем дополнительные параметры
         adaptive_used = metadata.get('adaptive_blocks', False)
@@ -980,35 +1046,73 @@ class HonestDataPreparator:
             cache_min_regime = metadata.get('min_regime_per_block')
             cache_max_size = metadata.get('max_block_size')
             if cache_min_regime is not None and cache_min_regime != self.min_regime_per_block:
-                mismatches.append(f"min_regime_per_block: model={self.min_regime_per_block}, cache={cache_min_regime}")
+                mismatches.append(
+                    f"  • min_regime_per_block: model={self.min_regime_per_block}, cache={cache_min_regime}"
+                )
             if cache_max_size is not None and cache_max_size != self.max_block_size:
-                mismatches.append(f"max_block_size: model={self.max_block_size}, cache={cache_max_size}")
+                mismatches.append(
+                    f"  • max_block_size: model={self.max_block_size}, cache={cache_max_size}"
+                )
         else:
             cache_block_size = metadata.get('block_size')
             if cache_block_size is not None and cache_block_size != self.block_size:
-                mismatches.append(f"block_size: model={self.block_size}, cache={cache_block_size}")
+                mismatches.append(
+                    f"  • block_size: model={self.block_size}, cache={cache_block_size}"
+                )
         
         if mismatches:
             raise ValueError(
                 "❌ Несоответствие параметров модели и кэшированных данных:\n" +
                 "\n".join(mismatches) +
-                "\nИспользуйте force_recompute=True или согласуйте параметры."
+                "\n\nРешение: используйте force_recompute=True или согласуйте параметры подготовки данных."
             )
         
-        # 🔑 ИСПРАВЛЕНИЕ №5: двойная валидация режимов
-        self._validate_regime_balance_loaded(cached['train'], cached['val'], cached['test'], metadata)
+        print("✅ Параметры модели согласованы с кэшем")
         
-        # 🔑 ВОССТАНОВЛЕНИЕ КВАНТИЛЕЙ ДЛЯ ОНЛАЙН-ПРЕДСКАЗАНИЯ
+        # 🔑 ВОССТАНОВЛЕНИЕ СЫРЫХ OHLC ДАННЫХ ДЛЯ ТЕСТОВОГО СПЛИТА
+        test_data = cached['test']
+        if 'raw_ohlc' in test_data and test_data['raw_ohlc'] is not None:
+            raw_ohlc_serializable = test_data['raw_ohlc']
+            raw_ohlc_df = raw_ohlc_serializable['data'].copy()
+            
+            # Восстанавливаем атрибуты границ тестового периода
+            raw_ohlc_df.attrs['test_start_idx'] = raw_ohlc_serializable['attrs'].get('test_start_idx', 0)
+            raw_ohlc_df.attrs['test_end_idx'] = raw_ohlc_serializable['attrs'].get('test_end_idx', len(raw_ohlc_df))
+            raw_ohlc_df.attrs['buffer_start'] = raw_ohlc_serializable['attrs'].get('buffer_start', 0)
+            raw_ohlc_df.attrs['buffer_end'] = raw_ohlc_serializable['attrs'].get('buffer_end', len(raw_ohlc_df))
+            
+            test_data['raw_ohlc'] = raw_ohlc_df
+            
+            print(f"✅ Сырые OHLC данные восстановлены для тестового сплита:")
+            print(f"   • Всего точек (с буфером): {len(raw_ohlc_df)}")
+            print(f"   • Тестовый период: [{raw_ohlc_df.attrs['test_start_idx']} : {raw_ohlc_df.attrs['test_end_idx']})")
+            print(f"   • Колонки: {list(raw_ohlc_df.columns)}")
+            print(f"   • Буферные зоны: {raw_ohlc_df.attrs['buffer_start']} — {raw_ohlc_df.attrs['buffer_end']}")
+        else:
+            test_data['raw_ohlc'] = None
+            warnings.warn(
+                "⚠️  Сырые OHLC данные отсутствуют в кэше. Для полной функциональности метода evaluate "
+                "рекомендуется пересчитать данные с force_recompute=True"
+            )
+        
+        # 🔑 ДВОЙНАЯ ВАЛИДАЦИЯ РЕЖИМОВ (по метаданным + по фактическим меткам)
+        self._validate_regime_balance_loaded(cached['train'], cached['val'], test_data, metadata)
+        
+        # 🔑 ВОССТАНОВЛЕНИЕ КВАНТИЛЕЙ ВОЛАТИЛЬНОСТИ ДЛЯ ОНЛАЙН-ПРЕДСКАЗАНИЙ
         if 'volatility_quantiles' in metadata:
             self.model.volatility_quantiles = metadata['volatility_quantiles']
-            print(f"✅ Квантили волатильности восстановлены из кэша:")
+            print(f"\n✅ Квантили волатильности восстановлены из кэша:")
             print(f"   • Q33: {metadata['volatility_quantiles']['q33']:.6f}")
+            print(f"   • Q50: {metadata['volatility_quantiles']['q50']:.6f}")
             print(f"   • Q67: {metadata['volatility_quantiles']['q67']:.6f}")
             print(f"   • Будут использоваться в online_predict для согласованной классификации режимов")
         else:
-            warnings.warn("⚠️  Квантили волатильности отсутствуют в кэше! Онлайн-предсказание может быть несогласованным.")
+            warnings.warn(
+                "⚠️  Квантили волатильности отсутствуют в кэше! Онлайн-предсказание может быть несогласованным.\n"
+                "   Рекомендуется пересчитать данные с сохранением квантилей (force_recompute=True)."
+            )
         
-        # Восстановление скейлеров
+        # 🔑 ВОССТАНОВЛЕНИЕ СКЕЙЛЕРОВ И МЕТАДАННЫХ
         if 'scalers' in cached and cached['scalers'] is not None:
             self.model.feature_scalers = cached['scalers']
             print("✅ Скейлеры восстановлены")
@@ -1021,20 +1125,34 @@ class HonestDataPreparator:
             self.model.feature_columns = cached['feature_columns']
             print("✅ feature_columns восстановлены")
         
+        # 🔑 ВАЛИДАЦИЯ ХРОНОЛОГИИ ЗАГРУЖЕННЫХ ДАННЫХ
+        self._validate_chronology_loaded(cached['train'], cached['val'], test_data)
+        
+        # 🔑 ВОССТАНОВЛЕНИЕ ФЛАГА СТРАТИФИКАЦИИ ДЛЯ ПОСЛЕДУЮЩИХ ОПЕРАЦИЙ
+        self.adaptive_blocks = metadata.get('adaptive_blocks', False)
+        
+        # Вывод итоговой статистики
         train_data = cached['train']
         val_data = cached['val']
-        test_data = cached['test']
         
-        # Валидация хронологии
-        self._validate_chronology_loaded(train_data, val_data, test_data)
+        print(f"\n✅ Данные успешно загружены:")
+        print(f"   • Train: {train_data['n_samples']} образцов")
+        print(f"   • Val:   {val_data['n_samples']} образцов")
+        print(f"   • Test:  {test_data['n_samples']} образцов")
         
-        print(f"✅ Данные загружены:")
-        print(f"   Train: {train_data['n_samples']} образцов")
-        print(f"   Val:   {val_data['n_samples']} образцов")
-        print(f"   Test:  {test_data['n_samples']} образцов")
-        
-        # Восстанавливаем флаг адаптивной стратификации из метаданных для последующих операций
-        self.adaptive_blocks = metadata.get('adaptive_blocks', False)
+        # Дополнительная информация о распределении режимов
+        if 'regime_labels' in train_data:
+            regime_names = {0: 'LOW', 1: 'MID', 2: 'HIGH'}
+            print(f"\n📊 Распределение режимов волатильности:")
+            for split_name, split_data in [('Train', train_data), ('Val', val_data), ('Test', test_data)]:
+                if split_data['n_samples'] == 0:
+                    continue
+                counts = np.bincount(split_data['regime_labels'], minlength=3)
+                total = counts.sum()
+                print(f"   {split_name:5s}: " + " | ".join([
+                    f"{regime_names[r]}={counts[r]} ({counts[r]/total*100:.1f}%)"
+                    for r in range(3)
+                ]))
         
         return train_data, val_data, test_data
     
@@ -1126,20 +1244,16 @@ class HonestDataPreparator:
         val_df: Dict,
         batch_size: int = 64
     ) -> Tuple[Any, Any]:
-        """
-        🔑 ИСПРАВЛЕНИЕ №6: drop_remainder=False для валидации (сохранение всех данных).
-        """
         import tensorflow as tf
-        
+        # 🔑 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: используем МАСШТАБИРОВАННЫЕ наблюдения для фильтрации
         train_ds = tf.data.Dataset.from_tensor_slices((
             train_df['X_seq_scaled'],
-            train_df['y_filter'],
+            train_df['y_filter_scaled'],   # ✅ СКАЛИРОВАННЫЕ НАБЛЮДЕНИЯ!
             train_df['y_target_scaled']
         ))
-        
         val_ds = tf.data.Dataset.from_tensor_slices((
             val_df['X_seq_scaled'],
-            val_df['y_filter'],
+            val_df['y_filter_scaled'],     # ✅ СКАЛИРОВАННЫЕ НАБЛЮДЕНИЯ!
             val_df['y_target_scaled']
         ))
         
@@ -1551,4 +1665,104 @@ class HonestDataPreparator:
                 f"   Трассировка: {traceback.format_exc()}\n"
                 f"   Продолжаем подготовку данных без гистограмм."
             )
+
+    def _extract_raw_test_ohlc(
+        self,
+        df: pd.DataFrame,
+        test_windows: List[Dict]
+    ) -> pd.DataFrame:
+        """
+        Извлечение сырых OHLC данных для тестового сплита с буферными зонами.
+        
+        Возвращает датафрейм с колонками ['timestamp', 'Open', 'High', 'Low', 'Close']
+        и атрибутами:
+            - test_start_idx: индекс начала тестового периода (относительно буфера)
+            - test_end_idx: индекс конца тестового периода (относительно буфера, включительно)
+            - buffer_start: глобальный индекс начала буфера в исходном датафрейме
+            - buffer_end: глобальный индекс конца буфера в исходном датафрейме
+        
+        Гарантии:
+            • Буферные зоны достаточны для расчёта признаков при онлайн-оценке
+            • Временные метки сохраняются в истинном формате (не числовые индексы 0,1,2...)
+            • Все обязательные OHLC колонки присутствуют
+        """
+        if not test_windows:
+            raise ValueError("Тестовый сплит пуст")
+        
+        # Определяем границы тестового периода
+        min_t = min(win['t'] for win in test_windows)
+        max_t = max(win['t'] for win in test_windows)
+        
+        # Добавляем буфер для корректного расчёта признаков при онлайн-оценке
+        buffer_start = max(0, min_t - self.buffer_size - self.min_history_for_features)
+        buffer_end = min(len(df), max_t + self.buffer_size + 1)  # +1 для целевого значения
+        
+        # Валидация наличия обязательных колонок OHLC
+        required_cols = ['Open', 'High', 'Low', 'Close']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Отсутствуют обязательные OHLC колонки: {missing_cols}")
+        
+        # Извлекаем сырые OHLC данные с буферными зонами
+        raw_ohlc = df.iloc[buffer_start:buffer_end][required_cols].copy()
+        
+        # 🔑 КОРРЕКТНОЕ СОХРАНЕНИЕ ВРЕМЕННЫХ МЕТОК (поддержка разных форматов)
+        # Случай 1: исходный индекс — временной (DatetimeIndex)
+        if pd.api.types.is_datetime64_any_dtype(df.index):
+            raw_ohlc['timestamp'] = df.index[buffer_start:buffer_end].copy()
+        
+        # Случай 2: есть колонка с временной меткой в самом датафрейме
+        elif 'Date' in df.columns:
+            raw_ohlc['timestamp'] = df.iloc[buffer_start:buffer_end]['Date'].values
+        elif 'Datetime' in df.columns:
+            raw_ohlc['timestamp'] = df.iloc[buffer_start:buffer_end]['Datetime'].values
+        elif 'Timestamp' in df.columns:
+            raw_ohlc['timestamp'] = df.iloc[buffer_start:buffer_end]['Timestamp'].values
+        
+        # Случай 3: числовой индекс без временных меток — используем его как есть (предупреждение)
+        else:
+            warnings.warn(
+                "⚠️  В исходных данных отсутствуют временные метки (ни в индексе, ни в колонках). "
+                "Колонка 'timestamp' будет содержать числовой индекс. "
+                "Рекомендуется добавить колонку 'Date' или использовать DatetimeIndex."
+            )
+            raw_ohlc['timestamp'] = np.arange(buffer_start, buffer_end)
+        
+        # Перемещаем 'timestamp' в начало для удобства
+        raw_ohlc = raw_ohlc[['timestamp', 'Open', 'High', 'Low', 'Close']].copy()
+        
+        # 🔑 СОХРАНЕНИЕ МЕТАИНФОРМАЦИИ О ГРАНИЦАХ ТЕСТОВОГО ПЕРИОДА
+        # Относительные индексы внутри буферного датафрейма
+        raw_ohlc.attrs['test_start_idx'] = min_t - buffer_start  # начало теста (включительно)
+        raw_ohlc.attrs['test_end_idx'] = max_t - buffer_start + 1  # конец теста (включительно, +1 для среза)
+        
+        # Абсолютные индексы в исходном датафрейме
+        raw_ohlc.attrs['buffer_start'] = buffer_start
+        raw_ohlc.attrs['buffer_end'] = buffer_end
+        
+        # Дополнительная метаинформация для отладки
+        raw_ohlc.attrs['global_test_start'] = min_t
+        raw_ohlc.attrs['global_test_end'] = max_t
+        
+        # Валидация: тестовый период должен быть внутри буфера
+        if (raw_ohlc.attrs['test_start_idx'] < 0 or 
+            raw_ohlc.attrs['test_end_idx'] > len(raw_ohlc)):
+            raise RuntimeError(
+                f"Ошибка расчёта границ тестового периода: "
+                f"test_start_idx={raw_ohlc.attrs['test_start_idx']}, "
+                f"test_end_idx={raw_ohlc.attrs['test_end_idx']}, "
+                f"буферная длина={len(raw_ohlc)}"
+            )
+        
+        # Валидация: достаточность буфера для расчёта признаков
+        min_required_buffer = self.min_history_for_features + self.buffer_size
+        actual_left_buffer = raw_ohlc.attrs['test_start_idx']
+        if actual_left_buffer < min_required_buffer:
+            warnings.warn(
+                f"⚠️  Левый буфер ({actual_left_buffer} точек) меньше минимально требуемого "
+                f"({min_required_buffer} точек) для расчёта признаков. "
+                f"Это может повлиять на корректность онлайн-оценки в начале тестового периода."
+            )
+        
+        return raw_ohlc            
             
