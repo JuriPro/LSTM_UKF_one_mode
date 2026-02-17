@@ -2459,7 +2459,7 @@ class LSTMIMMUKF(tf.Module):
         volatility_levels: tf.Tensor,
         target_coverage: tf.Tensor,
         training: bool = False
-    ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+    ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
         """
         ЕДИНАЯ ТОЧКА РАСЧЁТА КАЛИБРОВОЧНОЙ ПОТЕРИ СО СГЛАЖЕННЫМ ПОКРЫТИЕМ.
     
@@ -2501,27 +2501,26 @@ class LSTMIMMUKF(tf.Module):
         over_gap = actual_coverage - target_coverage_mean    # >0 => перекрытие
     
         # Обычно undercoverage хуже, поэтому его вес выше.
-        undercoverage_penalty = 10.0 * tf.square(tf.nn.relu(under_gap))
-        overcoverage_penalty = 3.0 * tf.square(tf.nn.relu(over_gap))
+        undercoverage_penalty = 8.0 * tf.square(tf.nn.relu(under_gap))
+        overcoverage_penalty = 12.0 * tf.square(tf.nn.relu(over_gap))
     
         # === 5) Штраф за ширину ДИ (в относительных единицах) ===
         ci_width_batch = ci_upper - ci_lower
         mean_width = tf.reduce_mean(ci_width_batch)
         width_ratio = mean_width / (y_std_batch + 1e-8)
-    
-        # Твой таргет по ширине, зависящий от volatility_levels
+        
         avg_volatility = tf.reduce_mean(volatility_levels[:, -1, :])
         target_width_ratio = 1.8 * (1.0 + 0.2 * avg_volatility)
         target_width_ratio = tf.clip_by_value(target_width_ratio, 1.5, 2.5)
-    
-        # ВАЖНОЕ ИЗМЕНЕНИЕ: на этапе стабилизации калибровки штрафуем только "слишком широко".
-        # Штраф "слишком узко" часто конфликтует с задачей убрать overcoverage/сжать интервалы.
-        width_penalty = 2.0 * tf.square(tf.nn.relu(width_ratio - target_width_ratio))
-    
-        # === 6) Итог ===
+        
+        # ✅ Отдельный компонент ширины (можно логировать и/или добавлять в total loss без клипа)
+        width_error = tf.square(tf.nn.relu(width_ratio - target_width_ratio))
+        
+        width_penalty = 2.0 * width_error
+        
         raw_calibration_loss = undercoverage_penalty + overcoverage_penalty + width_penalty
-    
-        return raw_calibration_loss, actual_coverage, width_ratio, target_width_ratio
+        
+        return raw_calibration_loss, actual_coverage, width_ratio, target_width_ratio, width_error
 
     @tf.function
     def _calibrate_confidence_interval(
@@ -2841,7 +2840,7 @@ class LSTMIMMUKF(tf.Module):
     
                 mse_loss_for_normalization = tf.reduce_mean(tf.square(forecast - y_target_batch))
     
-                raw_calibration_loss, actual_coverage, width_ratio, target_width_ratio = self._compute_calibration_loss(
+                raw_calibration_loss, actual_coverage, width_ratio, target_width_ratio, width_error = self._compute_calibration_loss(
                     ci_min, ci_max, y_target_batch, y_for_filtering_batch,
                     volatility_levels, target_coverage, training=True
                 )
@@ -2849,15 +2848,11 @@ class LSTMIMMUKF(tf.Module):
                 scale = tf.stop_gradient(mse_loss_for_normalization / (raw_calibration_loss + 1e-8))
                 calibration_loss_normalized = raw_calibration_loss * scale
     
-                upper = current_weight * 0.3 * tf.stop_gradient(mse_loss_for_normalization)
-                calibration_loss_clipped = tf.clip_by_value(
-                    current_weight * calibration_loss_normalized,
-                    0.0,
-                    upper
-                )
+                x = current_weight * calibration_loss_normalized
+                cap = current_weight * 2.0 * tf.stop_gradient(mse_loss_for_normalization)
+                calibration_loss_clipped = cap * tf.math.tanh(x / (cap + 1e-8))
     
                 # 9) TOTAL LOSS
-                # ВАЖНО: compute_loss должен быть очищен от base_q_logit/student_t_base_dof/etc.
                 loss = self.compute_loss(
                     forecast,
                     y_target_batch,
@@ -2869,6 +2864,17 @@ class LSTMIMMUKF(tf.Module):
                     regime_info=regime_info,
                     training=True
                 )
+
+                # ✅ Width-only сигнал с warmup (не клипается calibration clip’ом)
+                width_warmup_steps = tf.constant(200.0, tf.float32)
+                wprog = tf.cast(self._step_counter, tf.float32) / width_warmup_steps
+                wprog = tf.clip_by_value(wprog, 0.0, 1.0)
+
+                lambda_width_base = tf.constant(0.005, tf.float32)  # попробуй 0.002–0.01
+                lambda_width = lambda_width_base * tf.square(wprog)
+
+                width_loss = lambda_width * tf.cast(width_error, tf.float32)
+                loss = loss + width_loss
     
                 # 10) TRAINABLE VARS (LSTM-only + diff_ukf + regime_selector + max_width_factor_logit)
                 trainable_vars = []
@@ -2961,6 +2967,9 @@ class LSTMIMMUKF(tf.Module):
             "calib_raw": raw_calibration_loss,
             "calib_norm": calibration_loss_normalized,
             "target_width_ratio": target_width_ratio,
+            "width_error": width_error,
+            "width_loss": width_loss,
+            "lambda_width": lambda_width
         }
     
         entropy_stats = self.entropy_regularizer.get_entropy_stats(h_lstm2)
@@ -3291,7 +3300,7 @@ class LSTMIMMUKF(tf.Module):
             mse_loss_for_normalization = tf.reduce_mean(tf.square(forecast - y_target_batch))
     
             # ВАЖНО: предполагаем, что _compute_calibration_loss уже обновлён и возвращает target_width_ratio 4-м значением
-            raw_calibration_loss, actual_coverage, width_ratio, target_width_ratio = self._compute_calibration_loss(
+            raw_calibration_loss, actual_coverage, width_ratio, target_width_ratio, width_error = self._compute_calibration_loss(
                 ci_min, ci_max, y_target_batch, y_for_filtering_batch,
                 volatility_levels, target_coverage, training=False
             )
@@ -3306,17 +3315,27 @@ class LSTMIMMUKF(tf.Module):
             calibration_loss = tf.clip_by_value(calibration_loss_normalized, 0.0, upper)  # "clipped" на VAL
     
             # 8) Total loss
+            # Это чтобы сравнивать только по MSE без добавки калибровки (только в val_step)
+            calibration_loss_for_val = tf.constant(0.0, tf.float32)
+            
             loss = self.compute_loss(
                 forecast,
                 y_target_batch,
                 volatility_levels,
                 inflation_factors,
                 ukf_params,
-                calibration_loss,
+                calibration_loss_for_val,
                 entropy_loss,
                 regime_info=regime_info,
                 training=False
             )
+
+            # ✅ Width-only сигнал (не клипается calibration clip’ом)
+            lambda_width = tf.constant(0.01, tf.float32)  # старт: 0.005–0.02
+            width_loss = lambda_width * tf.cast(width_error, tf.float32)
+            
+            # width_loss не используется в val_step
+            # loss = loss + width_loss            
     
             # 9) Метрики
             mse_loss = tf.reduce_mean(tf.square(forecast - y_target_batch))
@@ -3375,6 +3394,8 @@ class LSTMIMMUKF(tf.Module):
                 'calib_clipped': calibration_loss,              # на VAL это calibration_loss
                 'calib_raw': raw_calibration_loss,
                 'calib_norm': calibration_loss_normalized,
+                'width_error': width_error,
+                'lambda_width': lambda_width
             }
     
             if self.debug_mode and tf.equal(tf.math.floormod(self._step_counter, 100), 0):
@@ -4292,7 +4313,16 @@ class LSTMIMMUKF(tf.Module):
         # и добавишь в metrics.
         tr_tw = _mean("target_width_ratio", train_metrics)
         va_tw = _mean("target_width_ratio", val_metrics)
-    
+
+        # === WIDTH-ONLY (если добавишь ключи в metrics) ===
+        tr_we = _mean("width_error", train_metrics)
+        tr_wl = _mean("width_loss", train_metrics)
+        tr_lw = _mean("lambda_width", train_metrics)
+        
+        va_we = _mean("width_error", val_metrics)
+        va_wl = _mean("width_loss", val_metrics)
+        va_lw = _mean("lambda_width", val_metrics)
+            
         # Статусы
         tr_cov_s, tr_cov_msg, tr_cov_gap = _cov_status(tr_cov, tr_tc)
         va_cov_s, va_cov_msg, va_cov_gap = _cov_status(va_cov, va_tc)
@@ -4348,13 +4378,34 @@ class LSTMIMMUKF(tf.Module):
                 report += f"   • calib_norm: {tr_calib_norm:.6f}\n"
             if np.isfinite(tr_calib_raw):
                 report += f"   • calib_raw: {tr_calib_raw:.6f}\n"
+
+        # Доп. инфа по width-only (TRAIN/VAL)
+        if any(np.isfinite(x) for x in [tr_we, tr_wl, tr_lw, va_we, va_wl, va_lw]):
+            report += "\n📏 WIDTH-ONLY (среднее по батчам):\n"
+        
+            if np.isfinite(tr_we) or np.isfinite(tr_wl) or np.isfinite(tr_lw):
+                report += "   TRAIN:\n"
+                if np.isfinite(tr_we):
+                    report += f"     • width_error: {tr_we:.6f}\n"
+                if np.isfinite(tr_wl):
+                    report += f"     • width_loss: {tr_wl:.6e}\n"
+                if np.isfinite(tr_lw):
+                    report += f"     • lambda_width: {tr_lw:.6f}\n"
+        
+            if np.isfinite(va_we) or np.isfinite(va_wl) or np.isfinite(va_lw):
+                report += "   VAL:\n"
+                if np.isfinite(va_we):
+                    report += f"     • width_error: {va_we:.6f}\n"
+                if np.isfinite(va_wl):
+                    report += f"     • width_loss: {va_wl:.6e}\n"
+                if np.isfinite(va_lw):
+                    report += f"     • lambda_width: {va_lw:.6f}\n"
     
         if innov_line:
             report += "\n🔎 НОРМАЛИЗОВАННЫЕ ИННОВАЦИИ:\n" + innov_line
     
         report += f"{'='*80}\n"
         return report
-
 
     def inverse_transform_target(self, scaled_values: np.ndarray) -> np.ndarray:
         """
