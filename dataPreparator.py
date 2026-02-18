@@ -599,7 +599,10 @@ class HonestDataPreparator:
     
     def _scale_features_batch(self, X_batch: np.ndarray, fit: bool = False) -> np.ndarray:
         """
-        🔑 ИСПРАВЛЕНИЕ №4: устранение избыточного fit и добавление валидации скейлеров.
+        🔑 ИСПРАВЛЕНО: 
+        1. Добавлена численная стабилизация для группы 'none' (согласовано с инференсом)
+        2. Добавлена финальная очистка от inf/nan (согласовано с инференсом)
+        3. Убрана попытка обработать 'none' как скейлер
         """
         n_samples, seq_len, n_features = X_batch.shape
         X_scaled = np.zeros_like(X_batch, dtype=np.float32)
@@ -609,21 +612,19 @@ class HonestDataPreparator:
                 'robust': None,
                 'standard': None,
                 'minmax': None,
-                'none': None,
-                'Y': None
+                'Y': None  # 'none' не является скейлером — не включаем в словарь
             }
         
+        # 1. Обработка групповых скейлеров (кроме 'none')
         for group_name, features in self.model.scale_groups.items():
+            if group_name == 'none':  # ← ПРОПУСКАЕМ 'none' — обработаем отдельно
+                continue
+                
             valid_features = [f for f in features if f in self.model.feature_columns]
             if not valid_features:
                 continue
-            
+                
             feature_indices = [self.model.feature_columns.index(f) for f in valid_features]
-            
-            if group_name == 'none':
-                X_scaled[:, :, feature_indices] = X_batch[:, :, feature_indices]
-                continue
-            
             X_group = X_batch[:, :, feature_indices].reshape(-1, len(feature_indices))
             
             # Получаем или создаём скейлер
@@ -639,9 +640,8 @@ class HonestDataPreparator:
                     scaler = MinMaxScaler(feature_range=(0, 1))
                 else:
                     scaler = None
-                
+                    
                 if scaler is not None and fit:
-                    # 🔑 КРИТИЧЕСКИ ВАЖНО: НЕТ избыточного вызова fit() — только fit_transform
                     X_group_scaled = scaler.fit_transform(X_group)
                     self.model.feature_scalers[group_name] = scaler
                 else:
@@ -649,15 +649,47 @@ class HonestDataPreparator:
             else:
                 scaler = self.model.feature_scalers[group_name]
                 if scaler is None:
-                    raise RuntimeError(...)
-                if fit:
-                    X_group_scaled = scaler.fit_transform(X_group)  # ← переобучение при необходимости
-                    self.model.feature_scalers[group_name] = scaler
+                    X_group_scaled = X_group
                 else:
-                    X_group_scaled = scaler.transform(X_group)
-            
+                    if fit:
+                        X_group_scaled = scaler.fit_transform(X_group)
+                        self.model.feature_scalers[group_name] = scaler
+                    else:
+                        X_group_scaled = scaler.transform(X_group)
+                        
             X_scaled[:, :, feature_indices] = X_group_scaled.reshape(n_samples, seq_len, len(feature_indices))
         
+        # 2. 🔑 ЧИСЛЕННАЯ СТАБИЛИЗАЦИЯ ДЛЯ ГРУППЫ 'none' (СОГЛАСОВАНО С ИНФЕРЕНСОМ!)
+        if 'none' in self.model.scale_groups:
+            for col in self.model.scale_groups['none']:
+                if col in self.model.feature_columns:
+                    idx = self.model.feature_columns.index(col)
+                    X_scaled[:, :, idx] = X_batch[:, :, idx]  # копируем "как есть"
+                    # 🔑 ПРИМЕНЯЕМ ЧИСЛЕННУЮ СТАБИЛИЗАЦИЮ КАК В _scale_features()!
+                    if col == 'asymmetry_ratio':
+                        X_scaled[:, :, idx] = np.clip(X_scaled[:, :, idx], 0.1, 3.0)
+                    elif col == 'percentile_pos_fisher':
+                        X_scaled[:, :, idx] = np.clip(X_scaled[:, :, idx], -5.0, 5.0)
+        
+        # 🔑 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: СОГЛАСОВАННОЕ МАСШТАБИРОВАНИЕ 'level' ЧЕРЕЗ 'Y' СКЕЙЛЕР
+        # 'level' не входит в scale_groups → попадает в "дыру". Явно обрабатываем её через 'Y' скейлер.
+        if 'level' in self.model.feature_columns and 'Y' in self.model.feature_scalers and self.model.feature_scalers['Y'] is not None:
+            level_idx = self.model.feature_columns.index('level')
+            # Извлекаем 'level' из исходных данных
+            level_values = X_batch[:, :, level_idx].reshape(-1, 1)  # [B*T, 1]
+            # Применяем 'Y' скейлер (гарантированно существует благодаря изменению порядка выше!)
+            level_scaled = self.model.feature_scalers['Y'].transform(level_values).reshape(X_batch.shape[0], X_batch.shape[1])
+            X_scaled[:, :, level_idx] = level_scaled
+        elif 'level' in self.model.feature_columns:
+            # Fallback: если 'Y' скейлер отсутствует — оставляем как есть (но это ошибка!)
+            level_idx = self.model.feature_columns.index('level')
+            X_scaled[:, :, level_idx] = X_batch[:, :, level_idx]
+            warnings.warn(
+                "⚠️  Скейлер 'Y' отсутствует! 'level' не масштабирован согласованно. "
+                "Это приведёт к несогласованности между обучением и инференсом."
+            )
+        
+        # 3. 🔑 ФИНАЛЬНАЯ ОЧИСТКА ОТ НЕКОРРЕКТНЫХ ЗНАЧЕНИЙ (согласовано с обучением!)
         X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=0.0, neginf=0.0)
         return X_scaled
     
@@ -817,26 +849,20 @@ class HonestDataPreparator:
         
         # ШАГ 5: Масштабирование
         print("\n📏 ШАГ 5: Масштабирование признаков и целевых переменных (каузальный подход)...")
-        train_data['X_seq_scaled'] = self._scale_features_batch(train_data['X_seq'], fit=True)
-        val_data['X_seq_scaled'] = self._scale_features_batch(val_data['X_seq'], fit=False)
-        test_data['X_seq_scaled'] = self._scale_features_batch(test_data['X_seq'], fit=False)
         
-        # 🔑 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: масштабируем ВСЕ целевые переменные единым скейлером
+        # 🔑 СНАЧАЛА создаём и фитируем 'Y' скейлер на целевой переменной (гарантируем его существование ДО масштабирования признаков)
         y_scaler = PowerTransformer(method='yeo-johnson', standardize=True)
-        # Масштабируем целевую переменную
         y_train_scaled = y_scaler.fit_transform(train_data['y_target'].reshape(-1, 1)).flatten()
         y_val_scaled = y_scaler.transform(val_data['y_target'].reshape(-1, 1)).flatten()
         y_test_scaled = y_scaler.transform(test_data['y_target'].reshape(-1, 1)).flatten()
         
-        # 🔑 МАСШТАБИРУЕМ y_filter (наблюдения для фильтрации внутри окна)!
+        # Масштабируем y_filter через тот же 'Y' скейлер
         y_filter_train_scaled = y_scaler.transform(
-            train_data['y_filter'].reshape(-1, 1)  # ← КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ
+            train_data['y_filter'].reshape(-1, 1)
         ).reshape(train_data['y_filter'].shape)
-        
         y_filter_val_scaled = y_scaler.transform(
             val_data['y_filter'].reshape(-1, 1)
         ).reshape(val_data['y_filter'].shape)
-        
         y_filter_test_scaled = y_scaler.transform(
             test_data['y_filter'].reshape(-1, 1)
         ).reshape(test_data['y_filter'].shape)
@@ -844,13 +870,17 @@ class HonestDataPreparator:
         train_data['y_target_scaled'] = y_train_scaled
         val_data['y_target_scaled'] = y_val_scaled
         test_data['y_target_scaled'] = y_test_scaled
-        train_data['y_filter_scaled'] = y_filter_train_scaled  # ← НОВОЕ ПОЛЕ
-        val_data['y_filter_scaled'] = y_filter_val_scaled      # ← НОВОЕ ПОЛЕ
-        test_data['y_filter_scaled'] = y_filter_test_scaled    # ← НОВОЕ ПОЛЕ
-        
+        train_data['y_filter_scaled'] = y_filter_train_scaled
+        val_data['y_filter_scaled'] = y_filter_val_scaled
+        test_data['y_filter_scaled'] = y_filter_test_scaled
         self.model.feature_scalers['Y'] = y_scaler
+        print("✅ 'Y' скейлер создан и применён к целевым переменным")
         
-        print("✅ Масштабирование завершено")
+        # 🔑 ТОЛЬКО ПОСЛЕ ЭТОГО масштабируем признаки (включая 'level' через уже существующий 'Y' скейлер)
+        train_data['X_seq_scaled'] = self._scale_features_batch(train_data['X_seq'], fit=True)
+        val_data['X_seq_scaled'] = self._scale_features_batch(val_data['X_seq'], fit=False)
+        test_data['X_seq_scaled'] = self._scale_features_batch(test_data['X_seq'], fit=False)
+        print("✅ Масштабирование признаков завершено")
         
         # ШАГ 6: Сохранение
         if save_path is not None:
