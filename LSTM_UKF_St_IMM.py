@@ -104,186 +104,248 @@ class ImplicitKalmanUpdate(tf.Module):
 
         return x_upd, P_upd, innov, K
 
+class MinMaxClip(tf.keras.constraints.Constraint):
+    """Кастомный constraint для ограничения веса в диапазоне [min_value, max_value]"""
+    def __init__(self, min_value=0.0, max_value=1.0):
+        self.min_value = min_value
+        self.max_value = max_value
 
-class VolatilityRegimeSelector(tf.Module):
-    """
-    Мягкое распределение по режимам волатильности (LOW/MID/HIGH).
-    Адаптивная калибровка масштабов доверительных интервалов.
-    """
+    def __call__(self, w):
+        return tf.clip_by_value(w, self.min_value, self.max_value)
 
-    def __init__(self,
-                 num_regimes: int = 3,
-                 history_window: int = 100,
-                 learnable_centers: bool = True,
-                 name: str = None):
-        """
-        Args:
-            num_regimes: количество режимов (3: LOW, MID, HIGH)
-            history_window: размер окна истории для расчета квантилей
-            learnable_centers: использовать ли learnable центроиды режимов
-            name: имя модуля
-        """
-        super().__init__(name=name)
+    def get_config(self):
+        return {'min_value': self.min_value, 'max_value': self.max_value}
+
+class VolatilityRegimeSelector(tf.keras.layers.Layer):
+    def __init__(self, num_regimes=3, history_window=100, learnable_centers=True, name="volatility_regime_selector"):
+        super(VolatilityRegimeSelector, self).__init__(name=name)
+        
         self.num_regimes = num_regimes
         self.history_window = history_window
         self.learnable_centers = learnable_centers
 
-        # Learnable параметры для каждого режима
-        # regime_scales[i] = масштаб CI для режима i
-        # ИСПРАВЛЕНО: УВЕЛИЧЕННЫЕ ЦЕЛЕВЫЕ ЗНАЧЕНИЯ для режимов волатильности (увеличено на 30% для компенсации низкого покрытия)
-        # LOW: 1.56 × (-ln(1-0.85)) = 1.56 × 1.895 = 2.96
-        # MID: 2.34 × 1.895 = 4.44
-        # HIGH: 3.25 × 1.895 = 6.16
-        self.regime_scales = tf.Variable(
-            tf.constant([2.96, 4.44, 6.16], dtype=tf.float32),  # LOW, MID, HIGH - увеличены на ~30%
-            trainable=True,
-            name='regime_scales',
-            constraint=lambda x: tf.clip_by_value(x, 1.0, 8.0)  # Расширенный диапазон для адаптации
+        # === ИНИЦИАЛИЗАЦИЯ base_centers ===
+        self.base_centers = tf.constant([0.1, 0.3, 0.6], dtype=tf.float32)
+
+        # История волатильности
+        self._vol_history = tf.Variable(
+            tf.zeros([1, history_window], dtype=tf.float32),
+            trainable=False,
+            name='volatility_history'
         )
-        # Learnable центроиды для мягкого распределения
+
         if self.learnable_centers:
-            # Инициализация на основе ожидаемых квантилей волатильности
-            # LOW режим: 0.1 (низкая волатильность)
-            # MID режим: 0.3 (средняя волатильность)
-            # HIGH режим: 0.6 (высокая волатильность)
             initial_centers = np.log([0.1, 0.3, 0.6])
-            self.center_logits = tf.Variable(
-                tf.constant(initial_centers, dtype=tf.float32),
+            self.center_logits = self.add_weight(
+                name="center_logits",
+                shape=(num_regimes,),
+                initializer=lambda shape, dtype: tf.constant(initial_centers, dtype=dtype),
                 trainable=True,
-                name='center_logits'
+                dtype=tf.float32
             )
         else:
-            self.centers = tf.constant([0.1, 0.3, 0.6], dtype=tf.float32)
-        # Температура для softmax (управляет "остротой" распределения)
-        # ИСПРАВЛЕНО: Начальное значение 0.4 для более резкого начального распределения
-        self.temperature = tf.Variable(
-            0.4,
+            self.center_logits = None
+
+        # --- ИСПРАВЛЕНО: Кастомный MinMaxClip ---
+        self.temperature = self.add_weight(
+            name="temperature",
+            shape=(),
+            initializer="ones",
             trainable=True,
-            name='regime_temperature',
-            constraint=lambda x: tf.clip_by_value(x, 0.1, 1.5)  # сужаем диапазон
+            dtype=tf.float32,
+            constraint=MinMaxClip(min_value=0.7, max_value=5.0)  # ✅ Работает везде
         )
 
-        # История волатильности для расчета статистики
-        initial_history = np.concatenate([
-            np.full(self.history_window // 3, 0.1),   # LOW режим
-            np.full(self.history_window // 3, 0.3),   # MID режим
-            np.full(self.history_window - 2 * (self.history_window // 3), 0.6)  # HIGH режим
-        ]).astype(np.float32).reshape(1, -1)
-        
-        self._vol_history = tf.Variable(
-            tf.constant(initial_history, dtype=tf.float32),
-            trainable=False,
-            name='vol_history'
+        # Масштабы режимов
+        self.regime_scales = self.add_weight(
+            name="regime_scales",
+            shape=(num_regimes,),
+            initializer="random_normal",
+            trainable=True,
+            dtype=tf.float32,
+            constraint=tf.keras.constraints.NonNeg()  # ✅ Существует
         )
 
-    def update_history(self, vol_current: tf.Tensor) -> None:
-        """
-        Обновить историю волатильности.
+        # Инициализация начальных значений regime_scales
+        initial_scales = [2.96, 4.44, 6.16]
+        self.regime_scales.assign(initial_scales)
 
-        Args:
-            vol_current: [B] текущая волатильность
-        """
-        # vol_current: [B] → усредняем по батчу
-        vol_mean = tf.reduce_mean(vol_current)  # скаляр
-
-        # Сдвиг истории: убираем первый элемент, добавляем новый в конец
-        new_history = tf.concat([
-            self._vol_history[:, 1:],  # все кроме первого
-            tf.reshape(vol_mean, [1, 1])  # новое значение
-        ], axis=1)
-
-        self._vol_history.assign(new_history)
-
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "num_regimes": self.num_regimes,
+            "history_window": self.history_window,
+            "learnable_centers": self.learnable_centers,
+        })
+        return config    
+    
     @tf.function
-    def get_centers(self) -> tf.Tensor:
+    def update_history(self, vol_current: tf.Tensor) -> None:
+        """Обновляет историю волатильности.
+        
+        Args:
+            vol_current: [B] — текущие значения волатильности для каждого элемента батча
         """
-        Возвращает центроиды режимов волатильности с адаптацией к истории.
-        Гарантированно возвращает тензор формы [num_regimes] даже в графовом режиме.
-        """
-        base_centers = tf.nn.softplus(self.center_logits)  # [num_regimes]
+        # Усредняем по батчу → получаем одно значение
+        vol_mean = tf.reduce_mean(vol_current)  # скаляр (в пределах графа)
+        new_val = tf.reshape(vol_mean, [1, 1])   # [[mean]] → [1, 1]
+    
+        # Получаем текущую историю
+        old_hist = self._vol_history.value()     # [1, history_window]
         
-        # Адаптация к истории — безопасная для графа
-        flat_history = tf.reshape(self._vol_history, [-1])
-        valid_mask = flat_history > 0.0
-        valid_count = tf.reduce_sum(tf.cast(valid_mask, tf.float32))
-        
-        # Безопасное вычисление квантилей с защитой от пустой истории
-        sorted_history = tf.sort(flat_history)
-        
-        # Индексы с защитой от выхода за границы
-        idx25 = tf.minimum(tf.cast(valid_count * 0.25, tf.int32), tf.shape(sorted_history)[0] - 1)
-        idx50 = tf.minimum(tf.cast(valid_count * 0.50, tf.int32), tf.shape(sorted_history)[0] - 1)
-        idx75 = tf.minimum(tf.cast(valid_count * 0.75, tf.int32), tf.shape(sorted_history)[0] - 1)
-        
-        # Явное преобразование в форму [1] для каждого квантиля
-        q25 = tf.reshape(tf.gather(sorted_history, idx25), [1])
-        q50 = tf.reshape(tf.gather(sorted_history, idx50), [1])
-        q75 = tf.reshape(tf.gather(sorted_history, idx75), [1])
-        
-        # Адаптивный вес с заглушкой при малом количестве данных
-        adaptation_weight = tf.minimum(0.9, valid_count / 50.0)
-        
-        # Формирование адаптивных центров
-        adaptive_centers = tf.concat([
-            q25 * 0.8,
-            q50 * 1.0,
-            q75 * 1.2
-        ], axis=0)  # [num_regimes]
-        
-        # Взвешенное смешивание базовых и адаптивных центров
-        centers = (1.0 - adaptation_weight) * base_centers + adaptation_weight * adaptive_centers
-        centers = tf.clip_by_value(centers, 0.01, 0.99)
-        
-        # ✅ КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: замена tf.ensure_shape() на tf.reshape()
-        # tf.ensure_shape() в графовом режиме может вернуть None при неудачной статической проверке формы
-        # tf.reshape() всегда возвращает тензор с гарантированной формой
-        centers = tf.reshape(centers, [self.num_regimes])
-        
-        return centers
+        # Сдвигаем окно: удаляем первый элемент, добавляем новый в конец
+        updated = tf.concat([
+            old_hist[:, 1:],      # все кроме первого → [1, H-1]
+            new_val               # новый элемент → [1, 1]
+        ], axis=1)                # → [1, H]
+    
+        # Присваиваем обратно
+        self._vol_history.assign(updated)
 
+    def get_centers(self) -> tf.Tensor:
+        """Вычисляет адаптивные центры режимов волатильности.
+        - Использует сортировку вместо tf.quantile (без зависимости от tensorflow-probability)
+        - Требует минимум 20 валидных точек
+        - Принудительно разводит центры на min_sep=0.03
+        """
+        if not hasattr(self, '_vol_history') or self._vol_history is None:
+            return self.base_centers
+    
+        hist_t = self._vol_history.value()
+        flat = tf.reshape(hist_t, [-1])  # [H]
+        valid_mask = flat > 0.0
+        valid = tf.boolean_mask(flat, valid_mask)  # [Hv]
+        n = tf.shape(valid)[0]
+    
+        # Проверка: достаточно ли данных?
+        min_valid = 20
+        use_fallback = tf.less(n, min_valid)
+        fallback_centers = tf.constant([0.1, 0.3, 0.6], dtype=tf.float32)
+    
+        def _quantile(x, q):
+            """Расчёт квантиля порядка q (0-100) для 1D тензора x"""
+            x_sorted = tf.sort(x)  # по возрастанию
+            n_x = tf.shape(x_sorted)[0]
+            # Индекс: (q/100) * (n-1), округлён до ближайшего int
+            index_float = (tf.cast(q, tf.float32) / 100.0) * tf.cast(n_x - 1, tf.float32)
+            index = tf.cast(tf.round(index_float), tf.int32)
+            # Защита от выхода за границы
+            index = tf.clip_by_value(index, 0, n_x - 1)
+            return x_sorted[index]
+    
+        def compute_adaptive():
+            q10 = _quantile(valid, 10.0)
+            q50 = _quantile(valid, 50.0)
+            q90 = _quantile(valid, 90.0)
+            centers = tf.stack([q10, q50, q90])
+    
+            # Принудительное разведение центров (min_sep = 0.03)
+            min_sep = 0.03
+            for i in range(1, 3):
+                gap = centers[i] - centers[i-1]
+                correction = tf.nn.relu(min_sep - gap)
+                indices = [[i]]
+                updates = [correction]
+                centers = tf.tensor_scatter_nd_add(centers, indices, updates)
+            return centers
+    
+        adaptive_centers = tf.cond(
+            use_fallback,
+            lambda: fallback_centers,
+            compute_adaptive
+        )
+    
+        # Базовые центры (фиксированные или learnable)
+        base_centers = self.base_centers
+        if self.learnable_centers:
+            center_logits = self.center_logits
+            centers_raw = base_centers * tf.exp(center_logits)
+        else:
+            centers_raw = base_centers
+    
+        # Смешивание базовых и адаптивных центров
+        alpha = 0.7  # Вес адаптивной компоненты
+        mixed_centers = alpha * adaptive_centers + (1 - alpha) * centers_raw
+    
+        return mixed_centers
+
+    def get_center_separation_loss(self) -> tf.Tensor:
+        """Штраф за близость центров режимов.
+        - Минимальное расстояние между соседними центрами: 0.15
+        - Минимальное расстояние между крайними: 0.30
+        """
+        centers = self.get_centers()
+        min_center_dist = 0.15
+        min_extreme_dist = 0.30
+    
+        # Расстояния между соседними центрами
+        center_dists = centers[1:] - centers[:-1]  # [LOW-MID, MID-HIGH]
+        dist_loss = tf.reduce_mean(tf.nn.relu(min_center_dist - center_dists))
+    
+        # Расстояние между LOW и HIGH
+        extreme_dist = centers[2] - centers[0]
+        extreme_loss = tf.nn.relu(min_extreme_dist - extreme_dist)
+    
+        return dist_loss * 20.0 + extreme_loss * 10.0
+    
     @tf.function
     def assign_soft_regimes(self, vol_current: tf.Tensor) -> Dict[str, tf.Tensor]:
         """
         Мягкое распределение текущей волатильности по режимам.
-
-        Args:
-            vol_current: [B] текущая нормализованная волатильность
-
-        Returns:
-            Dict с ключами:
-                'soft_weights': [B, num_regimes] - мягкие веса для каждого режима
-                'regime_assignment': [B] - индекс доминирующего режима
-                'entropy': [B] - энтропия распределения (для мониторинга)
+    
+        ПАТЧ:
+        - возвращаем logits (для supervised CE по regime_labels_batch)
+        - добавляем per-regime scale (regime_scales), чтобы границы реально обучались
+        - делаем вычисление устойчивым (eps, клипы, stable entropy)
         """
+        vol_current = tf.cast(vol_current, tf.float32)               # [B]
+        vol_current = tf.reshape(vol_current, [-1])                  # [B]
         batch_size = tf.shape(vol_current)[0]
-        centers = self.get_centers()  # [num_regimes]
-        centers_exp = tf.reshape(centers, [1, self.num_regimes])
-
-        # Расстояния от текущей волатильности до центров каждого режима
-        # vol_current: [B] → [B, 1]
-        vol_expanded = tf.expand_dims(vol_current, axis=1)  # [B, 1]
-
-        # Евклидовы расстояния: [B, num_regimes]
-        distances = tf.abs(vol_expanded - centers_exp)  # (B,3) stable
-
-        # Softmax с температурой (управляет мягкостью распределения)
-        # Чем выше температура, тем более равномерное распределение
-        soft_weights = tf.nn.softmax(-distances / (self.temperature + 1e-6), axis=1)
-        # soft_weights: [B, num_regimes]
-
-        # Доминирующий режим для каждого элемента батча
-        regime_assignment = tf.argmax(soft_weights, axis=1)  # [B]
-
-        # Энтропия распределения (для мониторинга)
-        entropy = -tf.reduce_sum(
-            soft_weights * tf.math.log(soft_weights + 1e-8),
-            axis=1
-        )  # [B]
-
+    
+        # Centers: [K]
+        centers = tf.cast(self.get_centers(), tf.float32)            # [K]
+        centers = tf.reshape(centers, [1, self.num_regimes])         # [1,K]
+    
+        # Per-regime scales: [K] (обучаемые; должны существовать как tf.Variable)
+        # ВАЖНО: чтобы scale был >0 и не коллапсировал, используем softplus + floor.
+        if hasattr(self, "regime_scales"):
+            scales = tf.nn.softplus(tf.cast(self.regime_scales, tf.float32)) + 1e-3  # [K]
+        else:
+            # fallback: одинаковые масштабы
+            scales = tf.ones([self.num_regimes], dtype=tf.float32)
+        scales = tf.reshape(scales, [1, self.num_regimes])           # [1,K]
+    
+        # Temperature (global): scalar
+        temp = tf.cast(self.temperature, tf.float32)
+        temp = tf.clip_by_value(temp, 0.7, 5.0)  # можно оставить твой [0.7,2.0], но 5.0 полезно на прогреве
+        temp = temp + 1e-6
+    
+        # Distances: [B,1] -> [B,K]
+        vol_exp = tf.expand_dims(vol_current, axis=1)                # [B,1]
+        distances = tf.abs(vol_exp - centers)                        # [B,K]
+    
+        # Logits: чем ближе к центру и чем меньше scale/temp, тем выше логит
+        # (минус расстояние, нормированное масштабом)
+        logits = -distances / (scales * temp)                        # [B,K]
+    
+        # Soft weights
+        soft_weights = tf.nn.softmax(logits, axis=1)                 # [B,K]
+    
+        # Hard assignment
+        regime_assignment = tf.argmax(soft_weights, axis=1, output_type=tf.int32)  # [B]
+    
+        # Entropy (stable)
+        p = tf.clip_by_value(soft_weights, 1e-8, 1.0)
+        entropy = -tf.reduce_sum(p * tf.math.log(p), axis=1)         # [B]
+    
         return {
-            'soft_weights': soft_weights,      # [B, num_regimes]
-            'regime_assignment': regime_assignment,  # [B]
-            'entropy': entropy                 # [B]
+            "logits": logits,                        # [B,K]  <-- для CE
+            "soft_weights": soft_weights,            # [B,K]
+            "regime_assignment": regime_assignment,  # [B]
+            "entropy": entropy,                      # [B]
+            "centers": tf.reshape(centers, [self.num_regimes]),      # [K] удобно для дебага
+            "scales": tf.reshape(scales, [self.num_regimes]),        # [K] удобно для дебага
+            "temperature": temp                      # scalar (тензор)
         }
 
     @tf.function
@@ -305,18 +367,85 @@ class VolatilityRegimeSelector(tf.Module):
         # результат: [B, 1]
 
         # Нормировка regime_scale
-        regime_scale = regime_scale / (tf.reduce_mean(regime_scale) + 1e-8)
+        # ⚠️ ПРОБЛЕМА: Деление на среднее по батчу сбрасывает масштаб!
+        # regime_scale = regime_scale / (tf.reduce_mean(regime_scale) + 1e-8)
         
         return regime_scale  # [B, 1]
 
     def get_spectrum_info(self) -> Dict[str, tf.Tensor]:
-        """Информация о параметрах режимов для мониторинга"""
+        """
+        Информация о параметрах режимов для мониторинга.
+        🔑 ИСПРАВЛЕНО: безопасный вызов get_centers() без @tf.function проблем
+        """
+        # 🔑 БЕЗОПАСНОЕ ПОЛУЧЕНИЕ ЦЕНТРОВ (без вызова @tf.function из Python)
+        if self.learnable_centers:
+            centers_val = tf.nn.softplus(self.center_logits).numpy()
+        else:
+            centers_val = self.centers.numpy()
+        
         return {
             'regime_scales': self.regime_scales,
-            'centers': self.get_centers(),
+            'centers': centers_val,  # ← numpy array, не tf.Tensor
             'temperature': self.temperature
         }
 
+    @tf.function
+    def get_regime_entropy_loss(self, soft_weights: tf.Tensor) -> tf.Tensor:
+        """
+        ГИБРИДНЫЙ ПОДХОД: Штраф за коллапс режимов волатильности.
+        Заставляет селектор использовать все 3 режима, а не схлопываться в HIGH.
+        """
+        # Энтропия: H = -Σ(p × log(p))
+        entropy = -tf.reduce_sum(
+            soft_weights * tf.math.log(soft_weights + 1e-8),
+            axis=1
+        )  # [B]
+        
+        # Максимальная энтропия для 3 режимов
+        max_entropy = tf.math.log(tf.cast(self.num_regimes, tf.float32))  # ≈1.099
+        
+        # Нормализованная энтропия [0, 1]
+        normalized_entropy = entropy / (max_entropy + 1e-8)
+        
+        # Целевая энтропия: 70% от максимума (избегаем коллапса)
+        target_entropy = 0.70
+        
+        # Штрафуем только если энтропия ниже целевой
+        entropy_loss = tf.reduce_mean(
+            tf.nn.relu(target_entropy - normalized_entropy)
+        )
+        
+        # Дополнительно: штраф за доминирование одного режима (>80%)
+        max_regime_weight = tf.reduce_max(tf.reduce_mean(soft_weights, axis=0))
+        dominance_penalty = tf.nn.relu(max_regime_weight - 0.80)
+        
+        # Дополнительно: штраф за пустые режимы (<5%)
+        min_regime_weight = tf.reduce_min(tf.reduce_mean(soft_weights, axis=0))
+        empty_penalty = tf.nn.relu(0.05 - min_regime_weight)
+        
+        return entropy_loss + 5.0 * tf.square(dominance_penalty) + 3.0 * tf.square(empty_penalty)
+
+    @tf.function
+    def get_regime_contrastive_loss(self, soft_weights: tf.Tensor) -> tf.Tensor:
+        """
+        ГИБРИДНЫЙ ПОДХОД v2: Contrastive loss на центроиды режимов.
+        Заставляет центроиды LOW/MID/HIGH быть разделёнными.
+        """
+        centers = self.get_centers()  # [3]
+        
+        # Минимальное расстояние между центрами
+        min_center_dist = 0.15
+        center_dists = tf.abs(centers[1:] - centers[:-1])  # [2]: LOW-MID, MID-HIGH
+        
+        # Штраф если центры слишком близко
+        dist_loss = tf.reduce_mean(tf.nn.relu(min_center_dist - center_dists))
+        
+        # Дополнительно: штраф за слишком близкие крайние режимы
+        extreme_dist = tf.abs(centers[2] - centers[0])  # LOW-HIGH
+        extreme_loss = tf.nn.relu(0.30 - extreme_dist)
+        
+        return dist_loss * 20.0 + extreme_loss * 10.0
+        
 
 class EntropyRegularizer(tf.Module):
     """
@@ -718,13 +847,12 @@ class LSTMIMMUKF(tf.Module):
             name='volatility_regime_selector'
         )
         # Синхронизированные параметры для целевого покрытия 90% (с учетом улучшенного алгоритма)
-        target_coverage = 0.90
-        confidence_factor = -np.log(1.0 - target_coverage)  # ≈ 2.30259
-        # ИСПРАВЛЕНО: Увеличиваем начальные значения regime_scales для компенсации низкого покрытия
-        self.regime_selector.regime_scales.assign(tf.constant(
-            [0.95 * confidence_factor, 1.35 * confidence_factor, 1.85 * confidence_factor],  # Уменьшены, так как остальные параметры увеличили ширину
-            dtype=tf.float32
-        ))
+        # 🔑 ГИБРИДНЫЙ ПОДХОД v5: СОГЛАСОВАННЫЕ НАЧАЛЬНЫЕ ЗНАЧЕНИЯ regime_scales
+        # Не перезаписываем значения из VolatilityRegimeSelector.__init__()
+        # Они уже установлены в [2.96, 4.44, 6.16] что соответствует целевому покрытию 85-90%
+        print(f"✅ Regime scales оставлены по умолчанию: {self.regime_selector.regime_scales.numpy()}")
+        # Примечание: если нужно изменить — делайте это в VolatilityRegimeSelector.__init__()
+
         # Центроиды режимов адаптированы под реальную статистику волатильности
         self.regime_selector.center_logits.assign(tf.constant(
             np.log(np.array([0.12, 0.35, 0.75], dtype=np.float32)),
@@ -774,15 +902,35 @@ class LSTMIMMUKF(tf.Module):
             # Q ceiling used consistently in both explicit one-step prediction and UKF filtering
             self.Q_max_pred = tf.constant(5.0, dtype=tf.float32)   # старт для теста (потом 0.3/1.0)
 
-            # === ДОБАВЛЕНО: ПАРАМЕТР ДЛЯ МАКСИМАЛЬНОЙ ШИРИНЫ ДОВЕРИТЕЛЬНОГО ИНТЕРВАЛА ===
-            self.max_width_factor_logit = tf.Variable(
-                tf.math.log(2.2),  # exp(ln(2.5)) + 1.0 = 3.5 - увеличено для компенсации низкого покрытия
+            # === ДОБАВЛЕНО: ПАРАМЕТРЫ МАКСИМАЛЬНОЙ ШИРИНЫ ДОВЕРИТЕЛЬНОГО ИНТЕРВАЛА ПО РЕЖИМАМ ===
+            self.max_width_factors_logits = tf.Variable(
+                initial_value=tf.constant([0.5, 0.5, 1.0], dtype=tf.float32),  # → softplus(~0.65, 0.65, 1.3) → ~2.2x
                 trainable=True,
-                dtype=tf.float32,
-                constraint=lambda x: tf.clip_by_value(x, tf.math.log(1.0), tf.math.log(4.0)),  # Расширенный диапазон
-                name='max_width_factor_logit'
+                name="max_width_factors_logits",
+                dtype=tf.float32
             )
+            
+        # --- ДОБАВЛЕНО: обучаемые цели покрытия для каждого режима ---
+        # Инициализируем логиты так, чтобы sigmoid давал начальные значения [0.95, 0.88, 0.83]
+        initial_target_coverages = np.array([0.95, 0.88, 0.83], dtype=np.float32)
+        logits_init = np.log(initial_target_coverages / (1.0 - initial_target_coverages))  # [2.94, 1.87, 1.47]
+        
+        self.target_cov_logits = tf.Variable(
+            initial_value=logits_init,
+            trainable=True,
+            dtype=tf.float32,
+            name='target_cov_logits',
+            synchronization=tf.VariableSynchronization.ON_READ,
+            aggregation=tf.VariableAggregation.MEAN
+        )
 
+        # === ДОБАВЛЕНО: инициализация _prev_train_coverage
+        self._prev_train_coverage = tf.Variable(
+            initial_value=tf.constant(0.90, dtype=tf.float32),
+            trainable=False,
+            name="prev_train_coverage"
+        )
+        
         # Инициализация оптимизатора
         # Опитимизатор инициализируется в методе fit()
 
@@ -2238,139 +2386,138 @@ class LSTMIMMUKF(tf.Module):
         training: bool = False,
     ):
         """
-        LSTM-only compute_loss:
-        - Не использует никакие legacy self.base_q_logit/student_t_base_dof/confidence/inflation_* переменные.
-        - calibration_loss ожидается уже нормализованным/взвешенным/клипнутым в train_step.
+        Оптимизированный compute_loss:
+        - Убраны Python-условия внутри @tf.function
+        - Упрощены регуляризаторы
+        - Убрана problematic self.last_ukf_params assignment
         """
         # 1) MSE
         mse_loss = tf.reduce_mean(tf.square(predictions - targets))
-    
-        # 2) Smoothness по ukf_params (межшаговая регуляризация), опционально
-        smoothness_loss = tf.constant(0.0, dtype=tf.float32)
-        if training and hasattr(self, "last_ukf_params") and self.last_ukf_params is not None:
-            if isinstance(ukf_params, dict) and isinstance(self.last_ukf_params, dict):
-                diffs = []
-                for key in ukf_params.keys():
-                    if key in self.last_ukf_params and isinstance(ukf_params[key], tf.Tensor):
-                        # stop_gradient не нужен: это именно регуляризация динамики параметров
-                        diff = ukf_params[key] - self.last_ukf_params[key]
-                        diffs.append(tf.square(diff))
-                if diffs:
-                    all_diffs = tf.concat([tf.reshape(d, [-1]) for d in diffs], axis=0)
-                    smoothness_loss = tf.constant(0.001, dtype=tf.float32) * tf.reduce_mean(all_diffs)
-    
-        # 3) Stability по inflation (держим около 1.0)
+        
+        # 2) Stability по inflation (держим около 1.0)
         inflation_clipped = tf.clip_by_value(inflation_factors - 1.0, -5.0, 5.0)
         stability_penalty = tf.constant(0.05, tf.float32) * tf.reduce_mean(tf.square(inflation_clipped))
-    
-        # 4) Spectral reg (diff UKF)
+        
+        # 3) Spectral reg (diff UKF) — только если компонент существует
         spectral_reg = tf.constant(0.0, dtype=tf.float32)
-        d_raw_penalty = tf.constant(0.0, dtype=tf.float32)
-    
         if hasattr(self, "diff_ukf_component") and self.diff_ukf_component is not None:
             spectrum = self.diff_ukf_component.get_spectrum_info()
             min_eig = spectrum["min_eigenvalue"]
             spectral_reg = tf.constant(0.01, tf.float32) * tf.reduce_mean(tf.nn.relu(1e-4 - min_eig))
-    
-            # Если spec_param существует — мягко держим около log(0.5)
-            if hasattr(self.diff_ukf_component, "spec_param") and hasattr(self.diff_ukf_component.spec_param, "d_raw"):
-                d_raw_penalty = tf.constant(0.01, tf.float32) * tf.square(
-                    self.diff_ukf_component.spec_param.d_raw - tf.math.log(0.5)
-                )
-    
-        # 5) Regime selector reg (если учится)
+        
+        # 4) Regime selector reg
         selector_reg = tf.constant(0.0, dtype=tf.float32)
         if hasattr(self, "regime_selector") and self.regime_selector is not None:
-            # штраф на большие/малые масштабы (держим в разумном диапазоне, центр ~2.5 как было)
+            # Штраф на масштабы
             selector_reg = selector_reg + tf.constant(0.02, tf.float32) * tf.reduce_mean(
                 tf.square(self.regime_selector.regime_scales - 2.5)
             )
-            if getattr(self.regime_selector, "learnable_centers", False) and hasattr(self.regime_selector, "center_logits"):
-                selector_reg = selector_reg + tf.constant(0.001, tf.float32) * tf.reduce_sum(
-                    tf.square(self.regime_selector.center_logits)
-                )
-    
-        # 6) max_width_factor_logit reg (если обучаемый)
-        ci_clip_reg = tf.constant(0.0, dtype=tf.float32)
-        if hasattr(self, "max_width_factor_logit") and self.max_width_factor_logit is not None:
-            # слабая регуляризация, чтобы не улетал в бесконечную ширину
-            ci_clip_reg = tf.constant(1e-4, tf.float32) * tf.square(self.max_width_factor_logit - tf.math.log(2.2))
-    
-        # 7) Entropy penalty по режимам (если regime_info не передан — считаем из volatility_levels)
+            # Штраф на center_logits (если learnable)
+            if getattr(self.regime_selector, "learnable_centers", False):
+                if hasattr(self.regime_selector, "center_logits"):
+                    selector_reg = selector_reg + tf.constant(0.001, tf.float32) * tf.reduce_sum(
+                        tf.square(self.regime_selector.center_logits)
+                    )
+        
+        # 5) Entropy penalty по режимам — ГИБРИДНЫЙ ПОДХОД v2
         entropy_penalty = tf.constant(0.0, dtype=tf.float32)
         if hasattr(self, "regime_selector") and self.regime_selector is not None:
             if regime_info is None:
                 current_vol = tf.reshape(volatility_levels[:, -1, :], [-1])
                 regime_info = self.regime_selector.assign_soft_regimes(current_vol)
-    
+            
+            soft_weights = regime_info["soft_weights"]  # [B, 3]
+            
+            # 5.1) Энтропия распределения режимов
             current_entropy = tf.reduce_mean(regime_info["entropy"])
             max_entropy = tf.math.log(3.0)
             normalized_entropy = current_entropy / (max_entropy + 1e-8)
-    
-            target_entropy_normalized = tf.constant(0.75, tf.float32)
-            entropy_deviation = tf.abs(normalized_entropy - target_entropy_normalized)
-            entropy_penalty = tf.constant(2.0, tf.float32) * tf.square(entropy_deviation)
-    
-            is_uniform = tf.cast(tf.abs(current_entropy - max_entropy) < 0.05, tf.float32)
-            entropy_penalty = entropy_penalty + is_uniform * 1.0
-    
-            is_too_sharp = tf.cast(normalized_entropy < 0.3, tf.float32)
-            entropy_penalty = entropy_penalty + is_too_sharp * 0.5
-    
-        # 8) Total loss (calibration_loss уже “effective” из train_step)
+            target_entropy_normalized = tf.constant(0.70, tf.float32)
+            entropy_deviation = tf.nn.relu(target_entropy_normalized - normalized_entropy)
+            
+            # 🔑 ИЗМЕНЕНИЕ 1: Увеличен вес энтропийного штрафа
+            entropy_penalty = tf.constant(35.0, tf.float32) * tf.square(entropy_deviation)  # ← БЫЛО 25.0, СТАЛО 35.0
+            
+            # 5.2) Штраф за доминирование одного режима (>80%)
+            max_regime_weight = tf.reduce_max(tf.reduce_mean(soft_weights, axis=0))
+            dominance_penalty = tf.nn.relu(max_regime_weight - 0.80)
+            
+            # 🔑 ИЗМЕНЕНИЕ 2: Увеличен вес штрафа доминирования
+            entropy_penalty = entropy_penalty + tf.constant(25.0, tf.float32) * tf.square(dominance_penalty)  # ← БЫЛО 15.0, СТАЛО 25.0
+            
+            # 5.3) Штраф за пустые режимы (<5%)
+            min_regime_weight = tf.reduce_min(tf.reduce_mean(soft_weights, axis=0))
+            empty_penalty = tf.nn.relu(0.05 - min_regime_weight)
+            
+            # 🔑 ИЗМЕНЕНИЕ 3: Увеличен вес штрафа пустых режимов
+            entropy_penalty = entropy_penalty + tf.constant(15.0, tf.float32) * tf.square(empty_penalty)  # ← БЫЛО 8.0, СТАЛО 15.0
+            
+            # 5.4) Contrastive loss (если метод реализован)
+            if hasattr(self.regime_selector, "get_regime_contrastive_loss"):
+                contrastive_loss = self.regime_selector.get_regime_contrastive_loss(soft_weights)
+                entropy_penalty = entropy_penalty + contrastive_loss  # ← Без изменений (обычно 10.0-20.0 внутри метода)
+        
+        # 6) Total loss (упрощённый)
         total_loss = (
             mse_loss +
             calibration_loss +
-            0.1 * smoothness_loss +
-            0.05 * stability_penalty +
-            0.01 * spectral_reg +
-            selector_reg +
-            ci_clip_reg +
-            entropy_penalty +
-            (self.lambda_entropy * tf.cast(entropy_loss, tf.float32) * 2.0) +
-            d_raw_penalty
+            0.05 * stability_penalty +          # оставили
+            0.01 * spectral_reg +               # оставили (малый вес)
+            selector_reg +                      # режимы
+            entropy_penalty +                   # главный регуляризатор (15.0)
+            (self.lambda_entropy * tf.cast(entropy_loss, tf.float32))  # LSTM энтропия
         )
-    
+        
         # Safety NaN/Inf
         total_loss = tf.where(tf.math.is_nan(total_loss), tf.constant(1e6, tf.float32), total_loss)
         total_loss = tf.where(tf.math.is_inf(total_loss), tf.constant(1e6, tf.float32), total_loss)
-    
-        # сохранить для smoothness
-        self.last_ukf_params = ukf_params
-    
-        # редкий print (без шума)
-        do_print = tf.equal(tf.math.floormod(self._step_counter, 200), 0)
-        is_bad = tf.logical_or(tf.math.is_nan(total_loss), tf.logical_or(tf.math.is_inf(total_loss), total_loss > 1e4))
-        should_print = tf.logical_or(do_print, is_bad)
-    
-        def _do_print():
-            tf.print("\n[DEBUG LOSS] step", self._step_counter,
-                     "| MSE:", mse_loss,
-                     "| Calibration:", calibration_loss,
-                     "| TOTAL:", total_loss)
-            return 0
-    
-        tf.cond(should_print, _do_print, lambda: 0)
-    
+        
         return total_loss
 
-    def compute_target_coverage(self, volatility_level: tf.Tensor) -> tf.Tensor:
+    def compute_target_coverage(self, volatility_level: tf.Tensor, training: bool = True) -> tf.Tensor:
         """
         Единая точка вычисления целевого покрытия для ВСЕХ режимов работы.
-        Диапазон: 80.5% (высокая волатильность) → 95.5% (низкая волатильность)
-        Формула: 0.955 - 0.15 * volatility_level
+        Комбинирует:
+          - глобальную адаптацию по непрерывной волатильности
+          - обучаемые цели покрытия для каждого режима (LOW/MID/HIGH)
         """
-        base_confidence = 0.88
-        confidence_range = 0.10  # 83% → 93%
-        confidence_ceil = base_confidence + confidence_range / 2.0  # 0.955
-        confidence_floor = base_confidence - confidence_range / 2.0  # 0.805
+        # --- 1) Базовая цель по уровню волатильности ---
+        base_confidence = 0.88 if training else 0.84  # ← 0.84 → более честное ожидание
+        confidence_range = 0.10
+        confidence_ceil = base_confidence + confidence_range / 2.0  # ~0.89 (train), ~0.89 (val)
+        confidence_floor = base_confidence - confidence_range / 2.0  # ~0.79 (train), ~0.79 (val)
         
-        # Линейная адаптация: высокая волатильность → более широкие ДИ (меньше покрытие)
-        target_coverage = confidence_ceil - (confidence_ceil - confidence_floor) * volatility_level
+        v_clipped = tf.clip_by_value(volatility_level, 0.0, 1.0)
+        target_coverage_base = confidence_ceil - (confidence_ceil - confidence_floor) * v_clipped
+    
+        # --- 2) Получаем принадлежность к режимам ---
+        regime_info = self.regime_selector.assign_soft_regimes(volatility_level)
+        soft_weights = regime_info["soft_weights"]  # [B, K]
+    
+        # --- 3) Обучаемые цели покрытия для каждого режима ---
+        # Конвертируем логиты в вероятности, но используем как коэффициенты смещения
+        cov_probs = tf.nn.softmax(self.target_cov_logits)  # [3]
         
+        # Преобразуем обратно в вероятности покрытия: p = sigmoid(logit), но проще использовать напрямую
+        # Линейная комбинация: p_k = 0.7 + 0.25 * sigmoid(z_k), где z_k ~ N(0,1)
+        target_cov_values = 0.7 + 0.25 * tf.sigmoid(self.target_cov_logits)  # [3] ∈ [0.7, 0.95]
+    
+        # --- 4) Взвешенная цель по режимам ---
+        target_coverage_mode = tf.reduce_sum(
+            soft_weights * target_cov_values[tf.newaxis, :],  # [1, 3]
+            axis=1
+        )  # [B]
+    
+        # --- 5) Смесь двух стратегий ---
+        alpha = 0.6  # вес режимной компоненты
+        target_coverage = (
+            alpha * target_coverage_mode +
+            (1 - alpha) * target_coverage_base
+        )
+    
         return tf.clip_by_value(target_coverage, confidence_floor, confidence_ceil)
         
-    def _get_calibration_params(self, volatility_level, student_t_config=None, correction_adaptive=None):
+    def _get_calibration_params(self, volatility_level, student_t_config=None, correction_adaptive=None, training=True):
         """
         Возвращает student_t_config, пригодный для _calibrate_confidence_interval:
         - все скаляры -> [B] (берём последний timestep)
@@ -2391,7 +2538,7 @@ class LSTMIMMUKF(tf.Module):
         v = tf.squeeze(vol_bt1[:, -1, :], axis=-1)
     
         # -------- 2) target coverage + regime info --------
-        target_coverage = self.compute_target_coverage(v)  # ожидаем [B] или [B,1]
+        target_coverage = self.compute_target_coverage(v, training=training)  # ожидаем [B] или [B,1]
         target_coverage = tf.clip_by_value(
             tf.reshape(tf.squeeze(target_coverage), [B]),
             0.805, 0.955
@@ -2451,78 +2598,91 @@ class LSTMIMMUKF(tf.Module):
         return cfg, target_coverage, regime_info
 
     def _compute_calibration_loss(
-        self,
-        ci_lower: tf.Tensor,
-        ci_upper: tf.Tensor,
-        y_target: tf.Tensor,
-        y_for_filtering: tf.Tensor,
-        volatility_levels: tf.Tensor,
-        target_coverage: tf.Tensor,
-        training: bool = False
-    ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
-        """
-        ЕДИНАЯ ТОЧКА РАСЧЁТА КАЛИБРОВОЧНОЙ ПОТЕРИ СО СГЛАЖЕННЫМ ПОКРЫТИЕМ.
-    
-        Возвращает:
-            - raw_calibration_loss: ненормализованная калибровочная потеря (дальше ты её нормализуешь/клиппишь)
-            - actual_coverage: сглаженное покрытие (удобно для метрик/логов; можно использовать и в потере)
-            - width_ratio: отношение средней ширины ДИ к масштабу (стд) данных
-        """
-        # === 0) Flatten для стабильной математики ===
+        self, ci_lower, ci_upper, y_target, y_for_filtering,
+        volatility_levels, target_coverage, training=False,
+        regime_info=None  # ← ДОБАВЛЕН ПАРАМЕТР (по умолчанию None для обратной совместимости)
+    ):
         y_target_flat = tf.reshape(y_target, [-1])
         ci_min_flat = tf.reshape(ci_lower, [-1])
         ci_max_flat = tf.reshape(ci_upper, [-1])
-    
-        # === 1) Масштаб данных (для нормализации ширины и для margin) ===
-        # Берём std последнего окна по каждому батчу, затем усредняем по батчу.
-        # Важно: y_for_filtering ожидается формы [B, T] (как в твоём коде).
-        volatility_window = tf.math.reduce_std(y_for_filtering[:, -20:], axis=1) + 1e-8  # [B]
-        y_std_batch = tf.reduce_mean(volatility_window)  # scalar
-    
-        # === 2) Soft coverage (градиентный surrogate) ===
-        # ВАЖНОЕ ИЗМЕНЕНИЕ: margin НЕ зависит от ширины ДИ, чтобы модель не "обезвреживала"
-        # штрафы расширением интервала.
-        margin = 0.05 * y_std_batch + 1e-6  # scalar
-    
-        # Плавное "внутри интервала" через две сигмоиды
-        soft_lower = tf.sigmoid((y_target_flat - ci_min_flat) / margin)      # ~1 если y выше нижней границы
-        soft_upper = tf.sigmoid((ci_max_flat - y_target_flat) / margin)      # ~1 если y ниже верхней границы
-        soft_coverage = soft_lower * soft_upper                               # ~1 если внутри, ~0 если снаружи
-    
-        # Сглаженное покрытие (его можно логировать)
-        actual_coverage = tf.reduce_mean(soft_coverage)
-    
-        # === 3) Цель покрытия ===
-        target_coverage_mean = tf.reduce_mean(target_coverage)
-    
-        # === 4) Штрафы за under/over coverage (НЕ симметричный квадрат вокруг target) ===
-        # Раньше у тебя undercoverage_penalty был квадрат отклонения в обе стороны, что "подталкивало" к overcoverage.
-        under_gap = target_coverage_mean - actual_coverage   # >0 => недокрытие
-        over_gap = actual_coverage - target_coverage_mean    # >0 => перекрытие
-    
-        # Обычно undercoverage хуже, поэтому его вес выше.
-        undercoverage_penalty = 8.0 * tf.square(tf.nn.relu(under_gap))
-        overcoverage_penalty = 12.0 * tf.square(tf.nn.relu(over_gap))
-    
-        # === 5) Штраф за ширину ДИ (в относительных единицах) ===
-        ci_width_batch = ci_upper - ci_lower
-        mean_width = tf.reduce_mean(ci_width_batch)
-        width_ratio = mean_width / (y_std_batch + 1e-8)
         
-        avg_volatility = tf.reduce_mean(volatility_levels[:, -1, :])
+        # 1) Scale window
+        vol_raw = tf.math.reduce_std(y_for_filtering[:, -20:], axis=1)  # [B]
+        std_floor = tf.constant(1e-3, tf.float32)
+        vol = tf.maximum(vol_raw, std_floor)                            # [B]
+        y_std_batch = tf.reduce_mean(vol)                               # scalar
+        
+        # 2) Soft coverage surrogate
+        margin = tf.maximum(0.05 * y_std_batch, 1e-3)
+        
+        soft_lower = tf.sigmoid((y_target_flat - ci_min_flat) / margin)
+        soft_upper = tf.sigmoid((ci_max_flat - y_target_flat) / margin)
+        soft_cov = soft_lower * soft_upper
+        actual_coverage = tf.reduce_mean(soft_cov)
+        
+        # 3) Target coverage
+        target_coverage_mean = tf.reduce_mean(target_coverage)
+        
+        # 4) Under/over penalties — ГИБРИДНЫЙ ПОДХОД v2: АСИММЕТРИЧНЫЙ ШТРАФ
+        under_gap = target_coverage_mean - actual_coverage
+        over_gap  = actual_coverage - target_coverage_mean
+        
+        under_base = tf.constant(15.0, tf.float32)  # ← УВЕЛИЧЕНО с 8.0 (критично для under-coverage)
+        over_base  = tf.constant(8.0, tf.float32)   # ← СНИЖЕНО с 12.0 (перепокрытие менее критично)
+        
+        # Усиливаем штраф за недопокрытие в 3 раза
+        is_under = under_gap > 0.0
+        under_w = tf.where(is_under, under_base * 2.0, under_base * 0.5)
+        over_w  = tf.where(is_under, over_base  * 0.5, over_base  * 1.5)
+        
+        under_pen = under_w * tf.square(tf.nn.relu(under_gap))
+        over_pen  = over_w  * tf.square(tf.nn.relu(over_gap))
+        
+        # 4.1) ГИБРИДНЫЙ ПОДХОД v2: Per-regime calibration loss
+        regime_coverage_loss = 0.0
+        if regime_info is not None and 'soft_weights' in regime_info:
+            soft_weights = regime_info['soft_weights']  # [B, 3]
+            covered = tf.cast((y_target_flat >= ci_min_flat) & 
+                              (y_target_flat <= ci_max_flat), tf.float32)  # [B]
+            
+            # ГИБРИДНЫЙ ПОДХОД v4: Усиленный штраф для HIGH режима
+            for k in range(3):
+                regime_mask = soft_weights[:, k]
+                regime_coverage = tf.reduce_sum(covered * regime_mask) / (tf.reduce_sum(regime_mask) + 1e-8)
+                regime_gap = tf.abs(regime_coverage - target_coverage_mean)
+                regime_weight = tf.constant([1.0, 2.0, 10.0], tf.float32)[k]  # ← HIGH: 3→10
+                regime_coverage_loss += regime_weight * tf.square(regime_gap)
+            regime_coverage_loss = regime_coverage_loss * 25.0  # ← 12→25
+        
+        raw_calibration_loss = under_pen + over_pen + regime_coverage_loss
+    
+        # 5) Width diagnostics + width_error (устойчиво к плоским окнам)
+        width_ps = tf.maximum(ci_max_flat - ci_min_flat, 0.0)  # [B]
+        width_ratio_ps = width_ps / vol                        # [B]
+    
+        # Маска/вес: "плоские" окна (vol_raw ~ 0) почти не учитываем в ширине
+        k = tf.constant(10.0, tf.float32)                       # 5..30 обычно
+        # плавный вес 0..1 вместо жёсткой маски:
+        w = tf.clip_by_value(vol_raw / (k * std_floor), 0.0, 1.0)  # [B]
+        w_sum = tf.reduce_sum(w) + 1e-8
+    
+        width_ratio = tf.reduce_sum(w * width_ratio_ps) / w_sum     # scalar (взвешенное среднее)
+    
+        avg_volatility = tf.reduce_mean(tf.clip_by_value(
+            tf.reshape(volatility_levels[:, -1, :], [-1]), 0.0, 1.0
+        ))
         target_width_ratio = 1.8 * (1.0 + 0.2 * avg_volatility)
         target_width_ratio = tf.clip_by_value(target_width_ratio, 1.5, 2.5)
-        
-        # ✅ Отдельный компонент ширины (можно логировать и/или добавлять в total loss без клипа)
-        width_error = tf.square(tf.nn.relu(width_ratio - target_width_ratio))
-        
-        width_penalty = 2.0 * width_error
-        
-        raw_calibration_loss = undercoverage_penalty + overcoverage_penalty + width_penalty
-        
+    
+        # Штраф ширины лучше в лог-шкале (стабильнее при больших ratio)
+        ratio = (width_ratio + 1e-8) / (target_width_ratio + 1e-8)
+        wide_err = tf.square(tf.nn.relu(tf.math.log(ratio)))                 # ratio>1
+        narrow_err = tf.square(tf.nn.relu(tf.math.log(1.0 / ratio)))         # ratio<1
+        width_error = wide_err + 0.10 * narrow_err
+    
         return raw_calibration_loss, actual_coverage, width_ratio, target_width_ratio, width_error
 
-    @tf.function
+    @tf.function(jit_compile=False)
     def _calibrate_confidence_interval(
         self,
         forecast: tf.Tensor,
@@ -2530,133 +2690,127 @@ class LSTMIMMUKF(tf.Module):
         volatility_level: tf.Tensor,
         student_t_config: Dict[str, tf.Tensor],
         innovations: Optional[tf.Tensor] = None,
-        regime_assignment: Optional[tf.Tensor] = None,  # оставлен для совместимости сигнатуры
-        true_values: Optional[tf.Tensor] = None         # оставлен для совместимости сигнатуры
-    ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+        regime_assignment: Optional[tf.Tensor] = None,
+        true_values: Optional[tf.Tensor] = None
+    ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
         """
-        СОГЛАСОВАННАЯ КАЛИБРОВКА ДОВЕРИТЕЛЬНЫХ ИНТЕРВАЛОВ (CLEAN / PRODUCTION).
-        ⚠️ ВАЖНО: Валидация student_t_config выполняется ВНЕ @tf.function (в train_step/val_step)
-        Все параметры извлекаются через .get() с fallback для безопасности в graph-режиме.
+        Вычисляет адаптивные доверительные интервалы (CI) с мягким контролем ширины.
+        
+        Возвращает:
+            ci_min: нижняя граница CI
+            ci_max: верхняя граница CI
+            target_coverage: целевое покрытие [B]
+            width_penalty_value: скалярный штраф за отклонение ширины
         """
         batch_size = tf.shape(forecast)[0]
-        
-        # ===== 1) НОРМАЛИЗАЦИЯ ВХОДОВ =====
+    
+        # ===== 1) NORMALIZE INPUTS =====
         forecast = tf.reshape(tf.squeeze(forecast), [batch_size])                 # [B]
         stddev = tf.reshape(tf.squeeze(stddev), [batch_size])                     # [B]
         volatility_level = tf.reshape(tf.squeeze(volatility_level), [batch_size]) # [B]
         stddev = tf.maximum(stddev, 1e-8)
-        
-        # ===== 2) EXTRACT PARAMS (tf.function-safe) =====
+    
+        # ===== 2) EXTRACT PARAMS (safe for tf.function) =====
         def _as_batch_last(key, default_B):
-            """
-            Возвращает [B] из student_t_config[key], поддерживает:
-            scalar, [B], [B,1], [B,T], [B,T,1].
-            tf.function-safe: нет веток, которые требуют scalar, но получают [B].
-            """
             x = student_t_config.get(key, default_B)
             x = tf.convert_to_tensor(x, dtype=tf.float32)
-        
-            x_flat = tf.reshape(x, [-1])      # scalar -> [1], остальное -> [N]
+            x_flat = tf.reshape(x, [-1])
             n = tf.size(x_flat)
-        
+    
             def _scalar_case():
-                # x_flat[0] гарантированно scalar
                 return tf.fill([batch_size], x_flat[0])
-        
+    
             def _batched_case():
-                # N должно быть кратно B; для [B] это [B,1], для [B,T] это [B,T]
                 x2 = tf.reshape(x_flat, [batch_size, -1])
                 return x2[:, -1]
-        
+    
             return tf.cond(tf.equal(n, 1), _scalar_case, _batched_case)
-
-        # target_coverage
+    
         target_coverage = _as_batch_last("target_coverage", tf.fill([batch_size], 0.90))
         target_coverage = tf.clip_by_value(target_coverage, 0.805, 0.955)
-
-        # Student-t scalars
-        tail_weight_pos  = _as_batch_last("tail_weight_pos",  tf.ones([batch_size], tf.float32))
-        tail_weight_neg  = _as_batch_last("tail_weight_neg",  tf.ones([batch_size], tf.float32))
-        asymmetry_pos    = _as_batch_last("asymmetry_pos",    tf.ones([batch_size], tf.float32))
-        asymmetry_neg    = _as_batch_last("asymmetry_neg",    tf.ones([batch_size], tf.float32))
-        dof_base         = _as_batch_last("dof_base",         tf.fill([batch_size], 6.0))
-        dof_sensitivity  = _as_batch_last("dof_sensitivity",  tf.fill([batch_size], 0.5))
-
-        # regime_scale (используется ниже в APPLY MULTIPLIERS)
-        regime_scale     = _as_batch_last("regime_scale",     tf.ones([batch_size], tf.float32))
-
-        # correction_adaptive (optional)
+    
+        tail_weight_pos = _as_batch_last("tail_weight_pos", tf.ones([batch_size], tf.float32))
+        tail_weight_neg = _as_batch_last("tail_weight_neg", tf.ones([batch_size], tf.float32))
+        asymmetry_pos   = _as_batch_last("asymmetry_pos",   tf.ones([batch_size], tf.float32))
+        asymmetry_neg   = _as_batch_last("asymmetry_neg",   tf.ones([batch_size], tf.float32))
+        dof_base        = _as_batch_last("dof_base",        tf.fill([batch_size], 6.0))
+        dof_sensitivity = _as_batch_last("dof_sensitivity", tf.fill([batch_size], 0.5))
+    
+        regime_scale = _as_batch_last("regime_scale", tf.ones([batch_size], tf.float32))
         correction_adaptive = _as_batch_last("correction_adaptive", tf.ones([batch_size], tf.float32))
         correction_adaptive = tf.clip_by_value(correction_adaptive, 1.0, 3.0)
-        
-        # ===== 3) ADAPTIVE DOF (устойчиво, нижняя граница > 3) =====
+    
+        # ===== 3) ADAPTIVE DOF =====
         v = tf.clip_by_value(volatility_level, 0.0, 1.0)
-        dof_floor = 6.0 - 2.0 * v          # vol=0 -> 6, vol=1 -> 4
+        dof_floor = 6.0 - 2.0 * v
         dof_floor = tf.clip_by_value(dof_floor, 4.0, 8.0)
+    
         x = tf.nn.relu(v - 0.3) / 0.7
         x = tf.clip_by_value(x, 0.0, 1.0)
         decrease = dof_sensitivity * 2.0 * x
         dof_adjusted = dof_base - decrease
         dof_adjusted = tf.clip_by_value(dof_adjusted, dof_floor, 15.0)
-        
+    
         # ===== 4) t-QUANTILE APPROX (Cornish–Fisher) =====
         prob_lower = (1.0 - target_coverage) / 2.0
         prob_lower = tf.maximum(prob_lower, 0.001)
-        # z_{1-p} for normal using erfinv, z > 0
+    
         z = tf.sqrt(2.0) * tf.math.erfinv(2.0 * (1.0 - prob_lower) - 1.0)
-        # Cornish–Fisher expansion
+    
         nu = tf.maximum(dof_adjusted, 3.0)
-        inv_nu  = 1.0 / nu
+        inv_nu = 1.0 / nu
         inv_nu2 = inv_nu * inv_nu
         inv_nu3 = inv_nu2 * inv_nu
+    
         z2 = z * z
         z3 = z2 * z
         z5 = z3 * z2
         z7 = z5 * z2
+    
         t_approx = (
             z
             + (z3 + z) * (inv_nu / 4.0)
             + (5.0 * z5 + 16.0 * z3 + 3.0 * z) * (inv_nu2 / 96.0)
             + (3.0 * z7 + 19.0 * z5 + 17.0 * z3 - 15.0 * z) * (inv_nu3 / 384.0)
         )
-        # symmetric two-sided
+    
         z_upper = t_approx
         z_lower = -t_approx
-        
+    
         # ===== 5) BASE MARGINS =====
         margin_lower_base = stddev * tf.abs(z_lower)
         margin_upper_base = stddev * tf.abs(z_upper)
-        
+    
         # ===== 6) INNOVATIONS-BASED ASYMMETRY (optional) =====
         center_shift = tf.zeros([batch_size], dtype=tf.float32)
         tail_adj_pos = tf.ones([batch_size], dtype=tf.float32)
         tail_adj_neg = tf.ones([batch_size], dtype=tf.float32)
+    
         if innovations is not None:
-            # innovations: [B, window, 1] or [B, window]
-            innov = tf.squeeze(innovations)  # -> [B, window]
-            # если вдруг squeeze превратил [window] (B==1), восстановим [1, window]
+            innov = tf.squeeze(innovations)
             if innov.shape.rank == 1:
                 innov = tf.reshape(innov, [batch_size, -1])
+    
             pos_mask = tf.cast(innov > 0, tf.float32)
             neg_mask = tf.cast(innov <= 0, tf.float32)
             abs_innov = tf.abs(innov)
+    
             pos_sum = tf.reduce_sum(pos_mask * abs_innov, axis=1)
             pos_count = tf.reduce_sum(pos_mask, axis=1) + 1e-8
-            pos_magnitude = pos_sum / pos_count
+            pos_mag = pos_sum / pos_count
+    
             neg_sum = tf.reduce_sum(neg_mask * abs_innov, axis=1)
             neg_count = tf.reduce_sum(neg_mask, axis=1) + 1e-8
-            neg_magnitude = neg_sum / neg_count
-            asymmetry_ratio = (pos_magnitude - neg_magnitude) / (pos_magnitude + neg_magnitude + 1e-8)
-            center_shift = tf.clip_by_value(
-                stddev * asymmetry_ratio * 0.3,
-                -0.3 * stddev,
-                0.3 * stddev
-            )
-            ratio = (pos_magnitude + 1e-8) / (neg_magnitude + 1e-8)
+            neg_mag = neg_sum / neg_count
+    
+            asym_ratio = (pos_mag - neg_mag) / (pos_mag + neg_mag + 1e-8)
+            center_shift = tf.clip_by_value(stddev * asym_ratio * 0.3, -0.3 * stddev, 0.3 * stddev)
+    
+            ratio = (pos_mag + 1e-8) / (neg_mag + 1e-8)
             ratio = tf.clip_by_value(ratio, 0.5, 2.0)
             tail_adj_pos = tf.sqrt(ratio)
             tail_adj_neg = 1.0 / tf.sqrt(ratio)
-        
+    
         # ===== 7) APPLY MULTIPLIERS =====
         margin_lower = (
             margin_lower_base *
@@ -2670,50 +2824,77 @@ class LSTMIMMUKF(tf.Module):
             regime_scale * correction_adaptive *
             tail_adj_pos
         )
+        # Ширина будет ограничена ЕДИНСТВЕННЫМ местом ниже (MAX WIDTH LIMIT).
+        # Раннее масштабирование удалено для предотвращения конфликта градиентов.
         
-        # ===== 8) WIDTH CLIP (sum width), preserve asymmetry with scale =====
+        # ===== 8) MAX WIDTH LIMIT WITH RELAXED BOUND =====
         min_width_factor = 0.25
-        # max_width_factor_logit — разрешённый learnable параметр "крышки" ширины
-        if hasattr(self, "max_width_factor_logit") and (self.max_width_factor_logit is not None):
-            max_width_factor_raw = tf.nn.softplus(self.max_width_factor_logit) + 1.0
-            max_width_factor = max_width_factor_raw * (1.0 + 0.05 * volatility_level)
-            max_width_factor = tf.clip_by_value(max_width_factor, 1.2, 3.0)
+        
+        if hasattr(self, "max_width_factors_logits"):
+            factors_raw = tf.nn.softplus(self.max_width_factors_logits) + 1.0  # [3]
+            if regime_assignment is None:
+                max_width_factor = tf.fill([batch_size], tf.reduce_mean(factors_raw))
+            else:
+                max_width_factor = tf.gather(factors_raw, regime_assignment)  # [B]
         else:
-            max_width_factor = tf.ones([batch_size], dtype=tf.float32) * 2.0
+            max_width_factor = tf.fill([batch_size], 3.0)  # fallback
         
-        margin_lower = tf.maximum(margin_lower, 0.0)
-        margin_upper = tf.maximum(margin_upper, 0.0)
+        # Ширина до ограничения
         width_raw = margin_lower + margin_upper
-        width_min = 2.0 * min_width_factor * stddev
-        width_max = 2.0 * max_width_factor * stddev
-        width_clipped = tf.clip_by_value(width_raw, width_min, width_max)
-        # avoid divide-by-zero
-        width_scale = tf.math.divide_no_nan(width_clipped, width_raw)
-        margin_lower = margin_lower * width_scale
-        margin_upper = margin_upper * width_scale
+        width_max = 3.0 * max_width_factor * stddev  # ← ↑ с 2.0 до 3.0
         
-        # ===== 9) FINAL SAFETY (NaN/Inf/negative) =====
+        # Мягкое масштабирование
+        scale = tf.minimum(1.0, width_max / (width_raw + 1e-8))
+        new_total_margin = width_raw * scale
+        
+        ratio_lower = margin_lower / (width_raw + 1e-8)
+        ratio_upper = margin_upper / (width_raw + 1e-8)
+        
+        margin_lower_clipped = new_total_margin * ratio_lower
+        margin_upper_clipped = new_total_margin * ratio_upper
+        
+        margin_lower = tf.maximum(margin_lower_clipped, min_width_factor * stddev)
+        margin_upper = tf.maximum(margin_upper_clipped, min_width_factor * stddev)
+    
+        # ===== 9) FINAL WIDTH RATIO & PENALTY =====
+        final_width = margin_lower + margin_upper
+        width_ratio = final_width / (stddev + 1e-8)
+        target_width_ratio = 2.0
+    
+        wide_penalty = tf.where(
+            width_ratio > target_width_ratio * 1.2,
+            0.5 * tf.square(tf.math.log(width_ratio / (target_width_ratio + 1e-8))),
+            0.0
+        )
+    
+        narrow_penalty = tf.where(
+            width_ratio < target_width_ratio * 0.8,
+            0.3 * tf.square(tf.math.log((target_width_ratio + 1e-8) / width_ratio)),
+            0.0
+        )
+    
+        width_penalty_value = tf.reduce_mean(wide_penalty + narrow_penalty)
+    
+        # ===== 10) FINAL SAFETY =====
         width_is_valid = (
             tf.math.is_finite(margin_lower) &
             tf.math.is_finite(margin_upper) &
             (margin_lower >= 0.0) &
             (margin_upper >= 0.0)
         )
-        safe_margin_lower = tf.where(width_is_valid, margin_lower, min_width_factor * stddev)
-        safe_margin_upper = tf.where(width_is_valid, margin_upper, min_width_factor * stddev)
-        margin_lower = safe_margin_lower
-        margin_upper = safe_margin_upper
-        
-        # ===== 10) BOUNDS =====
+        margin_lower = tf.where(width_is_valid, margin_lower, min_width_factor * stddev)
+        margin_upper = tf.where(width_is_valid, margin_upper, min_width_factor * stddev)
+    
+        # ===== 11) BOUNDS =====
         ci_lower = forecast - margin_lower + center_shift
         ci_upper = forecast + margin_upper + center_shift
         ci_min = tf.minimum(ci_lower, ci_upper)
         ci_max = tf.maximum(ci_lower, ci_upper)
-        
-        return ci_min, ci_max, target_coverage
+    
+        return ci_min, ci_max, target_coverage, width_penalty_value
         
     @tf.function
-    def train_step(self, X_batch, y_for_filtering_batch, y_target_batch,
+    def train_step(self, X_batch, y_for_filtering_batch, y_target_batch, regime_labels_batch,
                    initial_state, initial_covariance):
         """
         Шаг обучения (LSTM-only): LSTM -> 37 params -> (vol_context, ukf_params, inflation_config, student_t_config)
@@ -2726,7 +2907,7 @@ class LSTMIMMUKF(tf.Module):
             self._step_counter = tf.Variable(0, trainable=False, dtype=tf.int64, name="step_counter")
     
         with tf.device(self.device):
-            with tf.GradientTape(persistent=True) as tape:
+            with tf.GradientTape(persistent=False) as tape:
     
                 # 0) Debug helpers (минимально; без Python-ветвлений по Tensor)
                 if not hasattr(self, "grad_debug_enabled"):
@@ -2744,7 +2925,16 @@ class LSTMIMMUKF(tf.Module):
                     cond2 = tf.cast(self.grad_debug_enabled, tf.bool)
                     cond3 = step >= self.grad_debug_step0
                     cond4 = tf.equal(tf.math.floormod(step, self.grad_debug_every), 0)
-                    return tf.logical_and(tf.logical_and(cond1, cond2), tf.logical_and(cond3, cond4))
+                    
+                    # ← НОВОЕ: Всегда логировать на эпохе 10 (критический переход)
+                    epoch_10_start = 200  # Примерный step для начала эпохи 10
+                    epoch_10_end = 250    # Примерный step для конца эпохи 10
+                    cond5 = (step >= epoch_10_start) & (step <= epoch_10_end)
+                    
+                    return tf.logical_or(
+                        tf.logical_and(tf.logical_and(cond1, cond2), tf.logical_and(cond3, cond4)),
+                        cond5
+                    )
     
                 # 1) FORWARD PASS LSTM
                 lstm_outputs = self.model(X_batch, training=True)
@@ -2798,8 +2988,47 @@ class LSTMIMMUKF(tf.Module):
     
                 correction_adaptive = correction_adaptive_hist[:, -1, :]  # [B,1]
     
-                # режимы волатильности (для логов/калибровки)
+                # --- НАЧАЛО supervised regime classification ---
                 regime_info = self.regime_selector.assign_soft_regimes(final_volatility)
+                soft_weights = regime_info["soft_weights"]  # [B, K]
+                logits = regime_info["logits"]         # [B, K]
+                
+                # Используем переданный аргумент — НЕ ПЕРЕЗАПИСЫВАЕМ!
+                # regime_labels_batch уже доступен → просто используем
+                
+                unique, _, counts = tf.unique_with_counts(regime_labels_batch)
+                class_weights = tf.math.reciprocal(tf.cast(counts, tf.float32))
+                class_weights /= tf.reduce_sum(class_weights)
+                class_weights *= 3.0
+                
+                rprog = tf.cast(self._step_counter, tf.float32) / 200.0
+                lambda_regime_base = 2.0
+                lambda_regime = lambda_regime_base * (1.0 - tf.exp(-5.0 * rprog))
+                
+                per_sample_ce = tf.nn.sparse_softmax_cross_entropy_with_logits(
+                    labels=regime_labels_batch,
+                    logits=logits
+                )
+                regime_ce_loss = tf.reduce_mean(per_sample_ce)
+                
+                max_weight = tf.reduce_max(tf.reduce_mean(soft_weights, axis=0))
+                dominance_penalty = tf.nn.relu(max_weight - 0.80)
+                min_weight = tf.reduce_min(tf.reduce_mean(soft_weights, axis=0))
+                empty_penalty = tf.nn.relu(0.05 - min_weight)
+                
+                entropy_penalty = (
+                    tf.square(dominance_penalty) * 25.0 +
+                    tf.square(empty_penalty) * 15.0
+                )
+                
+                separation_loss = self.regime_selector.get_center_separation_loss()
+                
+                regime_loss = (
+                    lambda_regime * regime_ce_loss +
+                    entropy_penalty +
+                    0.1 * separation_loss
+                )
+                # --- КОНЕЦ regime classification ---
     
                 forecast, std_dev, pred_dbg = self._explicit_predict_next_step(
                     final_state,
@@ -2812,45 +3041,207 @@ class LSTMIMMUKF(tf.Module):
                     kappa_base_final, kappa_sensitivity_final
                 )
     
-                # 6) CALIBRATION PARAMS (только из LSTM + обязательные поля)
+                # === 6) CALIBRATION PARAMS (только из LSTM + обязательные поля) ===
                 student_t_config, target_coverage, regime_info = self._get_calibration_params(
                     final_volatility,
-                    student_t_config=student_t_config,      # из process_lstm_output (там [B,T,*]) [file:1]
-                    correction_adaptive=correction_adaptive # [B,1] [file:1]
+                    student_t_config=student_t_config,
+                    correction_adaptive=correction_adaptive,
+                    training=True
                 )
                 target_coverage_mean = tf.reduce_mean(target_coverage)
-    
-                # 7) CALIBRATE CI
-                ci_lower, ci_upper, _ = self._calibrate_confidence_interval(
+                
+                regime_assignment = regime_info.get("regime_assignment", None)
+
+                # === 7) CALIBRATE CI ===
+                ci_lower, ci_upper, _, width_regularization = self._calibrate_confidence_interval(
                     forecast, std_dev, final_volatility, student_t_config,
                     innovations=innovations[:, -10:, :],
-                    regime_assignment=regime_info.get("regime_assignment", None),
+                    regime_assignment=regime_assignment,
                     true_values=y_target_batch
                 )
                 ci_min = tf.minimum(ci_lower, ci_upper)
                 ci_max = tf.maximum(ci_lower, ci_upper)
+
+                # === DIAG: batch mix + per-regime calibration (LOSS-CONSISTENT) ===
+                def _print_regime_diag():
+                    def _pct(x1d, q):
+                        xs = tf.sort(x1d)
+                        n = tf.shape(xs)[0]
+                        idx = tf.cast(tf.math.floor((q / 100.0) * tf.cast(n - 1, tf.float32)), tf.int32)
+                        idx = tf.clip_by_value(idx, 0, n - 1)
+                        return xs[idx]
+                
+                    B_diag = tf.shape(y_for_filtering_batch)[0]
+                
+                    # 1) std окна как в loss + floor
+                    vol_raw = tf.math.reduce_std(y_for_filtering_batch[:, -20:], axis=1)  # [B]
+                    std_floor = tf.constant(1e-3, tf.float32)                              # как в _compute_calibration_loss
+                    vol = tf.maximum(vol_raw, std_floor)                                   # [B]
+                
+                    ystd_p10 = _pct(vol, 10.0)
+                    ystd_p50 = _pct(vol, 50.0)
+                    ystd_p90 = _pct(vol, 90.0)
+                
+                    # 2) covered per-sample (hard coverage, для DIAG)
+                    y_flat = tf.reshape(y_target_batch, [-1])                              # [B]
+                    ci_min_flat = tf.reshape(ci_min, [-1])                                 # [B]
+                    ci_max_flat = tf.reshape(ci_max, [-1])                                 # [B]
+                    covered = tf.cast(
+                        (y_flat >= ci_min_flat) & (y_flat <= ci_max_flat),
+                        tf.float32
+                    )                                                                      # [B]
+                
+                    # 3) widthRatio per-sample (unweighted) + веса как в _compute_calibration_loss
+                    width_ps = tf.maximum(ci_max_flat - ci_min_flat, 0.0)                  # [B]
+                    wr_ps = width_ps / vol                                                 # [B]  (unweighted per-sample)
+                
+                    k = tf.constant(10.0, tf.float32)                                      # MUST match _compute_calibration_loss
+                    w = tf.clip_by_value(vol_raw / (k * std_floor), 0.0, 1.0)              # [B]
+                    w_sum = tf.reduce_sum(w) + 1e-8
+                
+                    wr_unweighted = tf.reduce_mean(wr_ps)
+                    wr_weighted = tf.reduce_sum(w * wr_ps) / w_sum
+                
+                    floor_frac = tf.reduce_mean(tf.cast(vol_raw <= (k * std_floor), tf.float32))
+                    w_mean = tf.reduce_mean(w)
+                
+                    # 4) режимы датасета
+                    ds_regimes = tf.reshape(tf.cast(regime_labels_batch, tf.int32), [-1])  # [B], 0..2
+                
+                    def _safe_wmean(x, mask, w_local):
+                        m = tf.cast(mask, tf.float32)
+                        ww = w_local * m
+                        denom = tf.reduce_sum(ww) + 1e-8
+                        return tf.math.divide_no_nan(tf.reduce_sum(x * ww), denom)
+                
+                    # coverage per regime (взвешенно теми же w — можно оставить так или вернуться к невзвешенному)
+                    cov_low  = _safe_wmean(covered, ds_regimes == 0, w)
+                    cov_mid  = _safe_wmean(covered, ds_regimes == 1, w)
+                    cov_high = _safe_wmean(covered, ds_regimes == 2, w)
+                
+                    # widthRatio per regime (взвешенно, как в лоссе)
+                    wr_low  = _safe_wmean(wr_ps, ds_regimes == 0, w)
+                    wr_mid  = _safe_wmean(wr_ps, ds_regimes == 1, w)
+                    wr_high = _safe_wmean(wr_ps, ds_regimes == 2, w)
+                
+                    # 5) pred regime + confusion matrix (ds x pred)
+                    if ("regime_assignment" in regime_info) and (regime_info["regime_assignment"] is not None):
+                        pred_reg = tf.reshape(tf.cast(regime_info["regime_assignment"], tf.int32), [-1])  # [B]
+                    else:
+                        soft_w_reg = tf.cast(regime_info["soft_weights"], tf.float32)                     # [B,3]
+                        pred_reg = tf.argmax(soft_w_reg, axis=-1, output_type=tf.int32)                  # [B]
+                
+                    cm_idx = ds_regimes * 3 + pred_reg                                                   # [B]
+                    cm_flat = tf.math.bincount(cm_idx, minlength=9, maxlength=9, dtype=tf.int32)
+                    cm = tf.reshape(cm_flat, [3, 3])
+                
+                    # 6) ds_counts / ds_pcts
+                    ds_counts = tf.math.bincount(ds_regimes, minlength=3, maxlength=3, dtype=tf.int32)
+                    ds_pcts = tf.cast(ds_counts, tf.float32) / tf.cast(B_diag, tf.float32)
+                
+                    tf.print(
+                        "\n[REGIME DIAG][TRAIN] step", self._step_counter,
+                        "| ds_counts", ds_counts,
+                        "| ds_pcts", ds_pcts,
+                        "| ystd(p10/p50/p90)", ystd_p10, ystd_p50, ystd_p90,
+                        "| cov(low/mid/high)", [cov_low, cov_mid, cov_high],
+                        "| widthRatio(low/mid/high)", [wr_low, wr_mid, wr_high],
+                        "| cm(ds x pred)=\n", cm,
+                        "| wr_unweighted", wr_unweighted,
+                        "| wr_weighted", wr_weighted,
+                        "| floor_frac", floor_frac,
+                        "| w_mean", w_mean,
+                    )
+                    return tf.constant(0)
+                
+                _ = tf.cond(_is_debug_step(), _print_regime_diag, lambda: tf.constant(0))
     
                 # 8) CALIBRATION LOSS (raw -> normalized -> clipped/weighted)
-                base_calibration_weight = 0.01
-                warmup_steps = 100
-    
+                base_calibration_weight = 0.12  # ← 0.05→0.12 (12% от MSE)
+                warmup_steps = 250  # ← ↑ 150 → 250 (более плавный warmup)
                 progress = tf.cast(self._step_counter, tf.float32) / tf.cast(warmup_steps, tf.float32)
                 progress = tf.clip_by_value(progress, 0.0, 1.0)
-                current_weight = base_calibration_weight * tf.square(progress)
-    
+                current_weight = base_calibration_weight * (1.0 - tf.exp(-3.0 * progress))
+                
+                # ✅ ИСПРАВЛЕНО: tf.cond требует одинаковых типов возврата из обеих веток
+                should_print = tf.equal(tf.math.floormod(self._step_counter, 50), 0)
+                
+                def _print_dbg():
+                    tf.print(
+                        '[WARMUP DBG] step=', self._step_counter, 
+                        '| progress=', progress, 
+                        '| calib_weight=', base_calibration_weight * (1.0 - tf.exp(-3.0 * progress))
+                    )
+                    return tf.constant(0)  # ← Явно возвращаем tf.constant(0)
+                
+                def _no_print():
+                    return tf.constant(0)  # ← Тоже tf.constant(0)
+                
+                tf.cond(should_print, _print_dbg, _no_print)  # ✅ Теперь типы совпадают (оба int32)
+                
                 mse_loss_for_normalization = tf.reduce_mean(tf.square(forecast - y_target_batch))
-    
-                raw_calibration_loss, actual_coverage, width_ratio, target_width_ratio, width_error = self._compute_calibration_loss(
+                
+                raw_calibration_loss, actual_coverage, width_ratio, target_width_ratio, width_error = \
+                self._compute_calibration_loss(
                     ci_min, ci_max, y_target_batch, y_for_filtering_batch,
                     volatility_levels, target_coverage, training=True
                 )
-    
+
+                # ✅ Width-only сигнал с warmup — УСИЛЕННЫЙ РЕЖИМНО-ЗАВИСИМЫЙ ПОДХОД
+                width_warmup_steps = tf.constant(300.0, tf.float32)
+                wprog = tf.cast(self._step_counter, tf.float32) / width_warmup_steps
+                wprog = tf.clip_by_value(wprog, 0.0, 1.0)
+                
+                lambda_width_base = tf.constant(0.08, tf.float32)
+                lambda_width = lambda_width_base * (1.0 - tf.exp(-5.0 * wprog))
+                
+                # === ДОБАВЬТЕ СЮДА УСЛОВНЫЙ ЛОГ ===
+                debug_freq = 100
+                is_debug_step = tf.equal(tf.math.floormod(self._step_counter, debug_freq), 0)
+                
+                def _log_debug():
+                    tf.print(
+                        "🔍 TRAIN DIAG | step", self._step_counter,
+                        "| wr:", width_ratio,
+                        "| cov:", actual_coverage,
+                        "| tgt:", target_coverage_mean,
+                        "| w_err:", width_error,
+                        "| l_w:", lambda_width
+                    )
+                    return 0
+                
+                def _no_log():
+                    return 0
+                
+                tf.cond(is_debug_step, _log_debug, _no_log)                
+                
                 scale = tf.stop_gradient(mse_loss_for_normalization / (raw_calibration_loss + 1e-8))
                 calibration_loss_normalized = raw_calibration_loss * scale
-    
+                
                 x = current_weight * calibration_loss_normalized
                 cap = current_weight * 2.0 * tf.stop_gradient(mse_loss_for_normalization)
                 calibration_loss_clipped = cap * tf.math.tanh(x / (cap + 1e-8))
+                
+                # 🔑 ГИБРИДНЫЙ ПОДХОД v3: Domain Adaptation Penalty
+                def _apply_domain_penalty():
+                    target_coverage_val = target_coverage_mean
+                    # 🔑 НОВОЕ: Если есть сохранённое val coverage — используем его
+                    if hasattr(self, '_prev_val_coverage') and self._prev_val_coverage is not None:
+                        train_val_gap = tf.abs(actual_coverage - self._prev_val_coverage)
+                        domain_penalty = tf.constant(20.0, tf.float32) * tf.square(train_val_gap)  # ↑ с 15.0 до 20.0
+                    else:
+                        coverage_gap = tf.abs(actual_coverage - target_coverage_val)
+                        domain_penalty = tf.constant(10.0, tf.float32) * tf.square(coverage_gap)  # ← БЫЛО 5.0, СТАЛО 10.0
+                    return calibration_loss_clipped + domain_penalty
+                
+                def _no_domain_penalty():
+                    return calibration_loss_clipped
+                
+                calibration_loss_clipped = tf.cond(
+                    self._step_counter > 250,  # ← Оставлено 250 (после завершения warmup)
+                    _apply_domain_penalty,
+                    _no_domain_penalty
+                )
     
                 # 9) TOTAL LOSS
                 loss = self.compute_loss(
@@ -2865,15 +3256,25 @@ class LSTMIMMUKF(tf.Module):
                     training=True
                 )
 
-                # ✅ Width-only сигнал с warmup (не клипается calibration clip’ом)
-                width_warmup_steps = tf.constant(200.0, tf.float32)
-                wprog = tf.cast(self._step_counter, tf.float32) / width_warmup_steps
-                wprog = tf.clip_by_value(wprog, 0.0, 1.0)
+                # ✅ Регуляризация regime_scales: предотвращение чрезмерного роста
+                scales = self.regime_selector.regime_scales
+                target_scales = tf.constant([2.96, 4.44, 6.16])  # целевые значения
+                scale_reg = 0.01 * tf.reduce_mean(tf.square(scales - target_scales))
+                loss = loss + regime_loss + scale_reg
 
-                lambda_width_base = tf.constant(0.005, tf.float32)  # попробуй 0.002–0.01
-                lambda_width = lambda_width_base * tf.square(wprog)
-
-                width_loss = lambda_width * tf.cast(width_error, tf.float32)
+                # ✅ Разбиваем на компоненты
+                base_width_loss = lambda_width * tf.cast(width_error, tf.float32)
+                high_regime_penalty_loss = 0.0
+                ci_regularization_loss = 0.5 * width_regularization
+                
+                if regime_assignment is not None:
+                    is_high_regime = tf.cast(tf.equal(regime_assignment, 2), tf.float32)
+                    high_width_penalty = is_high_regime * tf.nn.relu(width_ratio - 4.0)
+                    high_regime_penalty_loss = 0.1 * high_width_penalty
+                
+                # Суммируем
+                width_loss = base_width_loss + high_regime_penalty_loss + ci_regularization_loss
+                
                 loss = loss + width_loss
     
                 # 10) TRAINABLE VARS (LSTM-only + diff_ukf + regime_selector + max_width_factor_logit)
@@ -2889,8 +3290,11 @@ class LSTMIMMUKF(tf.Module):
                     if getattr(self.regime_selector, "learnable_centers", False):
                         trainable_vars.append(self.regime_selector.center_logits)
     
-                if hasattr(self, "max_width_factor_logit") and isinstance(self.max_width_factor_logit, tf.Variable):
-                    trainable_vars.append(self.max_width_factor_logit)
+                if hasattr(self, "max_width_factors_logits") and isinstance(self.max_width_factors_logits, tf.Variable):
+                    trainable_vars.append(self.max_width_factors_logits)
+                
+                if hasattr(self, "target_cov_logits") and isinstance(self.target_cov_logits, tf.Variable):
+                    trainable_vars.append(self.target_cov_logits)
     
         # 11) GRADS + OPTIMIZER STEP (вне tape scope)
         use_lso = isinstance(self._optimizer, tf.keras.mixed_precision.LossScaleOptimizer)
@@ -2901,7 +3305,7 @@ class LSTMIMMUKF(tf.Module):
             gradients = self._optimizer.get_unscaled_gradients(scaled_grads)
         else:
             gradients = tape.gradient(loss, trainable_vars)
-    
+
         # optional: мониторинг None grads (редко)
         do_monitor = tf.logical_and(
             tf.cast(self.debug_mode, tf.bool),
@@ -2910,12 +3314,73 @@ class LSTMIMMUKF(tf.Module):
         if do_monitor:
             none_total = tf.reduce_sum(tf.cast([g is None for g in gradients], tf.int32))
             tf.print("[GRAD DEBUG] step", self._step_counter, "| None total:", none_total, "/", len(trainable_vars))
-    
-        del tape
+
+        # === ДИАГНОСТИКА ГРАДИЕНТОВ: max_width_factors_logits (по режимам) ===
+        if tf.equal(tf.math.floormod(self._step_counter, 50), 0):
+            try:
+                var_name = 'max_width_factors_logits'
+                target_var = None
+                grad = None
+                var_idx = -1
+        
+                for i, var in enumerate(trainable_vars):
+                    if 'max_width_factors_logits' in var.name:
+                        target_var = var
+                        var_idx = i
+                        break
+        
+                if target_var is None:
+                    tf.print(
+                        "[GRAD DEBUG]", "step=", self._step_counter,
+                        "|", var_name + ": NOT FOUND in trainable_vars ❌"
+                    )
+                else:
+                    grad = gradients[var_idx]
+                    if grad is None:
+                        tf.print(
+                            "[GRAD DEBUG]", "step=", self._step_counter,
+                            "|", var_name + ": GRAD IS None ❌"
+                        )
+                    else:
+                        # Логируем значения по режимам
+                        factors_raw = target_var
+                        factors_actual = tf.nn.softplus(factors_raw) + 1.0  # [3]
+        
+                        tf.print(
+                            "[GRAD DEBUG]", "step=", self._step_counter,
+                            "|", var_name + ":",
+                            "raw_logits (L/M/H):", tf.round(factors_raw * 100) / 100,
+                            "| actual_factors (L/M/H):", tf.round(factors_actual * 100) / 100,
+                            "| grad_mean:", tf.reduce_mean(grad),
+                            "| grad_abs_max:", tf.reduce_max(tf.abs(grad)),
+                            "| grad_norm:", tf.norm(grad)
+                        )
+            except Exception as e:
+                tf.print(
+                    "[GRAD DEBUG]", "step=", self._step_counter,
+                    "| ERROR:", str(e)
+                )
+        
+        # Сейчас не нужен, т.к. persistent=False
+        # del tape
     
         clipped_grads, global_norm = tf.clip_by_global_norm(gradients, 1.0)
         self._optimizer.apply_gradients(zip(clipped_grads, trainable_vars))
-    
+        
+        # Гарантировать диапазон температуры
+        self.regime_selector.temperature.assign(
+            tf.clip_by_value(self.regime_selector.temperature, 0.7, 5.0)
+        )
+        # 🔑 ГИБРИДНЫЙ ПОДХОД v6: ЯВНЫЙ CLIP ТЕМПЕРАТУРЫ (критично!)
+        if hasattr(self, "regime_selector") and self.regime_selector is not None:
+            # 🔑 НОВОЕ: Логирование для отладки
+            if tf.equal(tf.math.floormod(self._step_counter, 50), 0):
+                tf.print(
+                    "[TEMP DEBUG] step=", self._step_counter,
+                    "| temperature=", self.regime_selector.temperature,  # ← ✅ Без .numpy()
+                    "| regime_scales=", self.regime_selector.regime_scales  # ← ✅ Без .numpy()
+                )
+                    
         # step counter increment
         self._step_counter.assign_add(1)
     
@@ -2969,12 +3434,51 @@ class LSTMIMMUKF(tf.Module):
             "target_width_ratio": target_width_ratio,
             "width_error": width_error,
             "width_loss": width_loss,
-            "lambda_width": lambda_width
+            "lambda_width": lambda_width,
+            "width_loss_base": base_width_loss,
+            "width_loss_high_regime": high_regime_penalty_loss,
+            "width_loss_ci_regul": ci_regularization_loss,
         }
-    
+        
+        # === ДОБАВЛЕНО: ОБНОВЛЕНИЕ ПРЕДЫДУЩЕГО ПОКРЫТИЯ для domain_penalty ===
+        self._prev_train_coverage.assign(actual_coverage)
+
         entropy_stats = self.entropy_regularizer.get_entropy_stats(h_lstm2)
         self.regime_selector.update_history(final_volatility)
-    
+
+        if tf.equal(tf.math.floormod(self._step_counter, 50), 0):
+            centers_val = self.regime_selector.get_centers()
+            soft_mean = tf.reduce_mean(soft_weights, axis=0)
+            temperature_val = self.regime_selector.temperature
+            scales_val = self.regime_selector.regime_scales
+        
+            tf.print("[REGIME DEBUG]", self._step_counter)
+            tf.print("  Centers:", centers_val)
+            tf.print("  Soft weights (mean):", soft_mean)
+            tf.print("  Temperature:", temperature_val)
+            tf.print("  Regime scales:", scales_val)
+            tf.print("  Regime CE Loss:", regime_ce_loss)
+            tf.print("  Separation Loss:", separation_loss)
+        
+            # === ДОБАВЛЕНО: диагностика max_width_factors_logits ===
+            if hasattr(self, "max_width_factors_logits"):
+                factors = tf.nn.softplus(self.max_width_factors_logits) + 1.0
+                tf.print("  Max width factor per regime (LOW/MID/HIGH):", factors)
+
+            # === ДОБАВЛЕНО: обучаемые целевые покрытия по режимам ===
+            if hasattr(self, "target_cov_logits") and self.target_cov_logits is not None:
+                target_cov_vals = 0.7 + 0.25 * tf.sigmoid(self.target_cov_logits)  # [3]
+                tf.print(
+                    "  Target coverage (LOW/MID/HIGH):",
+                    tf.round(target_cov_vals * 1000) / 1000
+                )
+                tf.print(
+                    "  Raw logits (L/M/H):",
+                    tf.round(self.target_cov_logits * 1000) / 1000
+                )
+            else:
+                tf.print("  Target coverage mode: FIXED")         
+        
         return (
             loss,
             metrics,
@@ -3205,7 +3709,7 @@ class LSTMIMMUKF(tf.Module):
         return inflation_correction, is_missed_jump_flag, correction_adaptive
 
     @tf.function
-    def val_step(self, X_batch, y_for_filtering_batch, y_target_batch,
+    def val_step(self, X_batch, y_for_filtering_batch, y_target_batch, regime_labels_batch,
                  initial_state, initial_covariance):
         """Шаг валидации для адаптивной UKF с контекстной волатильностью"""
         B = tf.shape(X_batch)[0]
@@ -3286,7 +3790,7 @@ class LSTMIMMUKF(tf.Module):
             )
             target_coverage_mean = tf.reduce_mean(target_coverage)
             
-            ci_lower, ci_upper, _ = self._calibrate_confidence_interval(
+            ci_lower, ci_upper, _, width_penalty_from_ci = self._calibrate_confidence_interval(
                 forecast, std_dev, final_volatility, student_t_config,
                 innovations=innovations[:, -10:, :],
                 regime_assignment=regime_info.get('regime_assignment', None),
@@ -3295,28 +3799,120 @@ class LSTMIMMUKF(tf.Module):
     
             ci_min = tf.minimum(ci_lower, ci_upper)
             ci_max = tf.maximum(ci_lower, ci_upper)
+
+            # === DIAG: batch mix + per-regime calibration (AFTER ci_min/ci_max) ===
+            
+            # 0) Частота логов (используй твой _is_debug_step() или do_monitor)
+            # Логируем каждые 2 эпохи (~42 шага)
+            diag_on = tf.logical_and(
+                tf.cast(self.debug_mode, tf.bool),
+                tf.equal(tf.math.floormod(self._step_counter, 42), 0)
+            )
+            
+            def _masked_mean(x, mask_bool):
+                mask = tf.cast(mask_bool, tf.float32)
+                return tf.reduce_sum(x * mask) / (tf.reduce_sum(mask) + 1e-8)
+            
+            def _approx_q(x, q01):  # q01 in [0,1]
+                xs = tf.sort(tf.reshape(x, [-1]))
+                n = tf.shape(xs)[0]
+                idx = tf.cast(tf.round(q01 * tf.cast(n - 1, tf.float32)), tf.int32)
+                return xs[tf.clip_by_value(idx, 0, n - 1)]
+            
+            def _print_diag():
+                # A) Mix батча по режимам ДАТАСЕТА
+                rl = tf.cast(tf.reshape(regime_labels_batch, [-1]), tf.int32)  # [B]
+                counts = tf.math.bincount(rl, minlength=3, maxlength=3, dtype=tf.int32)
+                counts_f = tf.cast(counts, tf.float32)
+                pcts = counts_f / (tf.reduce_sum(counts_f) + 1e-8)
+            
+                # B) Размах масштаба внутри батча (per-sample std по y_for_filtering)
+                vol_window = tf.math.reduce_std(y_for_filtering_batch[:, -20:], axis=1)  # [B]
+                v_p10 = _approx_q(vol_window, 0.10)
+                v_p50 = _approx_q(vol_window, 0.50)
+                v_p90 = _approx_q(vol_window, 0.90)
+            
+                # C) Coverage и widthRatio по режимам датасета
+                y = tf.reshape(y_target_batch, [-1])   # [B]
+                L = tf.reshape(ci_min, [-1])          # [B]
+                U = tf.reshape(ci_max, [-1])          # [B]
+                covered = tf.cast((y >= L) & (y <= U), tf.float32)  # [B]
+            
+                width = tf.maximum(U - L, 0.0)        # [B]
+                width_ratio_ps = width / (vol_window + 1e-8)  # [B]
+            
+                covs = []
+                wrs = []
+                for k in range(3):
+                    m = (rl == k)
+                    covs.append(_masked_mean(covered, m))
+                    wrs.append(_masked_mean(width_ratio_ps, m))
+            
+                # D) Согласованность режимов: датасет vs selector
+                pred_reg = tf.argmax(regime_info["soft_weights"], axis=1, output_type=tf.int32)  # [B]
+                cm = tf.math.confusion_matrix(rl, pred_reg, num_classes=3, dtype=tf.int32)
+            
+                tf.print(
+                    "\n[REGIME DIAG][VAL] step", self._step_counter,
+                    "| ds_counts", counts, "| ds_pcts", pcts,
+                    "| ystd(p10/p50/p90)", v_p10, v_p50, v_p90,
+                    "| cov(low/mid/high)", covs,
+                    "| widthRatio(low/mid/high)", wrs,
+                    "| cm(ds x pred)=\n", cm
+                )
+                return tf.constant(0, dtype=tf.int32)
+            
+            # ВАЖНО: tf.cond, чтобы не было Python-if по Tensor внутри @tf.function
+            _ = tf.cond(diag_on, _print_diag, lambda: tf.constant(0))
     
             # 7) Калибровочный loss (валидация)
             mse_loss_for_normalization = tf.reduce_mean(tf.square(forecast - y_target_batch))
-    
             # ВАЖНО: предполагаем, что _compute_calibration_loss уже обновлён и возвращает target_width_ratio 4-м значением
             raw_calibration_loss, actual_coverage, width_ratio, target_width_ratio, width_error = self._compute_calibration_loss(
                 ci_min, ci_max, y_target_batch, y_for_filtering_batch,
                 volatility_levels, target_coverage, training=False
             )
-    
             scale = tf.stop_gradient(mse_loss_for_normalization / (raw_calibration_loss + 1e-8))
             calibration_loss_normalized = raw_calibration_loss * scale
-    
+            
             # На валидации делаем фиксированный вес 1.0 (для отчёта и консистентности)
             current_weight = tf.constant(1.0, tf.float32)
-    
             upper = 0.3 * tf.stop_gradient(mse_loss_for_normalization)
             calibration_loss = tf.clip_by_value(calibration_loss_normalized, 0.0, upper)  # "clipped" на VAL
+            
+            # 🔑 НОВОЕ: Val-specific penalty — усиление штрафа на валидации для улучшения обобщения
+            calibration_loss = calibration_loss * 1.5  # ← БЫЛО: Усилить штраф на валидации на 50%
+            
+            # СТАЛО:
+            # 🔑 ГИБРИДНЫЙ ПОДХОД v6: Val-Specific Calibration Boost (критично для обобщения!)
+            val_boost_factor = 2.0  # ← ↑ 1.5 → 2.0 (усиление на 100% вместо 50%)
+            calibration_loss = calibration_loss * val_boost_factor
+            
+            # 🔑 ДОПОЛНИТЕЛЬНО: Адаптивный буст на основе train/val gap
+            # Если у модели есть сохранённое train coverage — усиливаем штраф пропорционально разрыву
+            # После вычисления actual_coverage
+            if hasattr(self, '_prev_train_coverage') and self._prev_train_coverage is not None:
+                train_val_gap = tf.abs(self._prev_train_coverage - actual_coverage)
+                
+                # Адаптивный буст штрафа
+                adaptive_boost = 1.0 + tf.minimum(3.0, train_val_gap * 10.0)  # до 4x
+                calibration_loss = calibration_loss * adaptive_boost
+                
+                # Диагностика (опционально)
+                should_log = tf.equal(tf.math.floormod(self._step_counter, 100), 0)
+                def _log():
+                    tf.print("[VAL BOOST DBG] step=", self._step_counter,
+                             "| train_val_gap=", train_val_gap,
+                             "| boost=", adaptive_boost)
+                    return tf.constant(0, dtype=tf.int32)
+                def _no_log():
+                    return tf.constant(0, dtype=tf.int32)
+                tf.cond(should_log, _log, _no_log)
     
             # 8) Total loss
             # Это чтобы сравнивать только по MSE без добавки калибровки (только в val_step)
-            calibration_loss_for_val = tf.constant(0.0, tf.float32)
+            # calibration_loss_for_val = tf.constant(0.0, tf.float32)
+            calibration_loss_for_val = calibration_loss
             
             loss = self.compute_loss(
                 forecast,
@@ -3398,15 +3994,28 @@ class LSTMIMMUKF(tf.Module):
                 'lambda_width': lambda_width
             }
     
-            if self.debug_mode and tf.equal(tf.math.floormod(self._step_counter, 100), 0):
+            def _log_diagnostics():
                 tf.print(
                     "\n[VAL DIAGNOSTICS] Step", self._step_counter,
                     "| MSE:", mse_loss_for_normalization,
                     "| Raw calibration:", raw_calibration_loss,
                     "| Normalized calibration:", calibration_loss_normalized,
                     "| Clipped calibration:", calibration_loss,
-                    "| Ratio (calib/mse):", calibration_loss / (mse_loss_for_normalization + 1e-8)
+                    "| Ratio (calib/mse):", calibration_loss / (mse_loss_for_normalization + 1e-8),
+                    "| actual_coverage:", actual_coverage,
+                    "| target_coverage_mean:", target_coverage_mean
                 )
+                return 0
+            
+            def _no_log():
+                return 0
+            
+            should_log = tf.logical_and(
+                tf.cast(self.debug_mode, tf.bool),
+                tf.equal(tf.math.floormod(self._step_counter, 100), 0)
+            )
+            
+            tf.cond(should_log, _log_diagnostics, _no_log)
     
         return loss, metrics, final_state, final_covariance, forecast, std_dev, ci_min, ci_max, target_coverage
 
@@ -3820,7 +4429,7 @@ class LSTMIMMUKF(tf.Module):
         print("✅ Оптимизированные датасеты успешно подготовлены")
         # 2. Инициализация модели на GPU
         print("\n🔧 Инициализация LSTM модели на GPU...")
-        for X_batch, y_for_filtering_batch, y_target_batch in train_ds.take(1):
+        for X_batch, y_for_filtering_batch, y_target_batch, regime_labels_batch in train_ds.take(1):
             input_shape = (int(X_batch.shape[1]), int(X_batch.shape[2]))
             print(f"✅ Определена форма входа: {input_shape}")
             with tf.device('/GPU:0' if self._gpu_available else '/CPU:0'):
@@ -3867,9 +4476,9 @@ class LSTMIMMUKF(tf.Module):
                 # Обновление learning rate
                 current_lr = self.get_lr_scheduler(
                     epoch=epoch,
-                    baselr=5e-4,   # адаптивный базовый LR
+                    baselr=5e-4,
                     minlr=1e-5,
-                    warmupepochs = 3,
+                    warmupepochs=5,  # ← ↑ 3→5 (более плавный warmup LR)
                     warmup_type='exponential',
                     gamma=1.5
                 )
@@ -3888,7 +4497,7 @@ class LSTMIMMUKF(tf.Module):
                 # ДОБАВЛЕНО: сбор всех нормализованных инноваций за эпоху
                 all_normalized_innov = []
 
-                for batch_idx, (X_batch, y_for_filtering_batch, y_target_batch) in enumerate(train_ds):
+                for batch_idx, (X_batch, y_for_filtering_batch, y_target_batch, regime_labels_batch) in enumerate(train_ds):
                     batch_size = tf.shape(X_batch)[0]
                     current_state_size = tf.shape(self._last_state)[0]
 
@@ -3961,7 +4570,7 @@ class LSTMIMMUKF(tf.Module):
 
                     # Шаг обучения
                     results = self.train_step(
-                        X_batch, y_for_filtering_batch, y_target_batch,
+                        X_batch, y_for_filtering_batch, y_target_batch, regime_labels_batch,
                         initial_state, initial_covariance
                     )
                     loss, metrics, final_state, final_covariance, forecast, std_devs, volatility_levels, \
@@ -3987,7 +4596,6 @@ class LSTMIMMUKF(tf.Module):
                         tf.reduce_mean(final_covariance, axis=0, keepdims=True)  # [B, 1, 1] → [1, 1, 1]
                     )
                     self._state_initialized.assign(True)
-                    self._step_counter.assign_add(1)
 
                     # ДОПОЛНИТЕЛЬНО: принудительно применяем статистику истории для адаптации центров
                     if self._step_counter % 10 == 0:  # каждые 10 шагов
@@ -4005,19 +4613,26 @@ class LSTMIMMUKF(tf.Module):
                         entropy_val = entropy_stats_np['entropy_mean']  # Используем предварительно вычисленную статистику
 
                         # Мягкие веса (вероятности режимов)
-                        soft_weights = regime_info['soft_weights']  # [B, num_regimes]
-                        soft_weights_mean = tf.reduce_mean(soft_weights, axis=0).numpy()
-
-                        # Красивый вывод
-                        regime_names = ['LOW', 'MID', 'HIGH']
-                        regime_dist = ' | '.join([
-                            f"{regime_names[i]}: {soft_weights_mean[i]:.1%}"
-                            for i in range(3)
-                        ])
+                        # --- Извлечение средних весов режимов ---
+                        soft_weights = regime_info['soft_weights']
+                        soft_weights_mean = tf.reduce_mean(soft_weights, axis=0).numpy().tolist()
+                        low_val, mid_val, high_val = soft_weights_mean
+                        
+                        regime_dist = f"LOW: {low_val:.1%} | MID: {mid_val:.1%} | HIGH: {high_val:.1%}"
+                        
+                        # --- Конвертация тензоров в числа ДО f-строки ---
+                        def safe_scalar(t):
+                            return float(np.array(t).flatten()[0])
+                        
+                        loss_val = safe_scalar(loss)
+                        progress_val = safe_scalar(progress)
+                        
+                        # --- Логирование прогресса ---
                         print(f"\r   Batch {batch_idx+1}/{len(train_ds)} | "
-                              f"Progress: {progress:.1f}% | loss={loss:.6f} | "
-                              f"LSTM_Ent:{entropy_val:.1f} | "  # сократить название
-                              f"Regimes(LOW/MID/HIGH): {soft_weights_mean[0]:.0%}/{soft_weights_mean[1]:.0%}/{soft_weights_mean[2]:.0%}", end='', flush=True)
+                              f"Progress: {progress_val:.1f}% | loss={loss_val:.6f} | "
+                              f"LSTM_Ent:{entropy_val:.1f} | "
+                              f"Regimes(LOW/MID/HIGH): {int(low_val*100)}%/{int(mid_val*100)}%/{int(high_val*100)}%",
+                              end='', flush=True)
                 print()  # Новая строка после прогресс-бара
 
                 # Средние метрики по эпохе
@@ -4039,7 +4654,7 @@ class LSTMIMMUKF(tf.Module):
                 self.all_val_covered = []
                 val_volatility_levels = []
                 val_metrics = []  # Список для хранения всех метрик по шагам валидации
-                for batch_idx, (X_val_batch, y_val_for_filtering_batch, y_val_target_batch) in enumerate(val_ds):
+                for batch_idx, (X_val_batch, y_val_for_filtering_batch, y_val_target_batch, regime_labels_batch) in enumerate(val_ds):
                     B_val = tf.shape(X_val_batch)[0]
 
                     # === ФУНКЦИИ ДЛЯ ВЫБОРА СОСТОЯНИЯ ДЛЯ ВАЛИДАЦИИ ===
@@ -4055,7 +4670,7 @@ class LSTMIMMUKF(tf.Module):
 
                     # Шаг валидации
                     results_val = self.val_step(
-                        X_val_batch, y_val_for_filtering_batch, y_val_target_batch,
+                        X_val_batch, y_val_for_filtering_batch, y_val_target_batch, regime_labels_batch,
                         initial_state_val, initial_covariance_val
                     )
                     val_loss, metrics_val, final_state_val, final_covariance_val, forecast_val, std_devs_val, ci_lower_val, ci_upper_val, target_coverage_val = results_val
@@ -4104,6 +4719,13 @@ class LSTMIMMUKF(tf.Module):
                 val_loss_avg = tf.reduce_mean(val_losses)
                 val_mse_avg = tf.reduce_mean(val_mse_losses)
                 val_volatility_avg = tf.reduce_mean(tf.stack(val_volatility_levels))
+                
+                # 🔑 ГИБРИДНЫЙ ПОДХОД v2: Сохраняем val coverage для domain adaptation penalty
+                if hasattr(self, 'all_val_covered') and len(self.all_val_covered) > 0:
+                    self._prev_val_coverage = tf.constant(np.mean(self.all_val_covered), dtype=tf.float32)
+                else:
+                    if not hasattr(self, '_prev_val_coverage'):
+                        self._prev_val_coverage = tf.constant(0.85, dtype=tf.float32)  # default target
 
                 # ===== ОБРАБОТКА РЕЗУЛЬТАТОВ =====
                 epoch_end_time = datetime.datetime.now()
@@ -4590,7 +5212,7 @@ class LSTMIMMUKF(tf.Module):
             'anomaly_buffer_size': int(getattr(self, 'anomaly_buffer_size', 100)),
     
             # scalar params (оставляем как часть архитектуры)
-            'max_width_factor_logit': self.max_width_factor_logit.numpy() if hasattr(self, 'max_width_factor_logit') else np.log(1.5),
+            'max_width_factors_logits': self.max_width_factors_logits.numpy() if hasattr(self, 'max_width_factors_logits') else np.array([np.log(1.5)] * 3),
             'lambda_entropy': self.lambda_entropy.numpy() if hasattr(self, 'lambda_entropy') else 0.02,
             'threshold_ema': self.threshold_ema.numpy() if hasattr(self, 'threshold_ema') else 3.0,
     
@@ -4907,7 +5529,7 @@ class LSTMIMMUKF(tf.Module):
         # === regime selector state ===
         regime_selector_state = {
             "regime_scales": np.array([2.96, 4.44, 6.16], dtype=np.float32),
-            "temperature": 0.4,
+            "temperature": 0.8,  # ← Оставлено 0.8 (согласовано с __init__)
             "history": np.zeros([1, 100], dtype=np.float32),
             "center_logits": np.log([0.12, 0.35, 0.75]),
         }
@@ -4943,7 +5565,7 @@ class LSTMIMMUKF(tf.Module):
             "anomaly_buffer_size": anomaly_buffer_size_val,
     
             # === trainable/important params ===
-            "max_width_factor_logit": self.max_width_factor_logit.numpy() if hasattr(self, "max_width_factor_logit") else np.log(1.5),
+            "max_width_factors_logits": self.max_width_factors_logits.numpy() if hasattr(self, "max_width_factors_logits") else np.array([np.log(1.5)] * 3),
     
             # === diff ukf ===
             "diff_ukf_state": diff_ukf_state,
@@ -5134,8 +5756,12 @@ class LSTMIMMUKF(tf.Module):
     
                 if "temperature" in selector_state and selector_state["temperature"] is not None and hasattr(rs, "temperature"):
                     try:
-                        rs.temperature.assign(tf.constant(selector_state["temperature"], dtype=tf.float32))
+                        # 🔑 ГИБРИДНЫЙ ПОДХОД v6: ЯВНЫЙ CLIP ПРИ ВОССТАНОВЛЕНИИ
+                        temp_val = float(selector_state["temperature"])
+                        temp_val = max(0.7, min(2.0, temp_val))  # ← ↑ [0.7, 2.0]
+                        rs.temperature.assign(tf.constant(temp_val, dtype=tf.float32))
                         restored.append("temperature")
+                        print(f"   ✅ temperature: {temp_val:.3f} (clip [0.7, 2.0])")  # ← Обновлённый лог
                     except Exception as e:
                         print(f"   ⚠️ Ошибка при восстановлении temperature: {str(e)}")
     
@@ -5196,8 +5822,6 @@ class LSTMIMMUKF(tf.Module):
                 print(f"   🎭 Regime Selector: scales={self.regime_selector.regime_scales.numpy()}, temp={float(self.regime_selector.temperature.numpy()):.3f}")
             if hasattr(self, "inflation_base_factor"):
                 print(f"   💧 Adaptive inflation: base={float(tf.nn.softplus(self.inflation_base_factor).numpy()):.3f}")
-            if hasattr(self, "max_width_factor_logit"):
-                print(f"   📏 Max width factor: {float(tf.nn.softplus(self.max_width_factor_logit).numpy()) + 1.0:.2f}x")
             print("=" * 80)
     
             return True
@@ -5349,10 +5973,11 @@ class LSTMIMMUKF(tf.Module):
         student_t_config, target_coverage, regime_info = self._get_calibration_params(
             final_volatility,
             student_t_config=student_t_config,
-            correction_adaptive=correction_adaptive
+            correction_adaptive=correction_adaptive,
+            training=False
         )
     
-        ci_lower, ci_upper, _ = self._calibrate_confidence_interval(
+        ci_lower, ci_upper, _, width_penalty_from_ci = self._calibrate_confidence_interval(
             forecast,
             std_dev,
             final_volatility,
