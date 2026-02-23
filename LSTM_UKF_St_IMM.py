@@ -3926,8 +3926,10 @@ class LSTMIMMUKF(tf.Module):
             
             # На валидации делаем фиксированный вес 1.0 (для отчёта и консистентности)
             # Используем ТОТ ЖЕ warmup как в train_step
+            warmup_steps = 250  # ← Параметр из train_step
             progress = tf.cast(self._step_counter, tf.float32) / tf.cast(warmup_steps, tf.float32)
             progress = tf.clip_by_value(progress, 0.0, 1.0)
+            base_calibration_weight = 0.05  # ← Фиксированное значение для val_step
             current_weight = base_calibration_weight * (1.0 - tf.exp(-3.0 * progress))
             
             calibration_loss = calibration_loss_normalized
@@ -5622,6 +5624,9 @@ class LSTMIMMUKF(tf.Module):
             # === regularization helpers ===
             "lambda_entropy": self.lambda_entropy.numpy() if hasattr(self, "lambda_entropy") else 0.02,
             "threshold_ema": self.threshold_ema.numpy() if hasattr(self, "threshold_ema") else 3.0,
+            
+            # === coverage mixing parameter ===
+            "coverage_mixing_alpha": self.coverage_mixing_alpha.numpy() if hasattr(self, "coverage_mixing_alpha") else 0.405,  # log(0.6/(1-0.6))
         }
     
         print("✅ Полное состояние модели сохранено (усреднённое по батчу)")
@@ -5656,6 +5661,22 @@ class LSTMIMMUKF(tf.Module):
             if self.model is not None and d.get("lstm_weights") is not None:
                 self.model.set_weights(d["lstm_weights"])
                 print("✅ LSTM веса загружены")
+            
+            # --- 1.1) Coverage mixing parameter ---
+            if "coverage_mixing_alpha" in d and d["coverage_mixing_alpha"] is not None:
+                if hasattr(self, "coverage_mixing_alpha"):
+                    self.coverage_mixing_alpha.assign(float(d["coverage_mixing_alpha"]))
+                    print(f"✅ coverage_mixing_alpha: {float(d['coverage_mixing_alpha']):.6f}")
+                else:
+                    # Initialize if it doesn't exist yet
+                    initial_logit = d["coverage_mixing_alpha"]
+                    self.coverage_mixing_alpha = tf.Variable(
+                        initial_value=float(initial_logit),
+                        trainable=True,
+                        dtype=tf.float32,
+                        name='coverage_mixing_alpha'
+                    )
+                    print(f"➕ coverage_mixing_alpha (новый): {float(d['coverage_mixing_alpha']):.6f}")
     
             # --- 2) UKF filter state ---
             print("\n🔧 Восстановление состояния фильтра UKF...")
