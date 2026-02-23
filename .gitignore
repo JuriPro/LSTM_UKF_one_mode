@@ -1,9 +1,8 @@
-```
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
 .Python
 build/
 develop-eggs/
@@ -20,7 +19,6 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-.MF
 
 # Virtual environments
 venv/
@@ -38,13 +36,20 @@ ENV/
 # Logs
 *.log
 
-# OS
-.DS_Store
-Thumbs.db
+# Environment
+.env
+.env.local
+*.env.*
 
 # Coverage
 .coverage
+coverage/
 htmlcov/
-.coverage.*
-coverage.xml
-```
+
+# Temporary files
+*.tmp
+*.temp
+
+# OS
+.DS_Store
+Thumbs.db
