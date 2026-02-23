@@ -2644,7 +2644,8 @@ class LSTMIMMUKF(tf.Module):
         y_std_batch = tf.reduce_mean(vol)                               # scalar
         
         # 2) Soft coverage surrogate
-        margin = tf.maximum(0.05 * y_std_batch, 1e-3)
+        # ✅ ИСПРАВЛЕНО: добавлен нижний порог для margin
+        margin = tf.maximum(0.05 * y_std_batch, 1e-6)
         soft_lower = tf.sigmoid((y_target_flat - ci_min_flat) / margin)
         soft_upper = tf.sigmoid((ci_max_flat - y_target_flat) / margin)
         soft_cov = soft_lower * soft_upper
@@ -3249,13 +3250,9 @@ class LSTMIMMUKF(tf.Module):
                 # 🔑 ГИБРИДНЫЙ ПОДХОД v3: Domain Adaptation Penalty
                 def _apply_domain_penalty():
                     target_coverage_val = target_coverage_mean
-                    # 🔑 НОВОЕ: Если есть сохранённое val coverage — используем его
-                    if hasattr(self, '_prev_val_coverage') and self._prev_val_coverage is not None:
-                        train_val_gap = tf.abs(actual_coverage - self._prev_val_coverage)
-                        domain_penalty = tf.constant(5.0, tf.float32) * tf.square(train_val_gap)  # ↑ с 15.0 до 20.0
-                    else:
-                        coverage_gap = tf.abs(actual_coverage - target_coverage_val)
-                        domain_penalty = tf.constant(10.0, tf.float32) * tf.square(coverage_gap)  # ← БЫЛО 5.0, СТАЛО 10.0
+                    # 🔑 ИСПРАВЛЕНО: штрафуем разницу между actual_coverage и целевым покрытием, а не с предыдущим val
+                    coverage_gap = tf.abs(actual_coverage - target_coverage_val)
+                    domain_penalty = tf.constant(10.0, tf.float32) * tf.square(coverage_gap)
                     return calibration_loss_clipped + domain_penalty
                 
                 def _no_domain_penalty():
@@ -4626,6 +4623,8 @@ class LSTMIMMUKF(tf.Module):
                     self._last_P.assign(
                         tf.reduce_mean(final_covariance, axis=0, keepdims=True)  # [B, 1, 1] → [1, 1, 1]
                     )
+                    # ✅ ИСПРАВЛЕНО: Обновление _last_volatility с использованием vol_final, а не final_state
+                    self._last_volatility.assign(tf.reduce_mean(vol_final, keepdims=True))  # [B] → [1]
                     self._state_initialized.assign(True)
 
                     # ДОПОЛНИТЕЛЬНО: принудительно применяем статистику истории для адаптации центров
