@@ -121,7 +121,7 @@ class VolatilityRegimeSelector(tf.keras.layers.Layer):
     def __init__(self, num_regimes=3, history_window=100, learnable_centers=True, name="volatility_regime_selector"):
         super(VolatilityRegimeSelector, self).__init__(name=name)
 
-        self.num_regimes = num_regimes
+        self.num_regimes = int(num_regimes)
         self.history_window = history_window
         self.learnable_centers = learnable_centers
 
@@ -2496,18 +2496,23 @@ class LSTMIMMUKF(tf.Module):
         total_loss = (
             mse_loss +
             calibration_loss +
-            0.05 * stability_penalty +          # оставили
-            0.01 * spectral_reg +               # оставили (малый вес)
-            selector_reg +                      # режимы
-            entropy_penalty +                   # главный регуляризатор (15.0)
-            (self.lambda_entropy * tf.cast(entropy_loss, tf.float32))  # LSTM энтропия
+            0.05 * stability_penalty +
+            0.01 * spectral_reg +
+            selector_reg +
+            entropy_penalty +
+            (self.lambda_entropy * tf.cast(entropy_loss, tf.float32))
         )
-
         # Safety NaN/Inf
         total_loss = tf.where(tf.math.is_nan(total_loss), tf.constant(1e6, tf.float32), total_loss)
         total_loss = tf.where(tf.math.is_inf(total_loss), tf.constant(1e6, tf.float32), total_loss)
-
-        return total_loss
+        
+        # 🔑 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Гарантированная скаляризация
+        total_loss = tf.reduce_mean(total_loss)  # Усредняем
+        total_loss = tf.squeeze(total_loss)      # Убираем размерности
+        if len(total_loss.shape) > 0:
+            total_loss = tf.reduce_sum(total_loss)
+        
+        return total_loss  # ← Теперь гарантированно скаляр
 
     def compute_target_coverage(self, volatility_level: tf.Tensor, training: bool = True) -> tf.Tensor:
         """
@@ -2624,7 +2629,12 @@ class LSTMIMMUKF(tf.Module):
             if hasattr(self.regime_selector, "num_regimes"):
                 K = int(self.regime_selector.num_regimes)
             else:
-                K = int(self.regime_selector.numregimes)
+                # Проверяем атрибут numregimes (редкий случай)
+                if hasattr(self.regime_selector, "numregimes"):
+                    K = int(self.regime_selector.numregimes)
+                else:
+                    # По умолчанию 3 режима, если ни один из атрибутов не найден
+                    K = 3
             cfg["regime_soft_weights"] = _to_BK(cfg["regime_soft_weights"], K)
         else:
             cfg["regime_soft_weights"] = regime_info["soft_weights"]
@@ -2748,6 +2758,12 @@ class LSTMIMMUKF(tf.Module):
         width_penalty = width_base * width_error
 
         raw_calibration_loss = under_pen + over_pen + regime_coverage_loss + width_penalty
+
+        # 🔑 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Скаляризация raw_calibration_loss
+        raw_calibration_loss = tf.reduce_mean(raw_calibration_loss)
+        raw_calibration_loss = tf.squeeze(raw_calibration_loss)
+        if len(raw_calibration_loss.shape) > 0:
+            raw_calibration_loss = tf.reduce_sum(raw_calibration_loss)
 
         # === 7) Width diagnostics ✅ ИСПРАВЛЕНО: Защита от log(0) ===
         width_ps = tf.maximum(ci_max_flat - ci_min_flat, 0.0)  # [B*T]
@@ -3438,6 +3454,13 @@ class LSTMIMMUKF(tf.Module):
                 if hasattr(self, "max_width_factors_logits") and self.max_width_factors_logits is not None:
                     l2_width_reg = 1e-4 * tf.reduce_sum(tf.square(self.max_width_factors_logits))
                     loss = loss + l2_width_reg
+
+                # 🔑 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Скаляризация loss перед возвратом
+                loss = tf.reduce_mean(loss)
+                loss = tf.squeeze(loss)
+                if len(loss.shape) > 0:
+                    loss = tf.reduce_sum(loss)
+                    
                 # ✅ МОНИТОРИНГ L2 регуляризации
                 should_log_l2 = tf.equal(tf.math.floormod(self._step_counter, 100), 0)
                 def _log_l2():
@@ -4162,6 +4185,11 @@ class LSTMIMMUKF(tf.Module):
 
             regime_soft_weights = tf.reduce_mean(regime_info['soft_weights'], axis=0)
             regime_entropy = tf.reduce_mean(regime_info['entropy'])
+
+            loss = tf.reduce_mean(loss)      # Усредняем если есть размерности
+            loss = tf.squeeze(loss)          # Убираем все оси размерности 1
+            if len(loss.shape) > 0:
+                loss = tf.reduce_sum(loss)
 
             q_val = tf.reduce_mean(q_base_final)
             r_val = tf.reduce_mean(r_base_final)
