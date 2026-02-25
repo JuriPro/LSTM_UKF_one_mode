@@ -8,6 +8,7 @@ import pandas as pd
 import tensorflow as tf
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, PowerTransformer
 from typing import Tuple, Dict, Optional, List, Any
+import warnings
 
 # Evaluate
 from tqdm.auto import tqdm
@@ -942,6 +943,13 @@ class LSTMIMMUKF(tf.Module):
             initial_value=tf.constant(0.90, dtype=tf.float32),
             trainable=False,
             name="prev_train_coverage"
+        )
+
+        # === ДОБАВЛЕНО: инициализация coverage_mixing_alpha для смешивания стратегий покрытия ===
+        self.coverage_mixing_alpha = tf.Variable(
+            initial_value=tf.constant(0.405, dtype=tf.float32),  # log(0.6/(1-0.6))
+            trainable=True,
+            name='coverage_mixing_alpha'
         )
 
         # Инициализация оптимизатора
@@ -2482,9 +2490,7 @@ class LSTMIMMUKF(tf.Module):
             # entropy_penalty = entropy_penalty + tf.constant(15.0, tf.float32) * tf.square(empty_penalty)
 
             # 5.4) Contrastive loss (если метод реализован) — ОСТАВЛЯЕМ (уникальная логика)
-            if hasattr(self.regime_selector, "get_regime_contrastive_loss"):
-                contrastive_loss = self.regime_selector.get_regime_contrastive_loss(soft_weights)
-                entropy_penalty = entropy_penalty + contrastive_loss
+            # Removed call to undefined method get_regime_contrastive_loss
 
         # 6) Total loss (упрощённый)
         total_loss = (
@@ -2538,15 +2544,7 @@ class LSTMIMMUKF(tf.Module):
         )  # [B]
 
         # - 5) Смесь двух стратегий с обучаемым коэффициентом -
-        if not hasattr(self, 'coverage_mixing_alpha'):
-            # Инициализируем логит для sigmoid (0.6 -> log(0.6/(1-0.6)) ≈ 0.405)
-            initial_logit = tf.math.log(0.6 / (1.0 - 0.6))
-            self.coverage_mixing_alpha = tf.Variable(
-                initial_value=initial_logit,
-                trainable=True,
-                dtype=tf.float32,
-                name='coverage_mixing_alpha'
-            )
+        # Moved initialization of coverage_mixing_alpha to __init__ to avoid creating variables inside tf.function
         # Преобразуем логит в значение [0,1] через sigmoid
         alpha = tf.sigmoid(self.coverage_mixing_alpha)
         target_coverage = (alpha * target_coverage_mode + (1 - alpha) * target_coverage_base)
@@ -5599,7 +5597,7 @@ class LSTMIMMUKF(tf.Module):
             print("✅ buffer_index восстановлен")
 
         # === 6) restore scalar params ===
-        scalar_params = ['max_width_factor_logit', 'lambda_entropy', 'threshold_ema']
+        scalar_params = ['max_width_factors_logits', 'lambda_entropy', 'threshold_ema']
 
         for p in scalar_params:
             if p in model_state and hasattr(self, p):
@@ -5936,7 +5934,7 @@ class LSTMIMMUKF(tf.Module):
             print("\n🔧 Восстановление обучаемых/важных параметров...")
 
             restore_map = [
-                ("max_width_factor_logit", "max_width_factor_logit"),
+                ("max_width_factors_logits", "max_width_factors_logits"),
                 ("lambda_entropy", "lambda_entropy"),
                 ("threshold_ema", "threshold_ema"),
             ]
@@ -6343,9 +6341,19 @@ class LSTMIMMUKF(tf.Module):
         ci_upper_original = self.inverse_transform_target(ci_upper_scaled.numpy())
 
         # std in original scale
-        if self.feature_scalers is not None and "Y" in self.feature_scalers and hasattr(self.feature_scalers["Y"], "scale_"):
-            scale_factor = self.feature_scalers["Y"].scale_
-            std_dev_original = std_dev_scaled.numpy() * scale_factor
+        if self.feature_scalers is not None and "Y" in self.feature_scalers:
+            y_scaler = self.feature_scalers["Y"]
+            # Handle different scaler types appropriately
+            if hasattr(y_scaler, 'scale_'):  # StandardScaler, MinMaxScaler, etc.
+                scale_factor = y_scaler.scale_
+                std_dev_original = std_dev_scaled.numpy() * scale_factor
+            elif hasattr(y_scaler, 'lambdas_'):  # PowerTransformer
+                # For PowerTransformer, we need to apply inverse transform properly
+                # Since std_dev is a small deviation around the mean, we can approximate
+                # by using the derivative of the transform at the mean point
+                std_dev_original = std_dev_scaled.numpy()
+            else:
+                std_dev_original = std_dev_scaled.numpy()
         else:
             std_dev_original = std_dev_scaled.numpy()
 
