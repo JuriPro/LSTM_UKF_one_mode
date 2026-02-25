@@ -1,40 +1,31 @@
+```
 # Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
+*.pyc
+*.pyo
+*.pyd
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual environments
-venv/
 env/
-ENV/
+venv/
 .venv/
-.env/
+.ENV
+.venv.bak/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Generated folders
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# Logs
-*.log
 
 # Environment
 .env
@@ -46,10 +37,12 @@ ENV/
 coverage/
 htmlcov/
 
-# Temporary files
-*.tmp
-*.temp
+# Testing
+.pytest_cache/
+.mypy_cache/
+.hypothesis/
 
 # OS
 .DS_Store
 Thumbs.db
+```
