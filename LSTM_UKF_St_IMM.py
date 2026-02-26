@@ -3029,41 +3029,31 @@ class LSTMIMMUKF(tf.Module):
                 inf_factor_final = tf.gather(inflation_factors, t_last, axis=1)                # [B,1]
                 correction_adaptive = correction_adaptive_hist[:, -1, :]  # [B,1]
 
-                # --- НАЧАЛО supervised regime classification ---
+                # --- НАЧАЛО soft clustering regime classification ---
                 regime_info = self.regime_selector.assign_soft_regimes(final_volatility)
                 soft_weights = regime_info["soft_weights"]  # [B, K]
                 logits = regime_info["logits"]         # [B, K]
 
                 regime_assignment = regime_info.get("regime_assignment", None)
 
-                # Используем переданный аргумент — НЕ ПЕРЕЗАПИСЫВАЕМ!
-                # regime_labels_batch уже доступен → просто используем
+                # Вычисляем центры режимов
+                centers = regime_info["centers"]  # [K]
 
-                # 1. Вычисляем веса классов
-                unique, _, counts = tf.unique_with_counts(regime_labels_batch)
-                class_weights = tf.math.reciprocal(tf.cast(counts, tf.float32) + 1e-6)
-                class_weights /= tf.reduce_sum(class_weights)
-                class_weights *= 3.0  # Нормализация на 3 класса
+                # Вычисляем квадратичные расстояния между каждой точкой и каждым центром
+                vol_flat = tf.reshape(final_volatility, [-1, 1])           # [B, 1]
+                centers_flat = tf.reshape(centers, [1, -1])                # [1, K]
+                distances = tf.square(vol_flat - centers_flat)             # [B, K]
 
-                # 2. Применяем веса к каждому образцу
-                sample_weights = tf.gather(class_weights, regime_labels_batch)
+                # Взвешенная сумма расстояний (soft clustering loss)
+                cluster_loss = tf.reduce_mean(tf.reduce_sum(soft_weights * distances, axis=1))
 
-                # 3. Вычисляем ВЗВЕШЕННУЮ перекрестную энтропию
-                per_sample_ce = tf.nn.sparse_softmax_cross_entropy_with_logits(
-                    labels=regime_labels_batch,
-                    logits=logits
-                )
-                weighted_ce = per_sample_ce * sample_weights
-                regime_ce_loss = tf.reduce_mean(weighted_ce)  # ✅ ВЕСА ПРИМЕНЕНЫ!
-
-                # 4. Остальной код без изменений
+                # Остальной код без изменений
                 rprog = tf.cast(self._step_counter, tf.float32) / 200.0
-                lambda_regime_base = 2.0
-                lambda_regime = lambda_regime_base * (1.0 - tf.exp(-5.0 * rprog))
+                lambda_cluster = 0.1  # вес кластеризации (подобрать экспериментально)
 
                 separation_loss = self.regime_selector.get_center_separation_loss()
                 regime_loss = (
-                    lambda_regime * regime_ce_loss +
+                    lambda_cluster * cluster_loss +
                     0.1 * separation_loss +
                     0.5 * self.regime_selector.get_regime_entropy_loss(soft_weights)  # ✅ Добавлен entropy loss
                 )
@@ -3593,7 +3583,6 @@ class LSTMIMMUKF(tf.Module):
                 tf.print("  Soft weights (mean):", soft_mean)
                 tf.print("  Temperature:", temperature_val)
                 tf.print("  Regime scales:", scales_val)
-                tf.print("  Regime CE Loss:", regime_ce_loss)
                 tf.print("  Separation Loss:", separation_loss)
 
                 # === ДОБАВЛЕНО: диагностика max_width_factors_logits ===
@@ -3966,85 +3955,29 @@ class LSTMIMMUKF(tf.Module):
             ci_min = tf.minimum(ci_lower, ci_upper)
             ci_max = tf.maximum(ci_lower, ci_upper)
 
-            # === DIAG: batch mix + per-regime calibration (AFTER ci_min/ci_max) ===
-            # ✅ ПРОВЕРКА: regime_labels_batch доступен
-            has_regime_labels = regime_labels_batch is not None
-
+            # === DIAG: упрощённая диагностика без меток режимов ===
             diag_on = tf.logical_and(
                 tf.cast(self.debug_mode, tf.bool),
                 tf.equal(tf.math.floormod(self._step_counter, 42), 0)
             )
 
-            def _masked_mean(x, mask_bool):
-                mask = tf.cast(mask_bool, tf.float32)
-                return tf.reduce_sum(x * mask) / (tf.reduce_sum(mask) + 1e-8)
-
-            def _approx_q(x, q01):  # q01 in [0,1]
-                xs = tf.sort(tf.reshape(x, [-1]))
-                n = tf.shape(xs)[0]
-                idx = tf.cast(tf.round(q01 * tf.cast(n - 1, tf.float32)), tf.int32)
-                return xs[tf.clip_by_value(idx, 0, n - 1)]
-
             def _print_diag():
-                if has_regime_labels:
-                    # A) Mix батча по режимам ДАТАСЕТА
-                    rl = tf.cast(tf.reshape(regime_labels_batch, [-1]), tf.int32)  # [B]
-                    counts = tf.math.bincount(rl, minlength=3, maxlength=3, dtype=tf.int32)
-                    counts_f = tf.cast(counts, tf.float32)
-                    pcts = counts_f / (tf.reduce_sum(counts_f) + 1e-8)
+                # Упрощённая диагностика без меток режимов
+                vol_window = tf.math.reduce_std(y_for_filtering_batch[:, -20:], axis=1)  # [B]
+                y = tf.reshape(y_target_batch, [-1])   # [B]
+                L = tf.reshape(ci_min, [-1])            # [B]
+                U = tf.reshape(ci_max, [-1])            # [B]
+                covered = tf.cast((y >= L) & (y <= U), tf.float32)  # [B]
+                width = tf.maximum(U - L, 0.0)          # [B]
+                width_ratio = tf.reduce_mean(width) / (tf.reduce_mean(vol_window) + 1e-8)
 
-                    # B) Размах масштаба внутри батча (per-sample std по y_for_filtering)
-                    vol_window = tf.math.reduce_std(y_for_filtering_batch[:, -20:], axis=1)  # [B]
-                    v_p10 = _approx_q(vol_window, 0.10)
-                    v_p50 = _approx_q(vol_window, 0.50)
-                    v_p90 = _approx_q(vol_window, 0.90)
-
-                    # C) Coverage и widthRatio по режимам датасета
-                    y = tf.reshape(y_target_batch, [-1])   # [B]
-                    L = tf.reshape(ci_min, [-1])          # [B]
-                    U = tf.reshape(ci_max, [-1])          # [B]
-                    covered = tf.cast((y >= L) & (y <= U), tf.float32)  # [B]
-
-                    width = tf.maximum(U - L, 0.0)        # [B]
-                    width_ratio_ps = width / (vol_window + 1e-8)  # [B]
-
-                    covs = []
-                    wrs = []
-                    for k in range(3):
-                        m = (rl == k)
-                        covs.append(_masked_mean(covered, m))
-                        wrs.append(_masked_mean(width_ratio_ps, m))
-
-                    # D) Согласованность режимов: датасет vs selector
-                    pred_reg = tf.argmax(regime_info["soft_weights"], axis=1, output_type=tf.int32)  # [B]
-                    cm = tf.math.confusion_matrix(rl, pred_reg, num_classes=3, dtype=tf.int32)
-
-                    tf.print(
-                        "\n[REGIME DIAG][VAL] step", self._step_counter,
-                        "| ds_counts", counts, "| ds_pcts", pcts,
-                        "| ystd(p10/p50/p90)", v_p10, v_p50, v_p90,
-                        "| cov(low/mid/high)", covs,
-                        "| widthRatio(low/mid/high)", wrs,
-                        "| cm(ds x pred)=\n", cm
-                    )
-                else:
-                    # Упрощённая диагностика без режимов
-                    vol_window = tf.math.reduce_std(y_for_filtering_batch[:, -20:], axis=1)  # [B]
-                    y = tf.reshape(y_target_batch, [-1])   # [B]
-                    L = tf.reshape(ci_min, [-1])          # [B]
-                    U = tf.reshape(ci_max, [-1])          # [B]
-                    covered = tf.cast((y >= L) & (y <= U), tf.float32)  # [B]
-                    width = tf.maximum(U - L, 0.0)        # [B]
-                    width_ratio = tf.reduce_mean(width) / (tf.reduce_mean(vol_window) + 1e-8)
-
-                    tf.print(
-                        "\n[REGIME DIAG][VAL] step", self._step_counter,
-                        "| coverage:", tf.reduce_mean(covered),
-                        "| width_ratio:", width_ratio
-                    )
+                tf.print(
+                    "\n[REGIME DIAG][VAL] step", self._step_counter,
+                    "| coverage:", tf.reduce_mean(covered),
+                    "| width_ratio:", width_ratio
+                )
                 return tf.constant(0, dtype=tf.int32)
 
-            # ВАЖНО: tf.cond, чтобы не было Python-if по Tensor внутри @tf.function
             _ = tf.cond(diag_on, _print_diag, lambda: tf.constant(0, dtype=tf.int32))
 
             # 7) Калибровочный loss (валидация)
