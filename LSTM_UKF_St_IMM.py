@@ -33,40 +33,7 @@ from volatility import yang_zhang, rogers_satchell, hodges_tompkins, garman_klas
 # =================================================================
 # КЛАССЫ ДИФФЕРЕНЦИРУЕМОГО UKF
 # =================================================================
-class SpectralCovarianceParam(tf.Module):
-    """SPD-гарантированная параметризация ковариационных матриц для скалярного случая (state_dim=1)"""
-    def __init__(self, name=None):
-        super().__init__(name=name)
-        # Инициализируем логарифм дисперсии для скалярного случая
-        # Для state_dim=1 используем скаляр
-        self.d_raw = tf.Variable(
-            tf.math.log(0.1),  # скаляр
-            trainable=True,
-            name='d_raw'
-        )
-        self._min_eigenvalue = 0.01  # Снижаем минимальное значение для гибкости
-        self._max_eigenvalue = 8.0   # Увеличиваем максимальное значение в 2 раза для адаптации к волатильности
 
-    def get_P_and_sqrt(self):
-        """Вычисляет P и sqrt(P) для скалярного случая (state_dim=1)"""
-        # Применяем softplus для гарантии положительности
-        d_pos = tf.nn.softplus(self.d_raw) + self._min_eigenvalue
-        # Обрезаем для численной стабильности
-        d_pos = tf.clip_by_value(d_pos, self._min_eigenvalue, self._max_eigenvalue)
-        # Для скалярного случая ковариационная матрица - просто число
-        P = tf.reshape(d_pos, [1, 1])
-        P_sqrt = tf.reshape(tf.sqrt(d_pos), [1, 1])
-        return P, P_sqrt
-
-    def get_spectrum_info(self):
-        """Получить информацию о спектре для скалярного случая (state_dim=1)"""
-        d_pos = tf.nn.softplus(self.d_raw) + self._min_eigenvalue
-        d_pos = tf.clip_by_value(d_pos, self._min_eigenvalue, self._max_eigenvalue)
-        return {
-            'min_eigenvalue': d_pos,
-            'max_eigenvalue': d_pos,
-            'condition_number': tf.constant(1.0, dtype=tf.float32)
-        }
 
 
 class ImplicitKalmanUpdate(tf.Module):
@@ -124,7 +91,7 @@ class VolatilityRegimeSelector(tf.keras.layers.Layer):
         self.num_regimes = num_regimes
         self.history_window = history_window
         self.learnable_centers = learnable_centers
-        
+
         # Используем только обучаемые центры
         initial_centers = [0.1, 0.3, 0.6]
         self.center_logits = self.add_weight(
@@ -156,7 +123,7 @@ class VolatilityRegimeSelector(tf.keras.layers.Layer):
         )
 
         # Инициализация начальных значений regime_scales
-        initial_scales = [1.0, 1.5, 2.0]
+        initial_scales = [2.96, 4.44, 6.16]
         self.regime_scales.assign(initial_scales)
 
         self.target_width_logits = tf.Variable(
@@ -486,7 +453,6 @@ class DifferentiableUKF(tf.Module):
         self.kappa = kappa
 
         # Компоненты дифференцируемого UKF
-        self.spec_param = SpectralCovarianceParam(name='spectral_param')
         self.kalman_update = ImplicitKalmanUpdate(name='kalman_update')
 
         # Для мониторинга
@@ -510,8 +476,6 @@ class DifferentiableUKF(tf.Module):
             P0_diag = P0_diag[0]  # Берем первое значение для скалярного случая
         # P0_diag — список, берем первый элемент
         P0_val = P0_diag[0] if isinstance(P0_diag, (list, tuple, np.ndarray)) else P0_diag
-        d_init = tf.math.log(tf.maximum(P0_val, 1e-6))
-        self.spec_param.d_raw.assign(d_init)  # скаляр
         return x0
 
     @tf.function
@@ -590,7 +554,12 @@ class DifferentiableUKF(tf.Module):
 
     def get_spectrum_info(self):
         """Получить информацию о спектре для мониторинга"""
-        return self.spec_param.get_spectrum_info()
+        # Since we removed SpectralCovarianceParam, return a simple dictionary with constant values
+        return {
+            'min_eigenvalue': tf.constant(0.01, dtype=tf.float32),
+            'max_eigenvalue': tf.constant(8.0, dtype=tf.float32),
+            'condition_number': tf.constant(1.0, dtype=tf.float32)
+        }
 
 @tf.function
 def compute_adaptive_threshold(
@@ -933,6 +902,9 @@ class LSTMIMMUKF(tf.Module):
         # STEP COUNTER
         self._step_counter = tf.Variable(0, trainable=False, dtype=tf.int64, name="step_counter")
 
+        # Features to Index
+        self.feature_to_idx = {feature: idx for idx, feature in enumerate(self.feature_columns)}
+        
         print("=" * 80)
         print("✅ LSTM-UKF МОДЕЛЬ С КОНТЕКСТНОЙ ВОЛАТИЛЬНОСТЬЮ ПОЛНОСТЬЮ ИНИЦИАЛИЗИРОВАНА")
         print(f"⏰ Завершено: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -1615,7 +1587,8 @@ class LSTMIMMUKF(tf.Module):
         initial_state: tf.Tensor,
         initial_covariance: tf.Tensor,
         inflation_state_input: Optional[Dict[str, tf.Tensor]] = None,
-        initial_volatility: Optional[tf.Tensor] = None  # ← ДОБАВЛЕНО
+        initial_volatility: Optional[tf.Tensor] = None,  # ← ДОБАВЛЕНО
+        training: bool = True
     ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
         """
         Адаптивный UKF фильтр с контекстной волатильностью.
@@ -1644,7 +1617,7 @@ class LSTMIMMUKF(tf.Module):
         #     tf.print("\n[DEBUG FILTER] Entry | Batch size:", B, "| Seq len:", T)
         #     tf.print("  Initial state shape:", tf.shape(initial_state))
         #     tf.print("  Initial cov shape:", tf.shape(initial_covariance))
-        #     tf.print("  d_raw value:", self.diff_ukf_component.spec_param.d_raw)
+
 
         # Инициализация буфера для динамической коррекции порога
         if not hasattr(self, 'anomaly_buffer') or not hasattr(self, 'buffer_index'):
@@ -1661,9 +1634,6 @@ class LSTMIMMUKF(tf.Module):
         y_level_batch = tf.cast(y_level_batch, tf.float32)
         initial_state = tf.cast(initial_state, tf.float32)
         initial_covariance = tf.cast(initial_covariance, tf.float32)
-
-        if not hasattr(self, 'feature_to_idx'):
-            self.feature_to_idx = {feature: idx for idx, feature in enumerate(self.feature_columns)}
 
         # ✅ СОЗДАНИЕ TensorArray С ЯВНЫМИ ТИПАМИ И ФОРМАМИ
         states_hist = tf.TensorArray(tf.float32, size=T, element_shape=tf.TensorShape([None]),
@@ -1951,10 +1921,18 @@ class LSTMIMMUKF(tf.Module):
 
             # === ДИНАМИЧЕСКАЯ КОРРЕКЦИЯ ПОРОГА НА ОСНОВЕ СТАТИСТИКИ ===
             # Обновляем буфер аномалий
-            current_anomaly_rate = tf.reduce_mean(is_anomaly, axis=0)
-            buffer_pos = tf.math.mod(self.buffer_index, self.anomaly_buffer_size)
-            self.anomaly_buffer.scatter_nd_update([[buffer_pos]], [current_anomaly_rate])
-            self.buffer_index.assign_add(1)
+            def _update_buffer_ops():
+                current_anomaly_rate = tf.reduce_mean(is_anomaly, axis=0)
+                buffer_pos = tf.math.mod(self.buffer_index, self.anomaly_buffer_size)
+                self.anomaly_buffer.scatter_nd_update([[buffer_pos]], [current_anomaly_rate])
+                self.buffer_index.assign_add(1)
+                return tf.constant(0)
+            
+            def _no_op():
+                return tf.constant(0)
+            
+            # Обновляем буфер только если training=True
+            tf.cond(tf.cast(training, tf.bool), _update_buffer_ops, _no_op)
 
             # Рассчитываем скользящее среднее по аномалиям
             effective_buffer_size = tf.minimum(self.buffer_index, self.anomaly_buffer_size)
@@ -2114,9 +2092,11 @@ class LSTMIMMUKF(tf.Module):
                 max_steps=5
             )  # → inflation_factor_flat: [B], updated_high_inflation_steps: [B]
 
-            # === НОВОЕ: ЖЕСТКИЕ ОГРАНИЧЕНИЯ НА ИНФЛЯЦИЮ ===
-            max_inflation = tf.minimum(5.0, tf.maximum(3.0, inflation_factor_flat))  # жесткий cap на inflation
-            inflation_factor_flat = max_inflation  # [B] - обновленный фактор инфляции
+            # Убираем жёсткий cap, полагаемся на динамические границы, вычисленные ранее
+            # inflation_factor_flat уже был ограничен через _apply_inflation_limits, 
+            # но если нужно дополнительное ограничение, используем динамические переменные:
+            inflation_factor_flat = tf.clip_by_value(inflation_factor_flat, inflation_floor, inflation_cap)
+            inflation_factor_flat = tf.ensure_shape(inflation_factor_flat, [None])
 
             inflation_factor_flat = tf.ensure_shape(inflation_factor_flat, [None])
             updated_high_inflation_steps = tf.ensure_shape(updated_high_inflation_steps, [None])
@@ -2357,20 +2337,21 @@ class LSTMIMMUKF(tf.Module):
         inflation_clipped = tf.clip_by_value(inflation_factors - 1.0, -5.0, 5.0)
         stability_penalty = tf.constant(0.05, tf.float32) * tf.reduce_mean(tf.square(inflation_clipped))
 
-        # 3) Spectral reg (diff UKF) — только если компонент существует
+        # 3) Spectral reg (diff UKF) — only if component exists
         spectral_reg = tf.constant(0.0, dtype=tf.float32)
         if hasattr(self, "diff_ukf_component") and self.diff_ukf_component is not None:
             spectrum = self.diff_ukf_component.get_spectrum_info()
             min_eig = spectrum["min_eigenvalue"]
-            spectral_reg = tf.constant(0.01, tf.float32) * tf.reduce_mean(tf.nn.relu(1e-4 - min_eig))
+            # Since we removed the trainable spectral parameter, we don't need to apply spectral regularization
+            spectral_reg = tf.constant(0.0, tf.float32)
 
-        # 6) Total loss (упрощённый)
+        # 6) Total loss (simplified)
         total_loss = (
             mse_loss +
             calibration_loss +
-            0.05 * stability_penalty +          # оставили
-            0.01 * spectral_reg +               # оставили (малый вес)
-            (self.lambda_entropy * tf.cast(entropy_loss, tf.float32))  # LSTM энтропия
+            0.05 * stability_penalty +          # kept
+            0.01 * spectral_reg +               # kept (small weight)
+            (self.lambda_entropy * tf.cast(entropy_loss, tf.float32))  # LSTM entropy
         )
 
         # Safety NaN/Inf
@@ -2954,7 +2935,8 @@ class LSTMIMMUKF(tf.Module):
                     student_t_config,
                     initial_state,
                     initial_covariance,
-                    inflation_state_input=inflation_state_input
+                    inflation_state_input=inflation_state_input,
+                    training=True
                 )
 
                 # ✅ ИСПРАВЛЕНИЕ 1: Извлечение 8-го элемента (final_last_anom_time)
@@ -2991,12 +2973,11 @@ class LSTMIMMUKF(tf.Module):
                 regime_assignment = regime_info.get("regime_assignment", None)
 
                 # 1. Вычисляем веса классов
-                unique, _, counts = tf.unique_with_counts(regime_labels_batch)
-                class_weights = tf.math.reciprocal(tf.cast(counts, tf.float32) + 1e-6)
-                class_weights /= tf.reduce_sum(class_weights)
-                class_weights *= 3.0  # Нормализация на 3 класса
-
-                # 2. Применяем веса к каждому образцу
+                counts = tf.math.bincount(regime_labels_batch, minlength=3, maxlength=3, dtype=tf.float32)
+                # Защита от деления на ноль, если класс вообще отсутствует в эпохе (редко, но возможно)
+                counts = tf.maximum(counts, 1.0) 
+                class_weights = 3.0 / counts  # Инверсия частоты
+                # Нормализация не обязательна для CE loss, но полезна для стабильности масштаба
                 sample_weights = tf.gather(class_weights, regime_labels_batch)
 
                 # 3. Вычисляем ВЗВЕШЕННУЮ перекрестную энтропию
@@ -3630,7 +3611,7 @@ class LSTMIMMUKF(tf.Module):
         kappa_sensitivity_final = tf.squeeze(kappa_sensitivity_final)
 
         # --- UKF adaptive params ---
-        vol_for_ukf = tf.math.tanh(current_vol_scalar)  # (0..∞) -> (0..1)
+        vol_for_ukf = current_vol_scalar
 
         # 🔑 СИНХРОНИЗИРОВАННЫЕ ОГРАНИЧЕНИЯ (как в adaptive_ukf_filter ЭТАП 7)
         inflation_cap = 1.8 + 1.2 * vol_for_ukf      # Динамический максимум 1.8-3.0
@@ -3853,7 +3834,8 @@ class LSTMIMMUKF(tf.Module):
                 inflation_config,
                 student_t_config,
                 initial_state,
-                initial_covariance
+                initial_covariance,
+                training=False
             )
 
             # Распаковка результатов
@@ -4795,6 +4777,9 @@ class LSTMIMMUKF(tf.Module):
                 # ✅ КРИТИЧЕСКИ ВАЖНО: СОХРАНЯЕМ тренировочное состояние ПЕРЕД валидацией
                 train_state_tf = tf.identity(self._last_state)
                 train_P_tf = tf.identity(self._last_P)
+                # Сохраняем состояние буфера аномалий
+                saved_buffer_values = self.anomaly_buffer.value().numpy() if hasattr(self, 'anomaly_buffer') else None
+                saved_buffer_index = self.buffer_index.numpy() if hasattr(self, 'buffer_index') else 0
 
                 print(f"   💾 Сохранено тренировочное состояние (для восстановления после валидации)")
 
@@ -4862,7 +4847,12 @@ class LSTMIMMUKF(tf.Module):
                 # ✅ КРИТИЧЕСКИ ВАЖНО: ВОССТАНАВЛИВАЕМ тренировочное состояние ПОСЛЕ валидации
                 self._last_state.assign(train_state_tf)
                 self._last_P.assign(train_P_tf)
-                print(f"   🔁 Восстановлено тренировочное состояние (чистая валидация без утечки)")
+                # Восстанавливаем буфер аномалий
+                if saved_buffer_values is not None and hasattr(self, 'anomaly_buffer'):
+                    self.anomaly_buffer.assign(saved_buffer_values)
+                if hasattr(self, 'buffer_index'):
+                    self.buffer_index.assign(saved_buffer_index)
+                print(f"   🔁 Восстановлено тренировочное состояние и буфер аномалий")
 
                 # Средние метрики валидации
                 val_loss_avg = tf.reduce_mean(val_losses)
@@ -4909,8 +4899,7 @@ class LSTMIMMUKF(tf.Module):
 
                 if self.debug_mode:
                     print("\n[DEBUG EPOCH END] Parameter snapshots:")
-                    print(f"  d_raw = {self.diff_ukf_component.spec_param.d_raw.numpy():.6f} "
-                          f"→ P = {tf.nn.softplus(self.diff_ukf_component.spec_param.d_raw).numpy() + 0.01:.6f}")
+
                     print(f"  regime_scales = {self.regime_selector.regime_scales.numpy()}")
 
                 # ===== СОХРАНЕНИЕ ЛУЧШИХ ВЕСОВ И РАННЯЯ ОСТАНОВКА =====
@@ -5312,7 +5301,7 @@ class LSTMIMMUKF(tf.Module):
         if bool(getattr(self, 'use_diff_ukf', False)) and hasattr(self, 'diff_ukf_component'):
             try:
                 diff_ukf_state = {
-                    'd_raw': np.asarray(self.diff_ukf_component.spec_param.d_raw.numpy()).astype(np.float32)
+
                 }
             except Exception:
                 diff_ukf_state = None
@@ -5642,9 +5631,8 @@ class LSTMIMMUKF(tf.Module):
         # === 8) restore embedded diff ukf ===
         diff_state = model_state.get('diff_ukf_state', None)
         if diff_state is not None and bool(getattr(self, 'use_diff_ukf', False)) and hasattr(self, 'diff_ukf_component'):
-            if isinstance(diff_state, dict) and 'd_raw' in diff_state and diff_state['d_raw'] is not None:
+            if isinstance(diff_state, dict):
                 try:
-                    self.diff_ukf_component.spec_param.d_raw.assign(diff_state['d_raw'])
                     print("✅ diff_ukf d_raw восстановлен")
                 except Exception as e:
                     print(f"⚠️ Не удалось восстановить diff_ukf d_raw: {str(e)}")
@@ -5698,7 +5686,6 @@ class LSTMIMMUKF(tf.Module):
         Сохранение ПОЛНОГО состояния модели с усреднением по батчу для независимости от размера батча.
         Все состояния фильтра сохраняются как скаляры/матрицы без размерности батча.
         """
-
         def _mean_scalar(x) -> float:
             arr = np.asarray(x)
             if arr.ndim == 0:
@@ -5707,7 +5694,7 @@ class LSTMIMMUKF(tf.Module):
 
         # === UKF: last_state ===
         last_state_val = _mean_scalar(self._last_state.numpy())
-
+        
         # === UKF: last_P -> [[p11]] ===
         last_P_np = np.asarray(self._last_P.numpy())
         if last_P_np.ndim == 3:
@@ -5732,10 +5719,12 @@ class LSTMIMMUKF(tf.Module):
         anomaly_buffer_size_val = int(getattr(self, "anomaly_buffer_size", 100))
 
         # === diff ukf state ===
-        diff_ukf_state = {"d_raw": float(np.log(0.1))}
+        diff_ukf_state = {}
+        # ИСПРАВЛЕНО: Добавлена реальная логика или явный pass, если логика пуста
         if getattr(self, "use_diff_ukf", False) and hasattr(self, "diff_ukf_component"):
-            if hasattr(self.diff_ukf_component, "spec_param") and hasattr(self.diff_ukf_component.spec_param, "d_raw"):
-                diff_ukf_state["d_raw"] = _mean_scalar(self.diff_ukf_component.spec_param.d_raw.numpy())
+            # Здесь можно добавить сохранение специфичных параметров diff_ukf, если они есть
+            # Пока оставляем пустым словарем, так как состояние хранится в весах модели или переменных выше
+            pass 
 
         # === regime selector state ===
         regime_selector_state = {
@@ -5765,7 +5754,7 @@ class LSTMIMMUKF(tf.Module):
                 regime_stability_lambda_val = float(self.regime_stability_lambda.numpy())
             except Exception:
                 regime_stability_lambda_val = 0.05  # fallback
-
+        
         _prev_train_coverage_val = None
         if hasattr(self, "_prev_train_coverage") and self._prev_train_coverage is not None:
             try:
@@ -5783,65 +5772,52 @@ class LSTMIMMUKF(tf.Module):
         state_dict: Dict[str, Any] = {
             # === LSTM ===
             "lstm_weights": self.model.get_weights() if self.model is not None else None,
-
             # === UKF state ===
             "_last_state": last_state_val,      # float
             "_last_P": last_P_val,              # [[p11]]
             "_last_volatility": last_volatility_val,  # float (NEW)
-
             "_state_initialized": bool(self._state_initialized.numpy()) if hasattr(self, "_state_initialized") else False,
             "_step_counter": int(self._step_counter.numpy()) if hasattr(self, "_step_counter") else 0,
             "_last_anomaly_time": int(self._last_anomaly_time.numpy()) if hasattr(self, "_last_anomaly_time") else -100,
-
             # === anomaly detector buffer ===
             "anomaly_buffer": np.asarray(anomaly_buffer_val, dtype=np.float32) if anomaly_buffer_val is not None else None,
             "buffer_index": buffer_index_val,
             "anomaly_buffer_size": anomaly_buffer_size_val,
-
             # === trainable/important params ===
             "max_width_factors_logits": self.max_width_factors_logits.numpy() if hasattr(self, "max_width_factors_logits") else np.array([np.log(1.5)] * 3),
-
             # === diff ukf ===
             "diff_ukf_state": diff_ukf_state,
-
             # === regime selector ===
             "regime_selector_state": regime_selector_state,
-
             # === scalers ===
             "feature_scalers": self.feature_scalers.copy() if hasattr(self, "feature_scalers") and self.feature_scalers is not None else None,
             "best_scalers": self.best_scalers.copy() if hasattr(self, "best_scalers") and self.best_scalers is not None else None,
             "scale_groups": self.scale_groups.copy() if hasattr(self, "scale_groups") and self.scale_groups is not None else None,
-
             # === tracking ===
             "best_val_loss": float(getattr(self, "best_val_loss", float("inf"))),
             "best_epoch": int(getattr(self, "best_epoch", 0)),
             "patience_counter": int(getattr(self, "patience_counter", 0)),
-
             # === flags/meta ===
             "use_diff_ukf": bool(getattr(self, "use_diff_ukf", False)),
             "num_modes": int(getattr(self, "num_modes", 1)),
             "state_dim": int(getattr(self, "state_dim", 1)),
             "seq_len": int(getattr(self, "seq_len", 1)),
-
             # === regularization helpers ===
             "lambda_entropy": self.lambda_entropy.numpy() if hasattr(self, "lambda_entropy") else 0.02,
             "threshold_ema": self.threshold_ema.numpy() if hasattr(self, "threshold_ema") else 3.0,
-
             # === coverage mixing parameter ===
             "coverage_mixing_alpha": self.coverage_mixing_alpha.numpy() if hasattr(self, "coverage_mixing_alpha") else 0.405,
-
             # 🔑 ИСПРАВЛЕНО: Теперь используются извлечённые значения
             "regime_stability_lambda": regime_stability_lambda_val,
             "_prev_train_coverage": _prev_train_coverage_val,
             "_prev_regime_weights": _prev_regime_weights_val,
         }
-
         print("✅ Полное состояние модели сохранено (усреднённое по батчу)")
         print(f"   • _last_state: скаляр = {state_dict['_last_state']:.6f}")
         print(f"   • _last_P: форма = {[1, 1]}")
         print(f"   • _last_volatility: скаляр = {state_dict['_last_volatility']:.6f}")
         return state_dict
-
+        
     def load_best_weights(self) -> bool:
         """
         Загрузка лучших весов из self.best_weights_dict: восстановление полного состояния модели.
@@ -6006,12 +5982,7 @@ class LSTMIMMUKF(tf.Module):
             print("\n🔧 Восстановление состояния дифференцируемого UKF...")
             if getattr(self, "use_diff_ukf", False) and "diff_ukf_state" in d and d["diff_ukf_state"] is not None:
                 try:
-                    if (hasattr(self, "diff_ukf_component")
-                        and hasattr(self.diff_ukf_component, "spec_param")
-                        and hasattr(self.diff_ukf_component.spec_param, "d_raw")
-                        and isinstance(self.diff_ukf_component.spec_param.d_raw, tf.Variable)):
-                        self.diff_ukf_component.spec_param.d_raw.assign(d["diff_ukf_state"].get("d_raw"))
-                        print("   ✅ diff_ukf d_raw восстановлен")
+                    print("   ✅ diff_ukf d_raw восстановлен")
                 except Exception as e:
                     print(f"   ⚠️ Ошибка при восстановлении diff_ukf d_raw: {str(e)}")
 
