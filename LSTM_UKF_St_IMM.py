@@ -3593,7 +3593,10 @@ class LSTMIMMUKF(tf.Module):
                 
                 # ✅ ИСПРАВЛЕНИЕ 1: Обновление _last_anomaly_time после фильтрации
                 self._last_anomaly_time.assign(
-                    tf.cast(tf.reduce_mean(tf.cast(final_last_anom_time, tf.float32)), tf.int32)
+                    tf.cast(
+                        tf.reduce_mean(tf.cast(final_last_anom_time, tf.float32)),
+                        tf.int64  # ← БЫЛО tf.int32, СТАЛО tf.int64
+                    )
                 )
                 
                 # step counter increment
@@ -6430,7 +6433,7 @@ class LSTMIMMUKF(tf.Module):
         if not hasattr(self, "_step_counter"):
             self._step_counter = tf.Variable(0, trainable=False, dtype=tf.int64, name="step_counter")
         if not hasattr(self, "_last_anomaly_time"):
-            self._last_anomaly_time = tf.Variable(-100, trainable=False, dtype=tf.int32, name="last_anomaly_time")
+            self._last_anomaly_time = tf.Variable(-100, trainable=False, dtype=tf.int64, name="last_anomaly_time")
         if not hasattr(self, "_last_volatility"):
             self._last_volatility = tf.Variable([0.1], trainable=False, dtype=tf.float32, name="last_volatility")
 
