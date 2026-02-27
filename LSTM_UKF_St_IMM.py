@@ -943,6 +943,20 @@ class LSTMIMMUKF(tf.Module):
             name='coverage_mixing_alpha'
         )
 
+        # === ДОБАВЛЕНО: инициализация anomaly_buffer и buffer_index для динамического контроля аномалий ===
+        self.anomaly_buffer_size = 100  # Размер буфера для хранения статистики аномалий
+        self.anomaly_buffer = tf.Variable(
+            tf.zeros([self.anomaly_buffer_size], dtype=tf.float32),
+            trainable=False,
+            name='anomaly_buffer'
+        )
+        self.buffer_index = tf.Variable(
+            0,
+            trainable=False,
+            dtype=tf.int32,
+            name='buffer_index'
+        )
+
         # Инициализация оптимизатора
         # Опитимизатор инициализируется в методе fit()
 
@@ -1733,15 +1747,7 @@ class LSTMIMMUKF(tf.Module):
         #     tf.print("  Initial cov shape:", tf.shape(initial_covariance))
         #     tf.print("  d_raw value:", self.diff_ukf_component.spec_param.d_raw)
 
-        # Инициализация буфера для динамической коррекции порога
-        if not hasattr(self, 'anomaly_buffer') or not hasattr(self, 'buffer_index'):
-            self.anomaly_buffer_size = 100
-            self.anomaly_buffer = tf.Variable(
-                tf.zeros([self.anomaly_buffer_size], dtype=tf.float32),
-                trainable=False,
-                name='anomaly_buffer'
-            )
-            self.buffer_index = tf.Variable(0, dtype=tf.int32, trainable=False, name='buffer_index')
+        # Буфер для динамической коррекции порога уже инициализирован в __init__
 
         # ЯВНОЕ УПРАВЛЕНИЕ РАЗМЕРНОСТЯМИ
         Xbatch = tf.cast(Xbatch, tf.float32)
@@ -2479,7 +2485,7 @@ class LSTMIMMUKF(tf.Module):
             entropy_deviation = tf.nn.relu(target_entropy_normalized - normalized_entropy)
 
             # ✅ ОСТАВЛЯЕМ: энтропийный штраф (только здесь)
-            entropy_penalty = tf.constant(35.0, tf.float32) * tf.square(entropy_deviation)
+            entropy_penalty = tf.constant(5.0, tf.float32) * tf.square(entropy_deviation)
 
             # ❌ УДАЛЕНО: 5.2) Штраф за доминирование одного режима (>80%)
             # dominance_penalty и empty_penalty уже вычисляются в train_step как часть regime_loss
@@ -2503,7 +2509,7 @@ class LSTMIMMUKF(tf.Module):
             0.01 * spectral_reg +               # оставили (малый вес)
             selector_reg +                      # режимы
             entropy_penalty +                   # главный регуляризатор (15.0)
-            (self.lambda_entropy * tf.cast(entropy_loss, tf.float32))  # LSTM энтропия
+            (self.lambda_entropy * entropy_loss)  # LSTM энтропия
         )
 
         # Safety NaN/Inf
@@ -2737,16 +2743,21 @@ class LSTMIMMUKF(tf.Module):
                                                         regime_soft_weights=soft_weights)  # [B]
             # Преобразуем к режимно-специфичным значениям - используем значения из get_target_coverage
             # Вычисляем целевые значения для каждого режима на основе усреднения по маске режима
+
+            # Создаём вспомогательную функцию для вычисления целевого покрытия для каждого режима
+            def _compute_regime_targets(soft_weights, target_cov_per_sample):
+                """Вычисляет целевое покрытие для каждого режима (усреднённое по мягким весам)."""
+                regime_targets = []
+                for k in range(3):
+                    mask = soft_weights[:, k]
+                    regime_targets.append(
+                        tf.reduce_sum(target_cov_per_sample * mask) / (tf.reduce_sum(mask) + 1e-8)
+                    )
+                return tf.stack(regime_targets)
+
             target_cov_per_sample = self.get_target_coverage(volatility_level=volatility_levels[:, -1, :],
-                                                            regime_soft_weights=soft_weights)  # [B]
-            target_cov_values = []
-            for k in range(3):
-                regime_mask = soft_weights[:, k]  # [B]
-                regime_target = tf.reduce_sum(target_cov_per_sample * regime_mask) / (
-                    tf.reduce_sum(regime_mask) + 1e-8
-                )
-                target_cov_values.append(regime_target)
-            target_cov_values = tf.stack(target_cov_values)  # [3]
+                                                            regime_soft_weights=soft_weights)
+            target_cov_values = _compute_regime_targets(soft_weights, target_cov_per_sample)
 
             for k in range(3):
                 regime_mask = soft_weights[:, k]  # [B]
@@ -2991,8 +3002,7 @@ class LSTMIMMUKF(tf.Module):
         B = tf.shape(X_batch)[0]
 
         # Safety: счетчик может отсутствовать если не создали в __init__
-        if not hasattr(self, "_step_counter"):
-            self._step_counter = tf.Variable(0, trainable=False, dtype=tf.int64, name="step_counter")
+        # NOTE: теперь _step_counter гарантированно инициализирован в __init__
 
         with tf.device(self.device):
             with tf.GradientTape(persistent=False) as tape:
@@ -3312,7 +3322,7 @@ class LSTMIMMUKF(tf.Module):
 
                 # Добавляем width_penalty_from_ci к width_loss для обучения max_width_factors_logits
                 # Используем width_regularization вместо width_penalty_from_ci, так как она определена в этом контексте
-                width_loss = ci_regularization_loss + high_regime_penalty_loss + 0.1 * width_regularization
+                width_loss = 0.6 * width_regularization + high_regime_penalty_loss
 
                 # ✅ УБРАНО: loss = loss + width_loss (loss еще не определен!)
                 # width_loss будет добавлен позже, после инициализации loss
@@ -3518,30 +3528,96 @@ class LSTMIMMUKF(tf.Module):
                         "| ERROR:", str(e)
                     )
 
-            # ✅ Gradient scaling для regime_scales (усилить градиенты на 50%)
-            scaled_grads = []
-            for i, grad in enumerate(gradients):
-                if grad is not None:
-                    var_name = trainable_vars[i].name
-                    # 🔑 Усиленные градиенты для калибровочных параметров
-                    if 'regime_scales' in var_name:
-                        scaled_grads.append(grad * 3.0)  # ✅ ↑1.5→3.0
-                    elif 'temperature' in var_name:
-                        # ✅ ИСПРАВЛЕНО: фиксированное масштабирование (без Python-if)
-                        # Адаптивное масштабирование удалено — не работает внутри @tf.function
-                        scaled_grads.append(grad * 1.5)  # ← ✅ Базовое масштабирование
-                    elif 'forecast_bias_correction' in var_name:
-                        # Convert IndexedSlices to dense if needed before multiplication
-                        if isinstance(grad, tf.IndexedSlices):
-                            grad = tf.convert_to_tensor(grad)
-                        scaled_grads.append(grad * 3.0)  # ✅ Новый: bias correction быстрее
-                    else:
-                        scaled_grads.append(grad)
-                else:
-                    scaled_grads.append(grad)
+            # ===== НОВЫЙ КОД: Разделение переменных по группам и применение разных оптимизаторов =====
+            # Разделяем переменные и соответствующие градиенты на группы
+            main_vars = []
+            regime_scales_vars = []
+            temperature_vars = []
+            bias_correction_vars = []
 
-            clipped_grads, global_norm = tf.clip_by_global_norm(scaled_grads, 1.0)
-            self._optimizer.apply_gradients(zip(clipped_grads, trainable_vars))
+            grad_dict = {var: grad for var, grad in zip(trainable_vars, gradients) if grad is not None}
+
+            for var in trainable_vars:
+                if 'regime_scales' in var.name:
+                    regime_scales_vars.append(var)
+                elif 'temperature' in var.name:
+                    temperature_vars.append(var)
+                elif 'forecast_bias_correction' in var.name:
+                    bias_correction_vars.append(var)
+                else:
+                    main_vars.append(var)
+
+            # Основной оптимизатор для основных параметров
+            if main_vars:
+                main_grads = [grad_dict[var] for var in main_vars if var in grad_dict]
+                clipped_main_grads, main_global_norm = tf.clip_by_global_norm(main_grads, 1.0)
+                self._optimizer.apply_gradients(zip(clipped_main_grads, main_vars))
+
+            # Для regime_scales используем отдельный оптимизатор с learning rate * 3
+            if regime_scales_vars:
+                regime_optimizer = tf.keras.optimizers.Adam(
+                    learning_rate=self._optimizer.learning_rate * 3.0,
+                    beta_1=self._optimizer.beta_1,
+                    beta_2=self._optimizer.beta_2,
+                    epsilon=self._optimizer.epsilon
+                )
+                regime_grads = [grad_dict[var] for var in regime_scales_vars if var in grad_dict]
+                clipped_regime_grads, regime_global_norm = tf.clip_by_global_norm(regime_grads, 1.0)
+                regime_optimizer.apply_gradients(zip(clipped_regime_grads, regime_scales_vars))
+
+            # Для temperature learning rate * 1.5
+            if temperature_vars:
+                temp_optimizer = tf.keras.optimizers.Adam(
+                    learning_rate=self._optimizer.learning_rate * 1.5,
+                    beta_1=self._optimizer.beta_1,
+                    beta_2=self._optimizer.beta_2,
+                    epsilon=self._optimizer.epsilon
+                )
+                temp_grads = [grad_dict[var] for var in temperature_vars if var in grad_dict]
+                clipped_temp_grads, temp_global_norm = tf.clip_by_global_norm(temp_grads, 1.0)
+                temp_optimizer.apply_gradients(zip(clipped_temp_grads, temperature_vars))
+
+            # Для bias_correction learning rate * 3
+            if bias_correction_vars:
+                bias_optimizer = tf.keras.optimizers.Adam(
+                    learning_rate=self._optimizer.learning_rate * 3.0,
+                    beta_1=self._optimizer.beta_1,
+                    beta_2=self._optimizer.beta_2,
+                    epsilon=self._optimizer.epsilon
+                )
+                bias_grads = [grad_dict[var] for var in bias_correction_vars if var in grad_dict]
+                clipped_bias_grads, bias_global_norm = tf.clip_by_global_norm(bias_grads, 1.0)
+                bias_optimizer.apply_gradients(zip(clipped_bias_grads, bias_correction_vars))
+
+            # Вычисляем общий глобальный норм для мониторинга (если нужно отслеживать общий градиент)
+            all_clipped_grads = []
+            for var in trainable_vars:
+                if var in grad_dict and grad_dict[var] is not None:
+                    # Находим соответствующий clipped градиент
+                    if var in main_vars:
+                        idx = main_vars.index(var)
+                        all_clipped_grads.append(clipped_main_grads[idx])
+                    elif var in regime_scales_vars:
+                        idx = regime_scales_vars.index(var)
+                        all_clipped_grads.append(clipped_regime_grads[idx])
+                    elif var in temperature_vars:
+                        idx = temperature_vars.index(var)
+                        all_clipped_grads.append(clipped_temp_grads[idx])
+                    elif var in bias_correction_vars:
+                        idx = bias_correction_vars.index(var)
+                        all_clipped_grads.append(clipped_bias_grads[idx])
+                    else:
+                        all_clipped_grads.append(grad_dict[var])  # fallback
+                else:
+                    all_clipped_grads.append(None)
+
+            # Вычисляем глобальную норму для мониторинга
+            finite_grads = [g for g in all_clipped_grads if g is not None and tf.reduce_any(tf.math.is_finite(g))]
+            if finite_grads:
+                global_norm = tf.linalg.global_norm(finite_grads)
+            else:
+                global_norm = tf.constant(0.0)
+            # ===== КОНЕЦ НОВОГО КОДА =====
 
             # Гарантировать диапазон температуры
             self.regime_selector.temperature.assign(
@@ -4569,7 +4645,8 @@ class LSTMIMMUKF(tf.Module):
         return scaled_df
 
     def fit(self, train_features, val_features, epochs=50, min_epochs=5,
-            patience=15, save_best_weights=True, early_stopping=True, log_dir=None):
+            patience=15, save_best_weights=True, early_stopping=True, log_dir=None,
+            batch_size=64):
         """Оптимизированный метод обучения для адаптивной UKF с контекстной волатильностью"""
         print("=" * 80)
         print("🚀 ОБУЧЕНИЕ LSTM-АДАПТИВНОЙ UKF МОДЕЛИ С КОНТЕКСТНОЙ ВОЛАТИЛЬНОСТЬЮ")
@@ -4591,14 +4668,14 @@ class LSTMIMMUKF(tf.Module):
 
             if preparator is not None:
                 # Создаём оптимизированные tf.data.Dataset напрямую
-                train_ds, val_ds = preparator.create_tf_datasets(train_data, val_data, batch_size=64)
-        else:
-            raise RuntimeError(
-                "❌ Устаревшая логика подготовки данных (_prepare_datasets) УДАЛЕНА из-за утечки будущего!\n"
-                "Используйте:\n"
-                " train_data, val_data, test_data = model.prepare_or_load_honest_datasets(full_df, './cache/my_data')\n"
-                "   model.fit_from_prepared(train_data, val_data, test_data, epochs=50)\n"
-            )
+                train_ds, val_ds = preparator.create_tf_datasets(train_data, val_data, batch_size=batch_size)
+            else:
+                raise RuntimeError(
+                    "❌ Устаревшая логика подготовки данных (_prepare_datasets) УДАЛЕНА из-за утечки будущего!\n"
+                    "Используйте:\n"
+                    " train_data, val_data, test_data = model.prepare_or_load_honest_datasets(full_df, './cache/my_data')\n"
+                    "   model.fit_from_prepared(train_data, val_data, test_data, epochs=50)\n"
+                )
 
         log_interval = max(1, len(train_ds) // 10)
         print("✅ Оптимизированные датасеты успешно подготовлены")
@@ -4676,59 +4753,8 @@ class LSTMIMMUKF(tf.Module):
                     batch_size = tf.shape(X_batch)[0]
                     current_state_size = tf.shape(self._last_state)[0]
 
-                    # === ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ UKF С АДАПТИВНОЙ ДИСПЕРСИЕЙ ===
-                    if batch_idx == 0 and epoch == 0:
-                        # Адаптивная инициализация с учетом волатильности данных
-                        window_std = tf.math.reduce_std(y_for_filtering_batch[:, :20], axis=1)
-                        initial_variance = tf.maximum(window_std ** 2, 0.01)  # Минимум 0.01
-                        initial_variance = tf.minimum(initial_variance, 0.1)   # Максимум 0.1
-
-                        # ✅ ИНИЦИАЛИЗАЦИЯ КАК СКАЛЯРА [1]
-                        initial_state_val = tf.reduce_mean(y_for_filtering_batch[:, 0])  # Скаляр
-
-                        # Создаём переменные с формой [1] и [1, 1, 1]
-                        self._last_state = tf.Variable(
-                            tf.reshape(initial_state_val, [1]),  # ← Явно [1]
-                            trainable=False,
-                            name='last_state'
-                        )
-
-                        # Для ковариации: усредняем дисперсию → [1, 1, 1]
-                        initial_cov_value = tf.reshape(
-                            tf.reduce_mean(initial_variance),
-                            [1, self.state_dim, self.state_dim]  # ← Явно [1, 1, 1]
-                        )
-                        self._last_P = tf.Variable(
-                            initial_cov_value,
-                            trainable=False,
-                            name='last_P'
-                        )
-
-                        # Флаг инициализации состояния
-                        self._state_initialized = tf.Variable(False, trainable=False, name='state_initialized', dtype=tf.bool)
-
-                        # Счетчик шагов (используется в train_step)
-                        self._step_counter = tf.Variable(0, trainable=False, name='step_counter', dtype=tf.int64)
-
-                        # Время последней аномалии (если adaptive inflation использует это состояние)
-                        self._last_anomaly_time = tf.Variable(-100, trainable=False, name='last_anomaly_time', dtype=tf.int64)
-
-                        self._state_initialized.assign(False)
-                        print(f"✅ Переменные состояния инициализированы: state={self._last_state.shape}, P={self._last_P.shape}")
-                        print(f"   Начальная дисперсия: {tf.reduce_mean(initial_variance):.6f}")
-
-                    # ВСЕГДА используем сохранённое состояние (оно всегда [1]), расширяем до размера батча
-                    should_use_saved_state = tf.logical_and(self._state_initialized, self._step_counter > 0)
-
-                    def use_saved_state():
-                        # ✅ РАСШИРЕНИЕ СКАЛЯРА [1] → [B, 1] ЧЕРЕЗ TILE
-                        return (
-                            tf.tile(tf.reshape(self._last_state, [1, self.state_dim]), [batch_size, 1]),
-                            tf.tile(tf.reshape(self._last_P, [1, self.state_dim, self.state_dim]), [batch_size, 1, 1])
-                        )
-
+                    # Всегда инициализируем состояние из данных текущего батча
                     def initialize_from_data():
-                        # Инициализация только если состояние ещё не инициализировано
                         base_value = y_for_filtering_batch[:, 0]
                         initial_state = tf.reshape(base_value, [batch_size, self.state_dim])
                         window_std = tf.math.reduce_std(y_for_filtering_batch[:, :10], axis=1)
@@ -4736,12 +4762,7 @@ class LSTMIMMUKF(tf.Module):
                         initial_covariance = tf.reshape(initial_variance, [batch_size, self.state_dim, self.state_dim])
                         return (initial_state, initial_covariance)
 
-                    # Используем tf.cond для графового режима
-                    initial_state, initial_covariance = tf.cond(
-                        should_use_saved_state,
-                        use_saved_state,
-                        initialize_from_data
-                    )
+                    initial_state, initial_covariance = initialize_from_data()
 
                     # Шаг обучения
                     results = self.train_step(
@@ -4779,21 +4800,10 @@ class LSTMIMMUKF(tf.Module):
                         'entropy_max': entropy_stats['entropy_max'].numpy(),
                     }
 
-                    # ===== СОХРАНЕНИЕ СОСТОЯНИЯ ДЛЯ СЛЕДУЮЩЕГО ШАГА =====
-                    # ✅ УСРЕДНЕНИЕ ПО БАТЧУ ДО СКАЛЯРА [1]
-                    self._last_state.assign(
-                        tf.reduce_mean(tf.squeeze(final_state, axis=1), keepdims=True)  # [B] → [1]
-                    )
-                    self._last_P.assign(
-                        tf.reduce_mean(final_covariance, axis=0, keepdims=True)  # [B, 1, 1] → [1, 1, 1]
-                    )
-                    # ✅ ИСПРАВЛЕНО: Обновление _last_volatility с использованием vol_final, а не final_state
-                    self._last_volatility.assign(tf.reduce_mean(vol_final, keepdims=True))  # [B] → [1]
-                    self._state_initialized.assign(True)
+
 
                     # ДОПОЛНИТЕЛЬНО: принудительно применяем статистику истории для адаптации центров
-                    if self._step_counter % 10 == 0:  # каждые 10 шагов
-                        self.regime_selector.get_centers()  # вызов для обновления адаптивных центров
+                    # self.regime_selector.get_centers()  # вызов для обновления адаптивных центров (удалено - неиспользуемый вызов)
 
                     # Агрегация метрик
                     epoch_losses.append(loss)
