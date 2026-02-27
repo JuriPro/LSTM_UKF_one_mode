@@ -13,13 +13,24 @@ venv/
 pip-log.txt
 pip-delete-this-directory.txt
 
-# Generated folders
-build/
-dist/
-*.egg-info/
-
-# Logs
+# Generated/Misc
+.DS_Store
+Thumbs.db
 *.log
+*.tmp
+*.swp
+*.swo
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# Virtual Environment
+.env
+.env.local
+.env.*
+!.env.example
 
 # IDE
 .vscode/
@@ -27,22 +38,19 @@ dist/
 *.swp
 *.swo
 
-# Environment
-.env
-.env.local
-*.env.*
-
-# Coverage
-.coverage
-coverage/
-htmlcov/
+# Build artifacts
+dist/
+build/
+*.egg-info/
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
 
 # Testing
 .pytest_cache/
 .mypy_cache/
-.hypothesis/
-
-# OS
-.DS_Store
-Thumbs.db
+.nyc_output/
+coverage.xml
 ```

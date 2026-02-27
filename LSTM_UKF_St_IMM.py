@@ -959,6 +959,12 @@ class LSTMIMMUKF(tf.Module):
         self.best_epoch = 0
         self.best_weights_dict = None
         self.best_scalers = None
+        
+        # Отладочные атрибуты для градиентов
+        self.grad_debug_enabled = True
+        self.grad_debug_every = 20
+        self.grad_debug_step0 = 0
+        self.grad_debug_max_vars = 40
         self.patience_counter = 0
 
         # Группы признаков для масштабирования
@@ -1007,6 +1013,8 @@ class LSTMIMMUKF(tf.Module):
             name='forecast_bias_correction'
         )
         print("✅ Добавлена обучаемая коррекция смещения прогноза по режимам")
+        
+
 
         self._prev_val_coverage = tf.Variable(
             initial_value=tf.constant(0.89, dtype=tf.float32),  # ✅ Целевое покрытие 89%
@@ -2999,14 +3007,7 @@ class LSTMIMMUKF(tf.Module):
             with tf.GradientTape(persistent=False) as tape:
 
                 # 0) Debug helpers (минимально; без Python-ветвлений по Tensor)
-                if not hasattr(self, "grad_debug_enabled"):
-                    self.grad_debug_enabled = True
-                if not hasattr(self, "grad_debug_every"):
-                    self.grad_debug_every = 20
-                if not hasattr(self, "grad_debug_step0"):
-                    self.grad_debug_step0 = 0
-                if not hasattr(self, "grad_debug_max_vars"):
-                    self.grad_debug_max_vars = 40
+                # Эти атрибуты теперь инициализируются в __init__
 
                 def _is_debug_step():
                     step = self._step_counter
@@ -3319,8 +3320,9 @@ class LSTMIMMUKF(tf.Module):
                     high_width_penalty = wide_high_penalty + narrow_high_penalty
                     high_regime_penalty_loss = 0.1 * high_width_penalty
 
-                # Убираем base_width_loss (на основе width_error), оставляем только ci_regularization_loss и high_regime_penalty_loss
-                width_loss = ci_regularization_loss + high_regime_penalty_loss
+                # Добавляем width_penalty_from_ci к width_loss для обучения max_width_factors_logits
+                # Используем width_regularization вместо width_penalty_from_ci, так как она определена в этом контексте
+                width_loss = ci_regularization_loss + high_regime_penalty_loss + 0.1 * width_regularization
 
                 # ✅ УБРАНО: loss = loss + width_loss (loss еще не определен!)
                 # width_loss будет добавлен позже, после инициализации loss
@@ -3454,6 +3456,13 @@ class LSTMIMMUKF(tf.Module):
                 if hasattr(self, "target_cov_logits") and isinstance(self.target_cov_logits, tf.Variable):
                     trainable_vars.append(self.target_cov_logits)
 
+            # Добавляем пропущенные переменные
+            if hasattr(self, "coverage_mixing_alpha") and isinstance(self.coverage_mixing_alpha, tf.Variable):
+                trainable_vars.append(self.coverage_mixing_alpha)
+
+            if hasattr(self, "forecast_bias_correction") and isinstance(self.forecast_bias_correction, tf.Variable):
+                trainable_vars.append(self.forecast_bias_correction)
+
             # 11) GRADS + OPTIMIZER STEP (вне tape scope)
             use_lso = isinstance(self._optimizer, tf.keras.mixed_precision.LossScaleOptimizer)
 
@@ -3532,6 +3541,9 @@ class LSTMIMMUKF(tf.Module):
                         # Адаптивное масштабирование удалено — не работает внутри @tf.function
                         scaled_grads.append(grad * 1.5)  # ← ✅ Базовое масштабирование
                     elif 'forecast_bias_correction' in var_name:
+                        # Convert IndexedSlices to dense if needed before multiplication
+                        if isinstance(grad, tf.IndexedSlices):
+                            grad = tf.convert_to_tensor(grad)
                         scaled_grads.append(grad * 3.0)  # ✅ Новый: bias correction быстрее
                     else:
                         scaled_grads.append(grad)
@@ -4947,7 +4959,7 @@ class LSTMIMMUKF(tf.Module):
                     print(f"  regime_scales = {self.regime_selector.regime_scales.numpy()}")
 
                 # ===== СОХРАНЕНИЕ ЛУЧШИХ ВЕСОВ И РАННЯЯ ОСТАНОВКА =====
-                current_val_loss = val_mse_avg.numpy()
+                current_val_loss = val_loss_avg.numpy()
                 if save_best_weights and not np.isnan(current_val_loss) and not np.isinf(current_val_loss):
                     if current_val_loss < self.best_val_loss:
                         self.best_val_loss = current_val_loss
