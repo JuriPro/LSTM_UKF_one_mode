@@ -3532,32 +3532,37 @@ class LSTMIMMUKF(tf.Module):
                     )
 
             # ===== НОВЫЙ КОД: Разделение переменных по группам и применение разных оптимизаторов =====
-            # Разделяем переменные и соответствующие градиенты на группы
-            main_vars = []
-            regime_scales_vars = []
-            temperature_vars = []
-            bias_correction_vars = []
+            # Разделяем пары (градиент, переменная) по группам напрямую
+            main_pairs = []
+            regime_pairs = []
+            temp_pairs = []
+            bias_pairs = []
 
-            grad_dict = {var: grad for var, grad in zip(trainable_vars, gradients) if grad is not None}
-
-            for var in trainable_vars:
+            for var, grad in zip(trainable_vars, gradients):
+                if grad is None:
+                    continue
                 if 'regime_scales' in var.name:
-                    regime_scales_vars.append(var)
+                    regime_pairs.append((grad, var))
                 elif 'temperature' in var.name:
-                    temperature_vars.append(var)
+                    temp_pairs.append((grad, var))
                 elif 'forecast_bias_correction' in var.name:
-                    bias_correction_vars.append(var)
+                    bias_pairs.append((grad, var))
                 else:
-                    main_vars.append(var)
+                    main_pairs.append((grad, var))
 
+            # ✅ ДОБАВЛЕНО: Инициализация global_norm для метрик
+            global_norm = tf.constant(0.0, dtype=tf.float32)
+            
             # Основной оптимизатор для основных параметров
-            if main_vars:
-                main_grads = [grad_dict[var] for var in main_vars if var in grad_dict]
+            if main_pairs:
+                main_grads, main_vars_filtered = zip(*main_pairs)
                 clipped_main_grads, main_global_norm = tf.clip_by_global_norm(main_grads, 1.0)
-                self._optimizer.apply_gradients(zip(clipped_main_grads, main_vars))
+                self._optimizer.apply_gradients(zip(clipped_main_grads, main_vars_filtered))
 
             # Для regime_scales используем отдельный оптимизатор с learning rate * 3
-            if regime_scales_vars:
+            if regime_pairs:
+                regime_grads, regime_vars_filtered = zip(*regime_pairs)
+                clipped_regime_grads, regime_global_norm = tf.clip_by_global_norm(regime_grads, 1.0)
                 if self._regime_optimizer is None:
                     self._regime_optimizer = tf.keras.optimizers.Adam(
                         learning_rate=self._optimizer.learning_rate * 3.0,
@@ -3565,12 +3570,12 @@ class LSTMIMMUKF(tf.Module):
                         beta_2=self._optimizer.beta_2,
                         epsilon=self._optimizer.epsilon
                     )
-                regime_grads = [grad_dict[var] for var in regime_scales_vars if var in grad_dict]
-                clipped_regime_grads, regime_global_norm = tf.clip_by_global_norm(regime_grads, 1.0)
-                self._regime_optimizer.apply_gradients(zip(clipped_regime_grads, regime_scales_vars))
+                self._regime_optimizer.apply_gradients(zip(clipped_regime_grads, regime_vars_filtered))
 
             # Для temperature learning rate * 1.5
-            if temperature_vars:
+            if temp_pairs:
+                temp_grads, temp_vars_filtered = zip(*temp_pairs)
+                clipped_temp_grads, temp_global_norm = tf.clip_by_global_norm(temp_grads, 1.0)
                 if self._temperature_optimizer is None:
                     self._temperature_optimizer = tf.keras.optimizers.Adam(
                         learning_rate=self._optimizer.learning_rate * 1.5,
@@ -3578,12 +3583,12 @@ class LSTMIMMUKF(tf.Module):
                         beta_2=self._optimizer.beta_2,
                         epsilon=self._optimizer.epsilon
                     )
-                temp_grads = [grad_dict[var] for var in temperature_vars if var in grad_dict]
-                clipped_temp_grads, temp_global_norm = tf.clip_by_global_norm(temp_grads, 1.0)
-                self._temperature_optimizer.apply_gradients(zip(clipped_temp_grads, temperature_vars))
+                self._temperature_optimizer.apply_gradients(zip(clipped_temp_grads, temp_vars_filtered))
 
             # Для bias_correction learning rate * 3
-            if bias_correction_vars:
+            if bias_pairs:
+                bias_grads, bias_vars_filtered = zip(*bias_pairs)
+                clipped_bias_grads, bias_global_norm = tf.clip_by_global_norm(bias_grads, 1.0)
                 if self._bias_optimizer is None:
                     self._bias_optimizer = tf.keras.optimizers.Adam(
                         learning_rate=self._optimizer.learning_rate * 3.0,
@@ -3591,43 +3596,11 @@ class LSTMIMMUKF(tf.Module):
                         beta_2=self._optimizer.beta_2,
                         epsilon=self._optimizer.epsilon
                     )
-                bias_grads = [grad_dict[var] for var in bias_correction_vars if var in grad_dict]
-                clipped_bias_grads, bias_global_norm = tf.clip_by_global_norm(bias_grads, 1.0)
-                self._bias_optimizer.apply_gradients(zip(clipped_bias_grads, bias_correction_vars))
-
-            # Вычисляем общий глобальный норм для мониторинга (если нужно отслеживать общий градиент)
-            all_clipped_grads = []
-            for var in trainable_vars:
-                if var in grad_dict and grad_dict[var] is not None:
-                    # Находим соответствующий clipped градиент
-                    if var in main_vars:
-                        idx = main_vars.index(var)
-                        all_clipped_grads.append(clipped_main_grads[idx])
-                    elif var in regime_scales_vars:
-                        idx = regime_scales_vars.index(var)
-                        all_clipped_grads.append(clipped_regime_grads[idx])
-                    elif var in temperature_vars:
-                        idx = temperature_vars.index(var)
-                        all_clipped_grads.append(clipped_temp_grads[idx])
-                    elif var in bias_correction_vars:
-                        idx = bias_correction_vars.index(var)
-                        all_clipped_grads.append(clipped_bias_grads[idx])
-                    else:
-                        all_clipped_grads.append(grad_dict[var])  # fallback
-                else:
-                    all_clipped_grads.append(None)
-
-            # Вычисляем глобальную норму для мониторинга
-            finite_grads = [g for g in all_clipped_grads if g is not None and tf.reduce_any(tf.math.is_finite(g))]
-            if finite_grads:
-                global_norm = tf.linalg.global_norm(finite_grads)
-            else:
-                global_norm = tf.constant(0.0)
-            # ===== КОНЕЦ НОВОГО КОДА =====
+                self._bias_optimizer.apply_gradients(zip(clipped_bias_grads, bias_vars_filtered))
 
             # Гарантировать диапазон температуры
             self.regime_selector.temperature.assign(
-                tf.clip_by_value(self.regime_selector.temperature, 0.3, 10.0)  # ✅ Согласовано с __init__
+                tf.clip_by_value(self.regime_selector.temperature, 0.3, 10.0)
             )
 
             # 🔑 ГИБРИДНЫЙ ПОДХОД v6: ЯВНЫЙ CLIP ТЕМПЕРАТУРЫ (критично!)
@@ -4697,21 +4670,28 @@ class LSTMIMMUKF(tf.Module):
 
         # 3. Инициализация оптимизатора
         print("\n✅ Инициализация оптимизатора с Loss Scale...")
-        base_lr = 5e-4
-        base_optimizer = tf.keras.optimizers.Adam(
-                learning_rate=base_lr,
-                beta_1=0.9,
-                beta_2=0.999,
-                epsilon=1e-7,
-                amsgrad=False
-            )
-        current_policy = tf.keras.mixed_precision.global_policy()
-        if current_policy.name == 'mixed_float16':
-            self._optimizer = tf.keras.mixed_precision.LossScaleOptimizer(base_optimizer)
-            print("✅ Loss Scale Optimizer инициализирован для mixed precision")
-        else:
-            self._optimizer = base_optimizer
-            print("✅ Стандартный оптимизатор инициализирован (без mixed precision)")
+        base_lr = 5e-4  # ← ИСПРАВЛЕНО: было base_lr (не определена)
+        base_lr_val = base_lr
+        
+        # ✅ ИСПРАВЛЕНО: Добавлена инициализация основного оптимизатора
+        self._optimizer = tf.keras.optimizers.Adam(
+            learning_rate=base_lr_val,
+            beta_1=0.9, beta_2=0.999, epsilon=1e-7
+        )
+        
+        self._regime_optimizer = tf.keras.optimizers.Adam(
+            learning_rate=base_lr_val * 3.0,
+            beta_1=0.9, beta_2=0.999, epsilon=1e-7
+        )
+        self._temperature_optimizer = tf.keras.optimizers.Adam(
+            learning_rate=base_lr_val * 1.5,
+            beta_1=0.9, beta_2=0.999, epsilon=1e-7
+        )
+        self._bias_optimizer = tf.keras.optimizers.Adam(
+            learning_rate=base_lr_val * 3.0,
+            beta_1=0.9, beta_2=0.999, epsilon=1e-7
+        )
+        print("✅ Дополнительные оптимизаторы для групп параметров созданы")
 
         # 4. История обучения
         history = {
