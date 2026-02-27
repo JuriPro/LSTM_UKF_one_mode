@@ -2434,8 +2434,7 @@ class LSTMIMMUKF(tf.Module):
         ukf_params: Dict[str, tf.Tensor],
         calibration_loss: tf.Tensor,
         entropy_loss: tf.Tensor = 0.0,
-        regime_info: Optional[Dict[str, tf.Tensor]] = None,
-        training: bool = False,
+        regime_info: Optional[Dict[str, tf.Tensor]] = None
     ):
         """
         Оптимизированный compute_loss:
@@ -2460,10 +2459,6 @@ class LSTMIMMUKF(tf.Module):
         # 4) Regime selector reg
         selector_reg = tf.constant(0.0, dtype=tf.float32)
         if hasattr(self, "regime_selector") and self.regime_selector is not None:
-            # Штраф на масштабы
-            selector_reg = selector_reg + tf.constant(0.02, tf.float32) * tf.reduce_mean(
-                tf.square(self.regime_selector.regime_scales - 2.5)
-            )
             # Штраф на center_logits (если learnable)
             if getattr(self.regime_selector, "learnable_centers", False):
                 if hasattr(self.regime_selector, "center_logits"):
@@ -2596,7 +2591,7 @@ class LSTMIMMUKF(tf.Module):
 
         return tf.clip_by_value(target, confidence_floor, confidence_ceil)
 
-    def _get_calibration_params(self, volatility_level, student_t_config=None, correction_adaptive=None, training=True):
+    def _get_calibration_params(self, volatility_level, student_t_config=None, correction_adaptive=None, training=True, regime_info=None):
         """
         Возвращает student_t_config, пригодный для _calibrate_confidence_interval:
         - все скаляры -> [B] (берём последний timestep)
@@ -2623,7 +2618,8 @@ class LSTMIMMUKF(tf.Module):
             0.805, 0.955
         )
 
-        regime_info = self.regime_selector.assign_soft_regimes(v)  # soft_weights обычно [B, K]
+        if regime_info is None:
+            regime_info = self.regime_selector.assign_soft_regimes(v)
 
         # -------- 3) подготовка конфига --------
         cfg = {} if student_t_config is None else dict(student_t_config)
@@ -3127,7 +3123,8 @@ class LSTMIMMUKF(tf.Module):
                     final_volatility,
                     student_t_config=student_t_config,
                     correction_adaptive=correction_adaptive,
-                    training=True
+                    training=True,
+                    regime_info=regime_info
                 )
                 target_coverage_mean = tf.reduce_mean(target_coverage)
 
@@ -3400,8 +3397,7 @@ class LSTMIMMUKF(tf.Module):
                     ukf_params,
                     calibration_loss_clipped,
                     entropy_loss,
-                    regime_info=regime_info,
-                    training=True
+                    regime_info=regime_info
                 )
 
                 # ✅ Улучшенная регуляризация regime_scales
@@ -3552,7 +3548,7 @@ class LSTMIMMUKF(tf.Module):
 
             # ✅ ДОБАВЛЕНО: Инициализация global_norm для метрик
             global_norm = tf.constant(0.0, dtype=tf.float32)
-            
+
             # Основной оптимизатор для основных параметров
             if main_pairs:
                 main_grads, main_vars_filtered = zip(*main_pairs)
@@ -4137,8 +4133,7 @@ class LSTMIMMUKF(tf.Module):
                 ukf_params,
                 calibration_loss_for_val,
                 entropy_loss,
-                regime_info=regime_info,
-                training=False
+                regime_info=regime_info
             )
 
             # ✅ Width-only сигнал (не клипится calibration clip'ом)
@@ -4672,13 +4667,13 @@ class LSTMIMMUKF(tf.Module):
         print("\n✅ Инициализация оптимизатора с Loss Scale...")
         base_lr = 5e-4  # ← ИСПРАВЛЕНО: было base_lr (не определена)
         base_lr_val = base_lr
-        
+
         # ✅ ИСПРАВЛЕНО: Добавлена инициализация основного оптимизатора
         self._optimizer = tf.keras.optimizers.Adam(
             learning_rate=base_lr_val,
             beta_1=0.9, beta_2=0.999, epsilon=1e-7
         )
-        
+
         self._regime_optimizer = tf.keras.optimizers.Adam(
             learning_rate=base_lr_val * 3.0,
             beta_1=0.9, beta_2=0.999, epsilon=1e-7
@@ -4721,6 +4716,10 @@ class LSTMIMMUKF(tf.Module):
                     gamma=1.5
                 )
                 self._optimizer.learning_rate.assign(current_lr)
+                # Синхронизация дополнительных оптимизаторов
+                self._regime_optimizer.learning_rate.assign(current_lr * 3.0)
+                self._temperature_optimizer.learning_rate.assign(current_lr * 1.5)
+                self._bias_optimizer.learning_rate.assign(current_lr * 3.0)
                 print(f"\n{'─' * 80}")
                 print(f"📅 EPOCH {epoch + 1}/{epochs} | LR: {current_lr:.2e} | Начало: {epoch_start_time.strftime('%H:%M:%S')}")
 
@@ -4833,11 +4832,6 @@ class LSTMIMMUKF(tf.Module):
                 # ===== ВАЛИДАЦИЯ =====
                 print("\n📉 ВАЛИДАЦИЯ...")
 
-                # ✅ КРИТИЧЕСКИ ВАЖНО: СОХРАНЯЕМ тренировочное состояние ПЕРЕД валидацией
-                train_state_tf = tf.identity(self._last_state)
-                train_P_tf = tf.identity(self._last_P)
-
-                print(f"   💾 Сохранено тренировочное состояние (для восстановления после валидации)")
 
                 val_losses = []
                 val_mse_losses = []
@@ -4900,12 +4894,7 @@ class LSTMIMMUKF(tf.Module):
                               f"Progress: {progress:.1f}% | val_loss={val_loss:.6f}", end='')
                 print()  # Новая строка после прогресс-бара
 
-                # ✅ КРИТИЧЕСКИ ВАЖНО: ВОССТАНАВЛИВАЕМ тренировочное состояние ПОСЛЕ валидации
-                self._last_state.assign(train_state_tf)
-                self._last_P.assign(train_P_tf)
-                print(f"   🔁 Восстановлено тренировочное состояние (чистая валидация без утечки)")
-
-                # Средние метрики валидации
+                # 🔑 ДОБАВИТЬ ЭТОТ БЛОК (ОТСУТСТВОВАЛ!)
                 val_loss_avg = tf.reduce_mean(val_losses)
                 val_mse_avg = tf.reduce_mean(val_mse_losses)
                 val_volatility_avg = tf.reduce_mean(tf.stack(val_volatility_levels))
