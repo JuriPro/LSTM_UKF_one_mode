@@ -13,7 +13,7 @@ import warnings
 # Evaluate
 from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
-import seaborn as sns
+
 import time
 # Метрики качества
 from sklearn.metrics import (
@@ -812,7 +812,7 @@ class LSTMIMMUKF(tf.Module):
 
         # Базовые параметры - ЕДИНСТВЕННЫЙ РЕЖИМ вместо 3
         self.state_dim = 1
-        self.num_modes = 1  # КРИТИЧЕСКИЕ ИЗМЕНЕНИЯ: от IMM к единому режиму
+
         self.seq_len = seq_len
         self.vol_window_short = vol_window
         self.vol_window_long = vol_window_long
@@ -870,7 +870,7 @@ class LSTMIMMUKF(tf.Module):
         # Модель будет инициализирована позже
         self.model = None
         self.feature_scalers = None
-        self.y_scalers = None
+
 
         # === ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЙ UKF ДЛЯ ЕДИНОГО РЕЖИМА ===
         with tf.device(self.device):
@@ -927,15 +927,7 @@ class LSTMIMMUKF(tf.Module):
             aggregation=tf.VariableAggregation.MEAN
         )
 
-        # Добавляем инициализацию целевых ширин (как рекомендовалось ранее)
-        initial_width_scales = np.array([0.8, 1.0, 1.3], dtype=np.float32)  # Увеличиваем ширину для высокого режима
-        width_logits_init = np.log(initial_width_scales)
-        self.target_width_logits = tf.Variable(
-            initial_value=width_logits_init,
-            trainable=True,
-            dtype=tf.float32,
-            name='target_width_logits'
-        )
+
 
         # === ДОБАВЛЕНО: инициализация _prev_train_coverage
         self._prev_train_coverage = tf.Variable(
@@ -959,7 +951,7 @@ class LSTMIMMUKF(tf.Module):
         self.best_epoch = 0
         self.best_weights_dict = None
         self.best_scalers = None
-        
+
         # Отладочные атрибуты для градиентов
         self.grad_debug_enabled = True
         self.grad_debug_every = 20
@@ -1013,7 +1005,7 @@ class LSTMIMMUKF(tf.Module):
             name='forecast_bias_correction'
         )
         print("✅ Добавлена обучаемая коррекция смещения прогноза по режимам")
-        
+
 
 
         self._prev_val_coverage = tf.Variable(
@@ -1022,11 +1014,11 @@ class LSTMIMMUKF(tf.Module):
             name="prev_val_coverage"
         )
         # ✅ ДОБАВЛЕНО: _prev_train_coverage для domain adaptation
-        self._prev_train_coverage = tf.Variable(
-            initial_value=tf.constant(0.89, dtype=tf.float32),
-            trainable=False,
-            name="prev_train_coverage"
-        )
+        # self._prev_train_coverage = tf.Variable(
+        #     initial_value=tf.constant(0.89, dtype=tf.float32),
+        #     trainable=False,
+        #     name="prev_train_coverage"
+        # )
 
         print("=" * 80)
         print("✅ LSTM-UKF МОДЕЛЬ С КОНТЕКСТНОЙ ВОЛАТИЛЬНОСТЬЮ ПОЛНОСТЬЮ ИНИЦИАЛИЗИРОВАНА")
@@ -2678,7 +2670,7 @@ class LSTMIMMUKF(tf.Module):
     @tf.function
     def _compute_calibration_loss(
         self, ci_lower, ci_upper, y_target, y_for_filtering,
-        volatility_levels, target_coverage, training=False,
+        volatility_levels, target_coverage,
         regime_info=None
     ):
         """
@@ -2807,8 +2799,7 @@ class LSTMIMMUKF(tf.Module):
         volatility_level: tf.Tensor,
         student_t_config: Dict[str, tf.Tensor],
         innovations: Optional[tf.Tensor] = None,
-        regime_assignment: Optional[tf.Tensor] = None,
-        true_values: Optional[tf.Tensor] = None
+        regime_assignment: Optional[tf.Tensor] = None
     ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
         """
         Вычисляет адаптивные доверительные интервалы (CI) с режимно-зависимым контролем ширины.
@@ -3160,8 +3151,7 @@ class LSTMIMMUKF(tf.Module):
                 ci_lower, ci_upper, _, width_regularization = self._calibrate_confidence_interval(
                     forecast, std_dev, final_volatility, student_t_config,
                     innovations=innovations[:, -10:, :],
-                    regime_assignment=regime_assignment,
-                    true_values=y_target_batch
+                    regime_assignment=regime_assignment
                 )
                 ci_min = tf.minimum(ci_lower, ci_upper)
                 ci_max = tf.maximum(ci_lower, ci_upper)
@@ -3296,7 +3286,7 @@ class LSTMIMMUKF(tf.Module):
                 raw_calibration_loss, actual_coverage, width_ratio, target_width_ratio, width_error = \
                     self._compute_calibration_loss(
                         ci_min, ci_max, y_target_batch, y_for_filtering_batch,
-                        volatility_levels, target_coverage, training=True,
+                        volatility_levels, target_coverage,
                         regime_info=regime_info  # ← ДОБАВЛЕНО
                     )
 
@@ -3585,12 +3575,7 @@ class LSTMIMMUKF(tf.Module):
 
             avg_inflation = tf.reduce_mean(inflation_factors[:, -1, :])
 
-            dynamic_threshold, inflation_anomaly_ratio = compute_adaptive_threshold(
-                inflation_factors,
-                final_volatility,
-                self.threshold_ema,
-                target_anomaly_ratio=0.35
-            )
+            inflation_anomaly_ratio = tf.constant(0.0, tf.float32)
 
             spectrum_info = self.diff_ukf_component.get_spectrum_info()
             min_eigenvalue = spectrum_info["min_eigenvalue"]
@@ -4011,11 +3996,10 @@ class LSTMIMMUKF(tf.Module):
             )
 
 
-            ci_lower, ci_upper, _, width_penalty_from_ci = self._calibrate_confidence_interval(
+            ci_lower, ci_upper, _, _ = self._calibrate_confidence_interval(
                 forecast, std_dev, final_volatility, student_t_config,
                 innovations=innovations[:, -10:, :],
-                regime_assignment=regime_info.get('regime_assignment', None),
-                true_values=y_target_batch
+                regime_assignment=regime_info.get('regime_assignment', None)
             )
 
             ci_min = tf.minimum(ci_lower, ci_upper)
@@ -4069,7 +4053,7 @@ class LSTMIMMUKF(tf.Module):
             raw_calibration_loss, actual_coverage, width_ratio, target_width_ratio, width_error = \
                 self._compute_calibration_loss(
                     ci_min, ci_max, y_target_batch, y_for_filtering_batch,
-                    volatility_levels, target_coverage, training=False,
+                    volatility_levels, target_coverage,
                     regime_info=regime_info  # ← ДОБАВЛЕНО
                 )
 
@@ -6246,8 +6230,7 @@ class LSTMIMMUKF(tf.Module):
         self,
         df: pd.DataFrame,
         reset_state: bool = False,
-        return_components: bool = False,
-        ground_truth_available: bool = False
+        return_components: bool = False
     ) -> Dict[str, Any]:
         required_cols = ["Open", "High", "Low", "Close"]
         missing_cols = [c for c in required_cols if c not in df.columns]
