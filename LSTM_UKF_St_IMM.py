@@ -957,8 +957,39 @@ class LSTMIMMUKF(tf.Module):
             name='buffer_index'
         )
 
-        # Инициализация оптимизатора
-        # Опитимизатор инициализируется в методе fit()
+        # =================================================================
+        # СОЗДАНИЕ LSTM МОДЕЛИ И ОПТИМИЗАТОРОВ (ПЕРЕМЕЩЕНО ИЗ fit)
+        # =================================================================
+        # Вычисляем форму входа для LSTM на основе параметров модели
+        self.input_shape = (self.seq_len, len(self.feature_columns))
+        print(f"📐 Форма входа для LSTM: {self.input_shape}")
+
+        # Создаём LSTM модель (архитектура без компиляции, только граф)
+        with tf.device(self.device):
+            self.model = self._build_model(self.input_shape, training=True)
+        print("✅ LSTM модель создана в __init__")
+
+        # Инициализируем основной оптимизатор с начальным learning rate
+        base_lr = 5e-4  # начальное значение, будет меняться планировщиком
+        self._optimizer = tf.keras.optimizers.Adam(
+            learning_rate=base_lr,
+            beta_1=0.9, beta_2=0.999, epsilon=1e-7
+        )
+
+        # Дополнительные оптимизаторы для специализированных групп параметров
+        self._regime_optimizer = tf.keras.optimizers.Adam(
+            learning_rate=base_lr * 3.0,
+            beta_1=0.9, beta_2=0.999, epsilon=1e-7
+        )
+        self._temperature_optimizer = tf.keras.optimizers.Adam(
+            learning_rate=base_lr * 1.5,
+            beta_1=0.9, beta_2=0.999, epsilon=1e-7
+        )
+        self._bias_optimizer = tf.keras.optimizers.Adam(
+            learning_rate=base_lr * 3.0,
+            beta_1=0.9, beta_2=0.999, epsilon=1e-7
+        )
+        print("✅ Оптимизаторы созданы в __init__")
 
         # Ранняя остановка
         self.best_val_loss = float('inf')
@@ -4653,40 +4684,7 @@ class LSTMIMMUKF(tf.Module):
 
         log_interval = max(1, len(train_ds) // 10)
         print("✅ Оптимизированные датасеты успешно подготовлены")
-        # 2. Инициализация модели на GPU
-        print("\n🔧 Инициализация LSTM модели на GPU...")
-        for X_batch, y_for_filtering_batch, y_target_batch, regime_labels_batch in train_ds.take(1):
-            input_shape = (int(X_batch.shape[1]), int(X_batch.shape[2]))
-            print(f"✅ Определена форма входа: {input_shape}")
-            with tf.device('/GPU:0' if self._gpu_available else '/CPU:0'):
-                self.model = self._build_model(input_shape, training=True)
-            print(f"✅ LSTM модель инициализирована с формой входа: {input_shape}")
-            break
 
-        # 3. Инициализация оптимизатора
-        print("\n✅ Инициализация оптимизатора с Loss Scale...")
-        base_lr = 5e-4  # ← ИСПРАВЛЕНО: было base_lr (не определена)
-        base_lr_val = base_lr
-
-        # ✅ ИСПРАВЛЕНО: Добавлена инициализация основного оптимизатора
-        self._optimizer = tf.keras.optimizers.Adam(
-            learning_rate=base_lr_val,
-            beta_1=0.9, beta_2=0.999, epsilon=1e-7
-        )
-
-        self._regime_optimizer = tf.keras.optimizers.Adam(
-            learning_rate=base_lr_val * 3.0,
-            beta_1=0.9, beta_2=0.999, epsilon=1e-7
-        )
-        self._temperature_optimizer = tf.keras.optimizers.Adam(
-            learning_rate=base_lr_val * 1.5,
-            beta_1=0.9, beta_2=0.999, epsilon=1e-7
-        )
-        self._bias_optimizer = tf.keras.optimizers.Adam(
-            learning_rate=base_lr_val * 3.0,
-            beta_1=0.9, beta_2=0.999, epsilon=1e-7
-        )
-        print("✅ Дополнительные оптимизаторы для групп параметров созданы")
 
         # 4. История обучения
         history = {
