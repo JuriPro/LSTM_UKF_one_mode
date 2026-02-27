@@ -1034,6 +1034,9 @@ class LSTMIMMUKF(tf.Module):
         #     name="prev_train_coverage"
         # )
 
+        # === ДОБАВЛЕНО: инициализация _step_counter для отслеживания шагов обучения ===
+        self._step_counter = tf.Variable(0, trainable=False, dtype=tf.int64, name="step_counter")
+
         print("=" * 80)
         print("✅ LSTM-UKF МОДЕЛЬ С КОНТЕКСТНОЙ ВОЛАТИЛЬНОСТЬЮ ПОЛНОСТЬЮ ИНИЦИАЛИЗИРОВАНА")
         print(f"⏰ Завершено: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -3555,39 +3558,42 @@ class LSTMIMMUKF(tf.Module):
 
             # Для regime_scales используем отдельный оптимизатор с learning rate * 3
             if regime_scales_vars:
-                regime_optimizer = tf.keras.optimizers.Adam(
-                    learning_rate=self._optimizer.learning_rate * 3.0,
-                    beta_1=self._optimizer.beta_1,
-                    beta_2=self._optimizer.beta_2,
-                    epsilon=self._optimizer.epsilon
-                )
+                if self._regime_optimizer is None:
+                    self._regime_optimizer = tf.keras.optimizers.Adam(
+                        learning_rate=self._optimizer.learning_rate * 3.0,
+                        beta_1=self._optimizer.beta_1,
+                        beta_2=self._optimizer.beta_2,
+                        epsilon=self._optimizer.epsilon
+                    )
                 regime_grads = [grad_dict[var] for var in regime_scales_vars if var in grad_dict]
                 clipped_regime_grads, regime_global_norm = tf.clip_by_global_norm(regime_grads, 1.0)
-                regime_optimizer.apply_gradients(zip(clipped_regime_grads, regime_scales_vars))
+                self._regime_optimizer.apply_gradients(zip(clipped_regime_grads, regime_scales_vars))
 
             # Для temperature learning rate * 1.5
             if temperature_vars:
-                temp_optimizer = tf.keras.optimizers.Adam(
-                    learning_rate=self._optimizer.learning_rate * 1.5,
-                    beta_1=self._optimizer.beta_1,
-                    beta_2=self._optimizer.beta_2,
-                    epsilon=self._optimizer.epsilon
-                )
+                if self._temperature_optimizer is None:
+                    self._temperature_optimizer = tf.keras.optimizers.Adam(
+                        learning_rate=self._optimizer.learning_rate * 1.5,
+                        beta_1=self._optimizer.beta_1,
+                        beta_2=self._optimizer.beta_2,
+                        epsilon=self._optimizer.epsilon
+                    )
                 temp_grads = [grad_dict[var] for var in temperature_vars if var in grad_dict]
                 clipped_temp_grads, temp_global_norm = tf.clip_by_global_norm(temp_grads, 1.0)
-                temp_optimizer.apply_gradients(zip(clipped_temp_grads, temperature_vars))
+                self._temperature_optimizer.apply_gradients(zip(clipped_temp_grads, temperature_vars))
 
             # Для bias_correction learning rate * 3
             if bias_correction_vars:
-                bias_optimizer = tf.keras.optimizers.Adam(
-                    learning_rate=self._optimizer.learning_rate * 3.0,
-                    beta_1=self._optimizer.beta_1,
-                    beta_2=self._optimizer.beta_2,
-                    epsilon=self._optimizer.epsilon
-                )
+                if self._bias_optimizer is None:
+                    self._bias_optimizer = tf.keras.optimizers.Adam(
+                        learning_rate=self._optimizer.learning_rate * 3.0,
+                        beta_1=self._optimizer.beta_1,
+                        beta_2=self._optimizer.beta_2,
+                        epsilon=self._optimizer.epsilon
+                    )
                 bias_grads = [grad_dict[var] for var in bias_correction_vars if var in grad_dict]
                 clipped_bias_grads, bias_global_norm = tf.clip_by_global_norm(bias_grads, 1.0)
-                bias_optimizer.apply_gradients(zip(clipped_bias_grads, bias_correction_vars))
+                self._bias_optimizer.apply_gradients(zip(clipped_bias_grads, bias_correction_vars))
 
             # Вычисляем общий глобальный норм для мониторинга (если нужно отслеживать общий градиент)
             all_clipped_grads = []
