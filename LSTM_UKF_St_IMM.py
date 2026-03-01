@@ -994,11 +994,53 @@ class LSTMIMMUKF(tf.Module):
 
         # Размер окна инноваций
         self.innov_window_size = 20
-        
+
         print("=" * 80)
         print("✅ LSTM-UKF МОДЕЛЬ С КОНТЕКСТНОЙ ВОЛАТИЛЬНОСТЬЮ ПОЛНОСТЬЮ ИНИЦИАЛИЗИРОВАНА")
+        # Flag для отслеживания инициализации состояния
+        self._state_initialized = tf.Variable(False, trainable=False, dtype=tf.bool, name="state_initialized")
+
+        # Переменные для отслеживания времени аномалий
+        self._last_anomaly_time = tf.Variable(-100, trainable=False, dtype=tf.int32, name='last_anomaly_time')
+
+        # Переменные для адаптивного инфляционного фактора
+        self._last_inflation_factor = tf.Variable([1.0], trainable=False, dtype=tf.float32, name='last_inflation_factor')
+        self._last_remaining_steps = tf.Variable([0], trainable=False, dtype=tf.int32, name='last_remaining_steps')
+        self._last_high_inflation_steps = tf.Variable([0], trainable=False, dtype=tf.int32, name='last_high_inflation_steps')
+
+        # Окно инноваций
+        self._last_innov_window = tf.Variable(tf.zeros([1, self.innov_window_size]), trainable=False, dtype=tf.float32, name='last_innov_window')
+
         print(f"⏰ Завершено: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("=" * 80)
+
+    def _ensure_state_vars(self):
+        """Гарантирует наличие всех переменных состояния фильтра."""
+        if not hasattr(self, '_state_initialized'):
+            self._state_initialized = tf.Variable(False, trainable=False, dtype=tf.bool, name="state_initialized")
+        if not hasattr(self, '_last_state'):
+            self._last_state = tf.Variable(tf.zeros([1], dtype=tf.float32), trainable=False, name='last_state')
+        if not hasattr(self, '_last_P'):
+            self._last_P = tf.Variable(tf.reshape(tf.eye(1) * 0.1, [1,1,1]), trainable=False, name='last_P')
+        if not hasattr(self, '_last_volatility'):
+            self._last_volatility = tf.Variable([0.1], trainable=False, dtype=tf.float32, name='last_volatility')
+        if not hasattr(self, '_step_counter'):
+            self._step_counter = tf.Variable(0, trainable=False, dtype=tf.int64, name='step_counter')
+        if not hasattr(self, '_last_anomaly_time'):
+            self._last_anomaly_time = tf.Variable(-100, trainable=False, dtype=tf.int32, name='last_anomaly_time')
+        if not hasattr(self, '_last_inflation_factor'):
+            self._last_inflation_factor = tf.Variable([1.0], trainable=False, dtype=tf.float32, name='last_inflation_factor')
+        if not hasattr(self, '_last_remaining_steps'):
+            self._last_remaining_steps = tf.Variable([0], trainable=False, dtype=tf.int32, name='last_remaining_steps')
+        if not hasattr(self, '_last_high_inflation_steps'):
+            self._last_high_inflation_steps = tf.Variable([0], trainable=False, dtype=tf.int32, name='last_high_inflation_steps')
+        if not hasattr(self, '_last_innov_window'):
+            innov_window_size = getattr(self, 'innov_window_size', 20)
+            self._last_innov_window = tf.Variable(tf.zeros([1, innov_window_size]), trainable=False, dtype=tf.float32, name='last_innov_window')
+        if not hasattr(self, 'anomaly_buffer'):
+            self.anomaly_buffer = tf.Variable(tf.zeros([self.anomaly_buffer_size], dtype=tf.float32), trainable=False, name='anomaly_buffer')
+        if not hasattr(self, 'buffer_index'):
+            self.buffer_index = tf.Variable(0, trainable=False, dtype=tf.int32, name='buffer_index')
 
     def _setup_reproducibility(self, seed: int = 42):
         """Установка глобальных seeds для воспроизводимости."""
@@ -2021,7 +2063,7 @@ class LSTMIMMUKF(tf.Module):
                 updates=[current_anomaly_rate]
             )
             buffer_index = buffer_index + 1
-            
+
             # Рассчитываем скользящее среднее по аномалиям, используя локальный буфер и индекс
             effective_buffer_size = tf.minimum(buffer_index, self.anomaly_buffer_size)
             rolling_anomaly_mean = tf.reduce_mean(anomaly_buffer[:effective_buffer_size])
@@ -2392,7 +2434,7 @@ class LSTMIMMUKF(tf.Module):
 
         # Извлекаем последнее значение high_inflation_steps из истории
         final_high_inflation_steps = high_infl_steps_hist.read(T - 1)  # [B]
-        
+
         result = (
             tf.expand_dims(states_out, axis=-1),           # 0
             tf.expand_dims(innovations_out, axis=-1),      # 1
@@ -2864,7 +2906,8 @@ class LSTMIMMUKF(tf.Module):
 
         if innovations is not None:
             innov = tf.squeeze(innovations)
-            if innov.shape.rank == 1:
+            # Динамическая проверка ранга: если одномерный, делаем reshape до [batch_size, -1]
+            if tf.rank(innov) == 1:
                 innov = tf.reshape(innov, [batch_size, -1])
             pos_mask = tf.cast(innov > 0, tf.float32)
             neg_mask = tf.cast(innov <= 0, tf.float32)
@@ -2971,7 +3014,7 @@ class LSTMIMMUKF(tf.Module):
         - Все tf.cond возвращают одинаковые типы
         - Shape consistency для всех тензоров
 
-        entropy_penalty в compute_loss контролирует глобальное распределение, 
+        entropy_penalty в compute_loss контролирует глобальное распределение,
         а regime_loss в train_step — локальное на батче
         """
         B = tf.shape(X_batch)[0]
@@ -3016,7 +3059,7 @@ class LSTMIMMUKF(tf.Module):
                 # 4) ADAPTIVE UKF FILTER
                 # Передавать None для обучения (каждый батч независим)
                 # Для онлайн-режима передавать сохранённое состояние
-                
+
                 results = self.adaptive_ukf_filter(
                     X_batch,
                     y_for_filtering_batch,
@@ -3030,7 +3073,7 @@ class LSTMIMMUKF(tf.Module):
                     anomaly_buffer_input=None,
                     buffer_index_input=None
                 )
-                
+
                 x_filtered = results[0]                  # [B, T, 1]
                 innovations = results[1]                 # [B, T, 1]
                 volatility_levels = results[2]           # [B, T, 1]
@@ -3196,7 +3239,7 @@ class LSTMIMMUKF(tf.Module):
                     # 🔑 ИСПРАВЛЕНО: Граф-безопасная проверка через tf.cond
                     def _get_ds_regimes_from_labels():
                         return tf.reshape(tf.cast(regime_labels_batch, tf.int32), [-1])
-                    
+
                     def _get_ds_regimes_from_pred():
                         # Если метки недоступны, используем предсказанные режимы
                         if "regime_assignment" in regime_info and regime_info["regime_assignment"] is not None:
@@ -3204,10 +3247,10 @@ class LSTMIMMUKF(tf.Module):
                         else:
                             soft_w_reg = tf.cast(regime_info["soft_weights"], tf.float32)  # [B,3]
                             return tf.argmax(soft_w_reg, axis=-1, output_type=tf.int32)  # [B]
-                    
+
                     # Граф-безопасная проверка на None
                     ds_regimes = tf.cond(
-                        tf.equal(regime_labels_batch, None) if regime_labels_batch is None else 
+                        tf.equal(regime_labels_batch, None) if regime_labels_batch is None else
                         tf.greater(tf.size(regime_labels_batch), 0),
                         lambda: _get_ds_regimes_from_pred(),
                         lambda: _get_ds_regimes_from_labels()
@@ -5900,29 +5943,29 @@ class LSTMIMMUKF(tf.Module):
                     print("   ✅ _last_inflation_factor восстановлен")
                 except Exception as e:
                     print(f"   ⚠️ Ошибка при восстановлении _last_inflation_factor: {str(e)}")
-            
+
             if "_last_remaining_steps" in d and d["_last_remaining_steps"] is not None and hasattr(self, "_last_remaining_steps"):
                 try:
                     self._last_remaining_steps.assign([d["_last_remaining_steps"]])
                     print("   ✅ _last_remaining_steps восстановлен")
                 except Exception as e:
                     print(f"   ⚠️ Ошибка при восстановлении _last_remaining_steps: {str(e)}")
-            
+
             if "_last_high_inflation_steps" in d and d["_last_high_inflation_steps"] is not None and hasattr(self, "_last_high_inflation_steps"):
                 try:
                     self._last_high_inflation_steps.assign([d["_last_high_inflation_steps"]])
                     print("   ✅ _last_high_inflation_steps восстановлен")
                 except Exception as e:
                     print(f"   ⚠️ Ошибка при восстановлении _last_high_inflation_steps: {str(e)}")
-            
+
             if "_last_innov_window" in d and d["_last_innov_window"] is not None and hasattr(self, "_last_innov_window"):
                 try:
                     self._last_innov_window.assign(np.array(d["_last_innov_window"], dtype=np.float32))
                     print("   ✅ _last_innov_window восстановлен")
                 except Exception as e:
                     print(f"   ⚠️ Ошибка при восстановлении _last_innov_window: {str(e)}")
-            
-            
+
+
             # --- 4) restore trainable/important params ---
             print("\n🔧 Восстановление обучаемых/важных параметров...")
 
@@ -6104,21 +6147,21 @@ class LSTMIMMUKF(tf.Module):
                 print("   ✅ _last_inflation_factor сброшен к 1.0")
             except Exception as e:
                 print(f"   ⚠️ Не удалось сбросить _last_inflation_factor: {str(e)}")
-        
+
         if hasattr(self, '_last_remaining_steps'):
             try:
                 self._last_remaining_steps.assign([0])
                 print("   ✅ _last_remaining_steps сброшен")
             except Exception as e:
                 print(f"   ⚠️ Не удалось сбросить _last_remaining_steps: {str(e)}")
-        
+
         if hasattr(self, '_last_high_inflation_steps'):
             try:
                 self._last_high_inflation_steps.assign([0])
                 print("   ✅ _last_high_inflation_steps сброшен")
             except Exception as e:
                 print(f"   ⚠️ Не удалось сбросить _last_high_inflation_steps: {str(e)}")
-        
+
         if hasattr(self, '_last_innov_window'):
             try:
                 innov_window_size = getattr(self, 'innov_window_size', 20)
@@ -6147,52 +6190,52 @@ class LSTMIMMUKF(tf.Module):
     ]:
         B = tf.shape(X_scaled)[0]
         T = tf.shape(X_scaled)[1]
-    
+
         # === 1) LSTM forward pass ===
         lstm_outputs = self.model(X_scaled, training=False)
         params_output = lstm_outputs["params"]  # [B, T, 37]
-    
+
         # === 2) LSTM params -> configs ===
         vol_context, ukf_params, inflation_config, student_t_config = self.process_lstm_output(params_output)
-    
+
         # === 3) UKF filtering ===
         initial_state = tf.reshape(initial_state, [B, self.state_dim])
         initial_covariance = tf.reshape(initial_covariance, [B, self.state_dim, self.state_dim])
-    
+
         level_idx = self.feature_columns.index("level")
         y_level_batch = X_scaled[:, :, level_idx]  # [B, T]
-    
+
         # last_volatility: ожидаем [B] (если пришло [B,1] — приведём)
         last_volatility = tf.reshape(tf.squeeze(last_volatility), [B])
-    
+
         # Используем переданные значения, а не self (чтобы избежать путаницы)
         if last_inflation_factor is not None:
             inf_factor_val = tf.reshape(last_inflation_factor, [B])
         else:
             inf_factor_val = tf.ones([B], dtype=tf.float32)
-        
+
         if last_remaining_steps is not None:
             rem_steps_val = tf.cast(tf.reshape(last_remaining_steps, [B]), tf.int32)
         else:
             rem_steps_val = tf.zeros([B], dtype=tf.int32)
-        
+
         if last_high_inflation_steps is not None:
             high_infl_val = tf.cast(tf.reshape(last_high_inflation_steps, [B]), tf.int32)
         else:
             high_infl_val = tf.zeros([B], dtype=tf.int32)
-        
+
         if hasattr(self, "_last_anomaly_time") and self._last_anomaly_time is not None:
             last_anom = tf.cast(tf.reshape(self._last_anomaly_time, [B]), tf.int32)
         else:
             last_anom = tf.fill([B], tf.constant(-100, dtype=tf.int32))
-        
+
         inflation_state_input = {
             "factor": inf_factor_val,
             "remaining_steps": rem_steps_val,
             "last_anomaly_time": last_anom,
             "high_inflation_steps": high_infl_val
         }
-        
+
         results = self.adaptive_ukf_filter(
             X_scaled,
             y_level_batch,
@@ -6208,34 +6251,34 @@ class LSTMIMMUKF(tf.Module):
             anomaly_buffer_input=anomaly_buffer_input,
             buffer_index_input=buffer_index_input
         )
-    
+
         # === РАСПАКОВКА С НОВЫМИ ВОЗВРАЩАЕМЫМИ ЗНАЧЕНИЯМИ ===
         (x_filtered, innovations, volatility_levels, inflation_factors,
          final_state, final_covariance, correction_adaptive_hist,
          updated_anomaly_buffer, updated_buffer_index,
          final_inflation_factor, final_remaining_steps, final_last_anom_time,
          final_innov_window, final_high_inflation_steps) = results
-    
+
         final_inflation = tf.reshape(inflation_factors[:, -1, :], [B])     # [B]
         final_volatility = tf.reshape(volatility_levels[:, -1, :], [B])    # [B]
         correction_adaptive = correction_adaptive_hist[:, -1, :]           # [B,1]
-    
+
         # === 4) explicit one-step predict ===
         t_last = T - 1
-        
+
         q_base_final = tf.gather(ukf_params["q_base"], t_last, axis=1)                 # [B,1]
         q_sensitivity_final = tf.gather(ukf_params["q_sensitivity"], t_last, axis=1)   # [B,1]
         q_floor_final = tf.gather(ukf_params["q_floor"], t_last, axis=1)               # [B,1]
-        
+
         relax_base_final = tf.gather(ukf_params["relax_base"], t_last, axis=1)         # [B,1]
         relax_sensitivity_final = tf.gather(ukf_params["relax_sensitivity"], t_last, axis=1)  # [B,1]
         alpha_base_final = tf.gather(ukf_params["alpha_base"], t_last, axis=1)         # [B,1]
         alpha_sensitivity_final = tf.gather(ukf_params["alpha_sensitivity"], t_last, axis=1)  # [B,1]
         kappa_base_final = tf.gather(ukf_params["kappa_base"], t_last, axis=1)         # [B,1]
         kappa_sensitivity_final = tf.gather(ukf_params["kappa_sensitivity"], t_last, axis=1)  # [B,1]
-        
+
         inf_factor_final = tf.reshape(final_inflation, [B, 1])  # [B,1]
-        
+
         # 1) Получаем regime_info (один раз)
         student_t_config, target_coverage, regime_info = self._get_calibration_params(
             final_volatility,
@@ -6243,7 +6286,7 @@ class LSTMIMMUKF(tf.Module):
             correction_adaptive=correction_adaptive,
             training=False
         )
-        
+
         # 2) Прогноз с regime_assignment
         forecast, std_dev, _ = self._explicit_predict_next_step(
             final_state,
@@ -6256,7 +6299,7 @@ class LSTMIMMUKF(tf.Module):
             kappa_base_final, kappa_sensitivity_final,
             regime_assignment=regime_info.get("regime_assignment")
         )
-        
+
         # 3) Калибровка CI (используем тот же student_t_config и regime_info)
         ci_lower, ci_upper, _, width_penalty_from_ci = self._calibrate_confidence_interval(
             forecast,
@@ -6266,17 +6309,17 @@ class LSTMIMMUKF(tf.Module):
             innovations=innovations[:, -10:, :] if innovations is not None else None,
             regime_assignment=regime_info.get("regime_assignment", None)
         )
-        
+
         ci_min = tf.minimum(ci_lower, ci_upper)
         ci_max = tf.maximum(ci_lower, ci_upper)
-    
+
         # === 6) СОХРАНЕНИЕ ОБНОВЛЁННОГО СОСТОЯНИЯ БУФЕРА ===
         # 🔑 ПУНКТ 4: Обновляем состояние модели для следующего вызова
         if hasattr(self, "anomaly_buffer"):
             self.anomaly_buffer.assign(updated_anomaly_buffer)
         if hasattr(self, "buffer_index"):
             self.buffer_index.assign(updated_buffer_index)
-    
+
         return (
             forecast,
             std_dev,
@@ -6431,7 +6474,7 @@ class LSTMIMMUKF(tf.Module):
         self._last_remaining_steps.assign(tf.reshape(final_remaining_steps, [1]))
         self._last_high_inflation_steps.assign(tf.reshape(final_high_inflation_steps, [1]))
         self._last_innov_window.assign(tf.reshape(final_innov_window, [1, -1]))
-        self._last_anomaly_time.assign(tf.reshape(final_last_anom_time, [1]))
+        self._last_anomaly_time.assign(tf.squeeze(final_last_anom_time))
 
         # Сохраняем обновлённые буферы в переменные модели
         self.anomaly_buffer.assign(updated_anomaly_buffer)
@@ -6442,7 +6485,7 @@ class LSTMIMMUKF(tf.Module):
         self._last_P.assign(final_covariance)
         self._last_volatility.assign(tf.reshape(final_volatility, [1]))
         self._step_counter.assign_add(1)
-        
+
         # 7) inverse transform
         forecast_original = self.inverse_transform_target(forecast_scaled.numpy())
         ci_lower_original = self.inverse_transform_target(ci_lower_scaled.numpy())
@@ -6535,6 +6578,9 @@ class LSTMIMMUKF(tf.Module):
                 f"❌ Недостаточно данных для оценки. Требуется минимум {window_size + 1} точек, "
                 f"получено {len(df)}"
             )
+
+        # Гарантируем наличие всех переменных состояния
+        self._ensure_state_vars()
 
         # === 2. СОХРАНЕНИЕ ИСХОДНОГО СОСТОЯНИЯ ФИЛЬТРА ===
         original_state_initialized_val = self._state_initialized.numpy()
