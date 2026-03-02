@@ -2896,8 +2896,9 @@ class LSTMIMMUKF(tf.Module):
         z_lower = -t_approx
 
         # ===== 5) BASE MARGINS =====
-        margin_lower_base = stddev * tf.abs(z_lower)
-        margin_upper_base = stddev * tf.abs(z_upper)
+        base_margin_multiplier = 2.5  # Было ~1.0-1.5
+        margin_lower_base = stddev * tf.abs(z_lower) * base_margin_multiplier
+        margin_upper_base = stddev * tf.abs(z_upper) * base_margin_multiplier
 
         # ===== 6) INNOVATIONS-BASED ASYMMETRY (optional) =====
         center_shift = tf.zeros([batch_size], dtype=tf.float32)
@@ -3003,7 +3004,7 @@ class LSTMIMMUKF(tf.Module):
 
     @tf.function
     def train_step(self, X_batch, y_for_filtering_batch, y_target_batch, regime_labels_batch=None,
-                   initial_state=None, initial_covariance=None):
+                   initial_state=None, initial_covariance=None, initial_state_dict=None):
         """
         Шаг обучения (LSTM-only): LSTM -> 37 params -> (vol_context, ukf_params, inflation_config, student_t_config)
         -> adaptive_ukf_filter -> explicit predict -> CI calibration -> loss -> grads.
@@ -3018,6 +3019,43 @@ class LSTMIMMUKF(tf.Module):
         а regime_loss в train_step — локальное на батче
         """
         B = tf.shape(X_batch)[0]
+
+        # --- Обработка состояния из словаря ---
+        if initial_state_dict is not None:
+            # Извлекаем все компоненты из словаря
+            initial_state = initial_state_dict['state']
+            initial_covariance = initial_state_dict['cov']
+            initial_volatility = initial_state_dict['volatility']
+            inflation_factor_input = initial_state_dict['inflation_factor']
+            remaining_steps_input = initial_state_dict['remaining_steps']
+            high_inflation_steps_input = initial_state_dict['high_inflation_steps']
+            last_anomaly_time_input = initial_state_dict['last_anomaly_time']
+            innov_window_input = initial_state_dict['innov_window']
+            anomaly_buffer_input = initial_state_dict['anomaly_buffer']
+            buffer_index_input = initial_state_dict['buffer_index']
+        else:
+            # Инициализация из данных (первый батч эпохи)
+            base_value = y_for_filtering_batch[:, 0]
+            initial_state = tf.reshape(base_value, [B, self.state_dim])
+            window_std = tf.math.reduce_std(y_for_filtering_batch[:, :10], axis=1)
+            initial_variance = tf.maximum(window_std ** 2, 0.01)
+            initial_covariance = tf.reshape(initial_variance, [B, self.state_dim, self.state_dim])
+            initial_volatility = window_std  # [B]
+            inflation_factor_input = tf.ones([B], dtype=tf.float32)
+            remaining_steps_input = tf.zeros([B], dtype=tf.int32)
+            high_inflation_steps_input = tf.zeros([B], dtype=tf.int32)
+            last_anomaly_time_input = tf.fill([B], tf.constant(-100, dtype=tf.int32))
+            innov_window_input = tf.zeros([B, self.innov_window_size], dtype=tf.float32)
+            anomaly_buffer_input = tf.zeros([self.anomaly_buffer_size], dtype=tf.float32)
+            buffer_index_input = tf.constant(0, dtype=tf.int32)
+
+        # Формируем словарь для inflation_state_input
+        inflation_state_input = {
+            "factor": inflation_factor_input,
+            "remaining_steps": remaining_steps_input,
+            "last_anomaly_time": last_anomaly_time_input,
+            "high_inflation_steps": high_inflation_steps_input
+        }
 
         # Safety: счетчик может отсутствовать если не создали в __init__
         # NOTE: теперь _step_counter гарантированно инициализирован в __init__
@@ -3069,24 +3107,36 @@ class LSTMIMMUKF(tf.Module):
                     student_t_config,
                     initial_state,
                     initial_covariance,
-                    initial_innov_window=None,            # ← добавлен новый параметр
-                    anomaly_buffer_input=None,
-                    buffer_index_input=None
+                    inflation_state_input=inflation_state_input,
+                    initial_volatility=initial_volatility,
+                    initial_innov_window=innov_window_input,
+                    anomaly_buffer_input=anomaly_buffer_input,
+                    buffer_index_input=buffer_index_input
                 )
 
-                x_filtered = results[0]                  # [B, T, 1]
-                innovations = results[1]                 # [B, T, 1]
-                volatility_levels = results[2]           # [B, T, 1]
-                inflation_factors = results[3]           # [B, T, 1]
-                final_state = results[4]                 # [B, 1]
-                final_covariance = results[5]            # [B, 1, 1]
-                correction_adaptive_hist = results[6]    # [B, T, 1]
-                # Остальные элементы результата (индексы 7–13) игнорируются
+                (x_filtered, innovations, volatility_levels, inflation_factors,
+                 final_state, final_covariance, correction_adaptive_hist,
+                 updated_anomaly_buffer, updated_buffer_index,
+                 final_inflation_factor, final_remaining_steps, final_last_anom_time,
+                 final_innov_window, final_high_inflation_steps) = results
 
                 normalized_innovations = tf.abs(innovations[:, -10:, :])  # [B, 10, 1]
 
                 # 5) EXPLICIT ONE-STEP PREDICT (t+1)
                 final_volatility = tf.reshape(volatility_levels[:, -1, :], [-1])  # [B]
+
+                state_dict = {
+                    'state': final_state,
+                    'cov': final_covariance,
+                    'volatility': final_volatility,
+                    'inflation_factor': final_inflation_factor,
+                    'remaining_steps': final_remaining_steps,
+                    'high_inflation_steps': final_high_inflation_steps,
+                    'last_anomaly_time': final_last_anom_time,
+                    'innov_window': final_innov_window,
+                    'anomaly_buffer': updated_anomaly_buffer,
+                    'buffer_index': updated_buffer_index,
+                }
                 t_last = tf.shape(ukf_params["q_base"])[1] - 1
 
                 q_base_final = tf.gather(ukf_params["q_base"], t_last, axis=1)                 # [B,1]
@@ -3457,7 +3507,7 @@ class LSTMIMMUKF(tf.Module):
                 scale_reg = ratio_reg + l2_reg   # или scale_reg = scale_reg1 + ratio_reg + l2_reg
 
                 # ✅ ИСПРАВЛЕНО: Добавляем все компоненты потерь здесь, где loss уже определен
-                loss = loss + regime_loss + scale_reg + width_loss
+                loss = loss + regime_loss + scale_reg
 
                 # ✅ ПУНКТ 7: L2-регуляризация для max_width_factors_logits
                 # Предотвращает переобучение параметров ширины ДИ (Train width_ratio ~3.4x vs Val ~2.4x)
@@ -3750,6 +3800,7 @@ class LSTMIMMUKF(tf.Module):
                 final_volatility,
                 entropy_stats,
                 normalized_innovations,
+                state_dict   # ← новый элемент
             )
 
     def _explicit_predict_next_step(self, final_state, final_covariance, current_volatility,
@@ -3781,7 +3832,7 @@ class LSTMIMMUKF(tf.Module):
         inf_factor = tf.squeeze(inf_factor)
         # гарантируем строго [B]
         inf_factor = tf.reshape(inf_factor, [batch_size])
-        inf_factor = tf.clip_by_value(inf_factor, 0.9, 1.2)
+        inf_factor = tf.clip_by_value(inf_factor, 0.5, 3.0)  # ← Было [0.9, 1.2]
 
         # Вычисление Q с инфляцией (q_val тоже строго [B])
         q_val = q_base_final * (1.0 + q_sensitivity_final * current_vol_scalar)
@@ -3974,8 +4025,9 @@ class LSTMIMMUKF(tf.Module):
 
     @tf.function
     def val_step(self, X_batch, y_for_filtering_batch, y_target_batch,
-                 regime_labels_batch=None,  # ← СДЕЛАНО ОПЦИОНАЛЬНЫМ
-                 initial_state=None, initial_covariance=None):
+                 regime_labels_batch=None,
+                 initial_state=None, initial_covariance=None,
+                 initial_state_dict=None):
         """
         Шаг валидации для адаптивной UKF с контекстной волатильностью.
 
@@ -3987,6 +4039,41 @@ class LSTMIMMUKF(tf.Module):
         - Нет модификации состояния модели во время валидации
         """
         B = tf.shape(X_batch)[0]
+
+        # --- Обработка состояния из словаря ---
+        if initial_state_dict is not None:
+            initial_state = initial_state_dict['state']
+            initial_covariance = initial_state_dict['cov']
+            initial_volatility = initial_state_dict['volatility']
+            inflation_factor_input = initial_state_dict['inflation_factor']
+            remaining_steps_input = initial_state_dict['remaining_steps']
+            high_inflation_steps_input = initial_state_dict['high_inflation_steps']
+            last_anomaly_time_input = initial_state_dict['last_anomaly_time']
+            innov_window_input = initial_state_dict['innov_window']
+            anomaly_buffer_input = initial_state_dict['anomaly_buffer']
+            buffer_index_input = initial_state_dict['buffer_index']
+        else:
+            # Инициализация из данных (как в текущей логике)
+            base_value = y_for_filtering_batch[:, 0]
+            initial_state = tf.reshape(base_value, [B, self.state_dim])
+            window_std = tf.math.reduce_std(y_for_filtering_batch[:, :10], axis=1)
+            initial_variance = tf.maximum(window_std ** 2, 0.01)
+            initial_covariance = tf.reshape(initial_variance, [B, self.state_dim, self.state_dim])
+            initial_volatility = window_std
+            inflation_factor_input = tf.ones([B], dtype=tf.float32)
+            remaining_steps_input = tf.zeros([B], dtype=tf.int32)
+            high_inflation_steps_input = tf.zeros([B], dtype=tf.int32)
+            last_anomaly_time_input = tf.fill([B], tf.constant(-100, dtype=tf.int32))
+            innov_window_input = tf.zeros([B, self.innov_window_size], dtype=tf.float32)
+            anomaly_buffer_input = tf.zeros([self.anomaly_buffer_size], dtype=tf.float32)
+            buffer_index_input = tf.constant(0, dtype=tf.int32)
+
+        inflation_state_input = {
+            "factor": inflation_factor_input,
+            "remaining_steps": remaining_steps_input,
+            "last_anomaly_time": last_anomaly_time_input,
+            "high_inflation_steps": high_inflation_steps_input
+        }
 
         with tf.device(self.device):
             # 1) LSTM forward pass (training=False для валидации)
@@ -4022,22 +4109,35 @@ class LSTMIMMUKF(tf.Module):
                 student_t_config,
                 initial_state,
                 initial_covariance,
-                initial_innov_window=None,            # ← добавлен
-                anomaly_buffer_input=None,
-                buffer_index_input=None
+                inflation_state_input=inflation_state_input,
+                initial_volatility=initial_volatility,
+                initial_innov_window=innov_window_input,
+                anomaly_buffer_input=anomaly_buffer_input,
+                buffer_index_input=buffer_index_input
             )
 
-            # Распаковка результатов
-            x_filtered = results[0]                # [B, T, 1]
-            innovations = results[1]               # [B, T, 1]
-            volatility_levels = results[2]         # [B, T, 1]
-            inflation_factors = results[3]         # [B, T, 1]
-            final_state = results[4]               # [B, 1]
-            final_covariance = results[5]          # [B, 1, 1]
-            correction_adaptive_hist = results[6]  # [B, T, 1]
+            # Распаковка всех 14 результатов
+            (x_filtered, innovations, volatility_levels, inflation_factors,
+             final_state, final_covariance, correction_adaptive_hist,
+             updated_anomaly_buffer, updated_buffer_index,
+             final_inflation_factor, final_remaining_steps, final_last_anom_time,
+             final_innov_window, final_high_inflation_steps) = results
 
             # Финальная волатильность
             final_volatility = tf.reshape(volatility_levels[:, -1, :], [-1])  # [B]
+
+            state_dict = {
+                'state': final_state,
+                'cov': final_covariance,
+                'volatility': final_volatility,
+                'inflation_factor': final_inflation_factor,
+                'remaining_steps': final_remaining_steps,
+                'high_inflation_steps': final_high_inflation_steps,
+                'last_anomaly_time': final_last_anom_time,
+                'innov_window': final_innov_window,
+                'anomaly_buffer': updated_anomaly_buffer,
+                'buffer_index': updated_buffer_index,
+            }
 
             # 5) Явный predict на следующий шаг
             t_last = tf.shape(ukf_params['q_base'])[1] - 1
@@ -4141,8 +4241,8 @@ class LSTMIMMUKF(tf.Module):
                     regime_info=regime_info  # ← ДОБАВЛЕНО
                 )
 
-            scale = tf.stop_gradient(mse_loss_for_normalization / (raw_calibration_loss + 1e-8))
-            calibration_loss_normalized = raw_calibration_loss * scale
+            base_calibration_weight = 0.3  # Фиксированный вес
+            calibration_loss_normalized = raw_calibration_loss * base_calibration_weight
 
             # На валидации делаем фиксированный вес (для отчёта и консистентности)
             # Используем ТОТ ЖЕ warmup как в train_step для согласованности
@@ -4274,7 +4374,8 @@ class LSTMIMMUKF(tf.Module):
             std_dev,
             ci_min,
             ci_max,
-            target_coverage
+            target_coverage,
+            state_dict   # ← новый элемент
         )
 
     def get_lr_scheduler(self, epoch, totalepochs=50, warmupepochs=8, baselr=1e-4, minlr=1e-5, warmup_type='exponential', gamma=2.0):
@@ -4734,28 +4835,23 @@ class LSTMIMMUKF(tf.Module):
                 # ДОБАВЛЕНО: сбор всех нормализованных инноваций за эпоху
                 all_normalized_innov = []
 
+                state_dict = None  # состояние для текущей эпохи
                 for batch_idx, (X_batch, y_for_filtering_batch, y_target_batch, regime_labels_batch) in enumerate(train_ds):
-                    batch_size = tf.shape(X_batch)[0]
-                    current_state_size = tf.shape(self._last_state)[0]
-
-                    # Всегда инициализируем состояние из данных текущего батча
-                    def initialize_from_data():
-                        base_value = y_for_filtering_batch[:, 0]
-                        initial_state = tf.reshape(base_value, [batch_size, self.state_dim])
-                        window_std = tf.math.reduce_std(y_for_filtering_batch[:, :10], axis=1)
-                        initial_variance = tf.maximum(window_std ** 2, 0.01)
-                        initial_covariance = tf.reshape(initial_variance, [batch_size, self.state_dim, self.state_dim])
-                        return (initial_state, initial_covariance)
-
-                    initial_state, initial_covariance = initialize_from_data()
-
-                    # Шаг обучения
-                    results = self.train_step(
-                        X_batch, y_for_filtering_batch, y_target_batch, regime_labels_batch,
-                        initial_state, initial_covariance
-                    )
-                    loss, metrics, final_state, final_covariance, forecast, std_devs, volatility_levels, \
-                    regime_info, vol_final, entropy_stats, batch_normalized_innov = results
+                    if state_dict is None:
+                        # Первый батч эпохи – инициализация из данных
+                        results = self.train_step(
+                            X_batch, y_for_filtering_batch, y_target_batch, regime_labels_batch
+                        )
+                    else:
+                        # Последующие батчи – передаём сохранённое состояние
+                        results = self.train_step(
+                            X_batch, y_for_filtering_batch, y_target_batch, regime_labels_batch,
+                            initial_state_dict=state_dict
+                        )
+                    # Распаковываем 12 возвращаемых значений (добавился state_dict)
+                    (loss, metrics, final_state, final_covariance, forecast, std_devs,
+                     volatility_levels, regime_info, vol_final, entropy_stats,
+                     batch_normalized_innov, state_dict) = results
 
                     # 🔴 ДОБАВИТЬ ЭТОТ БЛОК — ЛОГ ПО КАЖДОМУ БАТЧУ
                     def _log_batch_loss():
@@ -4838,26 +4934,29 @@ class LSTMIMMUKF(tf.Module):
                 self.all_val_covered = []
                 val_volatility_levels = []
                 val_metrics = []  # Список для хранения всех метрик по шагам валидации
+                val_state_dict = None
                 for batch_idx, (X_val_batch, y_val_for_filtering_batch, y_val_target_batch, regime_labels_batch) in enumerate(val_ds):
-                    B_val = tf.shape(X_val_batch)[0]
+                    # Получаем размер текущего батча
+                    current_batch_size = tf.shape(X_val_batch)[0]
 
-                    # === ФУНКЦИИ ДЛЯ ВЫБОРА СОСТОЯНИЯ ДЛЯ ВАЛИДАЦИИ ===
-                    def initialize_val_from_data():
-                        base_value = y_val_for_filtering_batch[:, 0]
-                        initial_state = tf.reshape(base_value, [B_val, self.state_dim])
-                        initial_variance = tf.math.reduce_variance(y_val_for_filtering_batch, axis=1) + 1e-6
-                        initial_covariance = tf.reshape(initial_variance, [B_val, self.state_dim, self.state_dim])
-                        initial_covariance = tf.maximum(initial_covariance, 1e-8)
-                        return initial_state, initial_covariance
+                    # Если размер батча изменился, сбрасываем состояние (начинаем новую последовательность)
+                    if val_state_dict is not None and current_batch_size != val_state_dict['state'].shape[0]:
+                        val_state_dict = None
 
-                    initial_state_val, initial_covariance_val = initialize_val_from_data()
+                    if val_state_dict is None:
+                        results_val = self.val_step(
+                            X_val_batch, y_val_for_filtering_batch, y_val_target_batch, regime_labels_batch
+                        )
+                    else:
+                        results_val = self.val_step(
+                            X_val_batch, y_val_for_filtering_batch, y_val_target_batch, regime_labels_batch,
+                            initial_state_dict=val_state_dict
+                        )
 
-                    # Шаг валидации
-                    results_val = self.val_step(
-                        X_val_batch, y_val_for_filtering_batch, y_val_target_batch, regime_labels_batch,
-                        initial_state_val, initial_covariance_val
-                    )
-                    val_loss, metrics_val, final_state_val, final_covariance_val, forecast_val, std_devs_val, ci_lower_val, ci_upper_val, target_coverage_val = results_val
+                    # Распаковываем 10 значений (добавился state_dict)
+                    (val_loss, metrics_val, final_state_val, final_covariance_val,
+                     forecast_val, std_devs_val, ci_lower_val, ci_upper_val,
+                     target_coverage_val, val_state_dict) = results_val
 
                     # Сохраняем прогнозы и ДИ для диагностики
                     if not hasattr(self, 'all_forecasts'):
