@@ -2813,7 +2813,7 @@ class LSTMIMMUKF(tf.Module):
     
         return raw_calibration_loss, actual_coverage, width_ratio, target_width_ratio, width_error
 
-    @tf.function(jit_compile=False)
+    # @tf.function(jit_compile=False)
     def _calibrate_confidence_interval(
         self,
         forecast: tf.Tensor,
