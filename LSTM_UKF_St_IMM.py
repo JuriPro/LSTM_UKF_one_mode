@@ -3210,7 +3210,7 @@ class LSTMIMMUKF(tf.Module):
                 target_coverage_mean = tf.reduce_mean(target_coverage)
                 
                 # 7) CALIBRATE CI ✅ soft_weights передан
-                ci_lower, ci_upper, _, _ = self._calibrate_confidence_interval(  # ← Игнорировать 4-е значение
+                ci_lower, ci_upper, _, width_penalty = self._calibrate_confidence_interval(
                     forecast, std_dev, final_volatility, student_t_config,
                     innovations=innovations[:, -10:, :],
                     regime_assignment=regime_assignment,
@@ -3299,7 +3299,7 @@ class LSTMIMMUKF(tf.Module):
                     l2_width_reg = 1e-4 * tf.reduce_sum(tf.square(self.max_width_factors_logits))
                 
                 # ✅ Все компоненты потерь добавляются здесь
-                loss = loss + regime_loss + scale_reg + l2_width_reg
+                loss = loss + regime_loss + scale_reg + l2_width_reg+ 0.1 * width_penalty
                 
                 # 10) TRAINABLE VARS
                 trainable_vars = []
@@ -4393,9 +4393,9 @@ class LSTMIMMUKF(tf.Module):
                 # ДОБАВЛЕНО: сбор всех нормализованных инноваций за эпоху
                 all_normalized_innov = []
 
-                state_dict = None  # состояние для текущей эпохи
                 # СБРОС state_dict в начале каждой эпохи
                 state_dict = None
+
                 for batch_idx, (X_batch, y_for_filtering_batch, y_target_batch, regime_labels_batch) in enumerate(train_ds):
                     if state_dict is None:
                         # Первый батч эпохи – инициализация из данных
