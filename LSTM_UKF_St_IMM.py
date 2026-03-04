@@ -822,7 +822,8 @@ class LSTMIMMUKF(tf.Module):
             print(f"✅ _last_volatility: shape={self._last_volatility.shape} (инициализировано 0.1)")
 
             # Q ceiling used consistently in both explicit one-step prediction and UKF filtering
-            self.Q_max_pred = tf.constant(5.0, dtype=tf.float32)   # старт для теста (потом 0.3/1.0)
+            # ✅ ИСПРАВЛЕНО: значение согласовано с комментарием (было 5.0, должно быть 1.0)
+            self.Q_max_pred = tf.Variable(1.0, dtype=tf.float32, trainable=True, name='Q_max_pred')
 
             # === ДОБАВЛЕНО: ПАРАМЕТРЫ МАКСИМАЛЬНОЙ ШИРИНЫ ДОВЕРИТЕЛЬНОГО ИНТЕРВАЛА ПО РЕЖИМАМ ===
             self.max_width_factors_logits = tf.Variable(
@@ -966,14 +967,19 @@ class LSTMIMMUKF(tf.Module):
             name="prev_val_coverage"
         )
 
-        # === ДОБАВЛЕНО: инициализация _step_counter для отслеживания шагов обучения ===
+        # Инициализация _step_counter
         self._step_counter = tf.Variable(0, trainable=False, dtype=tf.int64, name="step_counter")
+
+        # Инициализация _train_coverage_ema
+        self._train_coverage_ema = tf.Variable(
+            0.89, trainable=False, dtype=tf.float32, name='train_coverage_ema'
+        )
 
         # ✅ ИСПРАВЛЕНО: добавить constraint для предотвращения неограниченного роста
         self.regime_calibration_weights = tf.Variable(
             initial_value=tf.constant([2.0, 3.0, 5.0], dtype=tf.float32),
             trainable=True,
-            constraint=tf.keras.constraints.UnitNorm(axis=0),  # ← ДОБАВЛЕНО
+            constraint=tf.keras.constraints.NonNeg(),  # ← Только неотрицательность
             name='regime_calibration_weights'
         )
 
@@ -1734,9 +1740,9 @@ class LSTMIMMUKF(tf.Module):
 
         # ✅ СНИЖЕНО пороговое значение сброса с 5.0 до 2.0
         inflation_factor = tf.where(
-        reset_mask,
-        tf.ones_like(inflation_factor) * 2.0,  # БЫЛО 5.0, СТАЛО 2.0
-        inflation_factor
+            reset_mask,
+            inflation_factor * 0.5,  # Уменьшить на 50%, не сбрасывать полностью
+            inflation_factor
         )  # [B]
 
         # ✅ Обновление счетчика: сброс на 0 при сбросе инфляции, иначе инкремент
@@ -2539,6 +2545,9 @@ class LSTMIMMUKF(tf.Module):
                     selector_reg = selector_reg + tf.constant(0.001, tf.float32) * tf.reduce_sum(
                         tf.square(self.regime_selector.center_logits)
                     )
+            # ✅ ДОБАВЛЕНО: штраф за близость центров режимов
+            separation_loss = self.regime_selector.get_center_separation_loss()
+            selector_reg = selector_reg + 0.05 * separation_loss
 
         # 5) Entropy penalty по режимам — ГИБРИДНЫЙ ПОДХОД v2 (ИСПРАВЛЕНО)
         entropy_penalty = tf.constant(0.0, dtype=tf.float32)
@@ -2560,14 +2569,19 @@ class LSTMIMMUKF(tf.Module):
             entropy_penalty = tf.constant(2.0, tf.float32) * tf.square(entropy_deviation)
 
         # 6) Total loss (упрощённый)
+        if hasattr(self, 'entropy_regularizer') and self.entropy_regularizer is not None:
+            entropy_loss_val = self.lambda_entropy * entropy_loss
+        else:
+            entropy_loss_val = tf.constant(0.0, dtype=tf.float32)
+        
         total_loss = (
             mse_loss +
             calibration_loss +
-            0.05 * stability_penalty +          # оставили
-            0.01 * spectral_reg +               # оставили (малый вес)
-            selector_reg +                      # режимы
-            entropy_penalty +                   # главный регуляризатор (15.0)
-            (self.lambda_entropy * entropy_loss)  # LSTM энтропия
+            0.05 * stability_penalty +
+            0.01 * spectral_reg +
+            selector_reg +
+            entropy_penalty +
+            entropy_loss_val
         )
 
         # Safety NaN/Inf
@@ -2577,78 +2591,29 @@ class LSTMIMMUKF(tf.Module):
         return total_loss
 
     def compute_target_coverage(self, volatility_level: tf.Tensor) -> tf.Tensor:
-        """
-        Единая точка вычисления целевого покрытия для ВСЕХ режимов работы.
-        Комбинирует:
-          - глобальную адаптацию по непрерывной волатильности
-          - обучаемые цели покрытия для каждого режима (LOW/MID/HIGH)
-        """
-        # --- 1) Базовая цель по уровню волатильности ---
-        base_confidence = 0.88 # ← ОДИНАКОВО для train/val
-        confidence_range = 0.10
-        confidence_ceil = base_confidence + confidence_range / 2.0  # ~0.89 (train), ~0.89 (val)
-        confidence_floor = base_confidence - confidence_range / 2.0  # ~0.79 (train), ~0.79 (val)
-
-        v_clipped = tf.clip_by_value(volatility_level, 0.0, 1.0)
-        target_coverage_base = confidence_ceil - (confidence_ceil - confidence_floor) * v_clipped
-
-        # --- 2) Получаем принадлежность к режимам ---
+        """Единая точка вычисления целевого покрытия — делегирует get_target_coverage"""
         regime_info = self.regime_selector.assign_soft_regimes(volatility_level)
-        soft_weights = regime_info["soft_weights"]  # [B, K]
-
-        # --- 3) Обучаемые цели покрытия для каждого режима ---
-        # Конвертируем логиты в вероятности, но используем как коэффициенты смещения
-        cov_probs = tf.nn.softmax(self.target_cov_logits)  # [3]
-
-        # Преобразуем обратно в вероятности покрытия: p = sigmoid(logit), но проще использовать напрямую
-        # Линейная комбинация: p_k = 0.7 + 0.25 * sigmoid(z_k), где z_k ~ N(0,1)
-        target_cov_values = confidence_floor + (confidence_ceil - confidence_floor) * tf.sigmoid(self.target_cov_logits)
-
-        # --- 4) Взвешенная цель по режимам ---
-        target_coverage_mode = tf.reduce_sum(
-            soft_weights * target_cov_values[tf.newaxis, :],  # [1, 3]
-            axis=1
-        )  # [B]
-
-        # - 5) Смесь двух стратегий с обучаемым коэффициентом -
-        # Moved initialization of coverage_mixing_alpha to __init__ to avoid creating variables inside tf.function
-        # Преобразуем логит в значение [0,1] через sigmoid
-        alpha = tf.sigmoid(self.coverage_mixing_alpha)
-        target_coverage = (alpha * target_coverage_mode + (1 - alpha) * target_coverage_base)
-
-        return tf.clip_by_value(target_coverage, confidence_floor, confidence_ceil)
-
+        return self.get_target_coverage(volatility_level, regime_info['soft_weights'])
+    
     def get_target_coverage(self, volatility_level, regime_soft_weights=None):
         """
-        Единый метод для вычисления целевого покрытия, используемый как в калибровке CI,
-        так и в per-regime потерях. Заменяет compute_target_coverage для обеспечения
-        согласованности целей покрытия в разных частях системы.
-
-        Args:
-            volatility_level: [B] - уровень волатильности для каждого элемента батча
-            regime_soft_weights: [B, num_regimes] - мягкие веса принадлежности к режимам
-
-        Returns:
-            target_coverage: [B] - целевое покрытие для каждого элемента батча
+        Единый метод для вычисления целевого покрытия.
         """
-        # базовая цель от волатильности (совпадает с compute_target_coverage)
         base_confidence = 0.88
         confidence_range = 0.10
         confidence_ceil = base_confidence + confidence_range / 2.0
         confidence_floor = base_confidence - confidence_range / 2.0
         v_clipped = tf.clip_by_value(volatility_level, 0.0, 1.0)
         target_base = confidence_ceil - (confidence_ceil - confidence_floor) * v_clipped
-
+        
         if regime_soft_weights is not None:
-            # режимные поправки (обучаемые) – те же, что и в compute_target_coverage
             target_cov_values = confidence_floor + (confidence_ceil - confidence_floor) * tf.sigmoid(self.target_cov_logits)
             target_mode = tf.reduce_sum(regime_soft_weights * target_cov_values[tf.newaxis, :], axis=1)
-            # смешиваем с базовой целью (тот же alpha, что и в compute_target_coverage)
             alpha = tf.sigmoid(self.coverage_mixing_alpha)
             target = alpha * target_mode + (1 - alpha) * target_base
         else:
             target = target_base
-
+        
         return tf.clip_by_value(target, confidence_floor, confidence_ceil)
 
     def _get_calibration_params(self, volatility_level, student_t_config=None, correction_adaptive=None, training=False, regime_info=None):
@@ -2805,18 +2770,17 @@ class LSTMIMMUKF(tf.Module):
         # ════════════════════════════════════════════════════════════════
         # === 7) PER-REGIME CALIBRATION LOSS (ВЕКТОРИЗОВАНО) ===
         # ════════════════════════════════════════════════════════════════
+        
         regime_coverage_loss = tf.constant(0.0, dtype=tf.float32)
         
         if regime_info is not None and 'soft_weights' in regime_info:
             soft_weights_full = regime_info['soft_weights']             # [B, T, K] или [B, K]
-            
-            # ✅ Приводим к [B, T, K] если нужно
-            soft_weights_rank = tf.rank(soft_weights_full)
-            soft_weights_full = tf.cond(
-                tf.equal(soft_weights_rank, 2),
-                lambda: tf.expand_dims(soft_weights_full, axis=1),      # [B, 1, K] → [B, T, K]
-                lambda: soft_weights_full                                # [B, T, K]
-            )
+            # ✅ Явное приведение формы без tf.cond с lambda
+            soft_weights_shape = tf.shape(soft_weights_full)
+            if len(soft_weights_shape) == 2:
+                # [B, K] → [B, 1, K]
+                soft_weights_full = tf.expand_dims(soft_weights_full, axis=1)
+            # Теперь всегда [B, T, K]
             
             # ✅ Взвешенное покрытие по режимам для ВСЕХ timestep
             covered_expanded = tf.expand_dims(covered_reshaped, axis=-1)  # [B, T, 1]
@@ -3085,13 +3049,12 @@ class LSTMIMMUKF(tf.Module):
 
     @tf.function(jit_compile=False)
     def train_step(
-        self, 
-        X_batch, 
-        y_for_filtering_batch, 
-        y_target_batch, 
-        regime_labels_batch=None,
-        initial_state=None, 
-        initial_covariance=None, 
+        self,
+        X_batch,
+        y_for_filtering_batch,
+        y_target_batch,
+        initial_state=None,
+        initial_covariance=None,
         initial_state_dict=None
     ):
         """
@@ -3180,16 +3143,16 @@ class LSTMIMMUKF(tf.Module):
                 final_volatility = tf.reshape(volatility_levels[:, -1, :], [-1])
 
                 state_dict = {
-                    'state': tf.stop_gradient(final_state),
-                    'cov': tf.stop_gradient(final_covariance),
-                    'volatility': tf.stop_gradient(final_volatility),
-                    'inflation_factor': tf.stop_gradient(final_inflation_factor),
-                    'remaining_steps': tf.stop_gradient(final_remaining_steps),
-                    'high_inflation_steps': tf.stop_gradient(final_high_inflation_steps),
-                    'last_anomaly_time': tf.stop_gradient(final_last_anom_time),
-                    'innov_window': tf.stop_gradient(final_innov_window),
-                    'anomaly_buffer': tf.stop_gradient(updated_anomaly_buffer),
-                    'buffer_index': tf.stop_gradient(updated_buffer_index),
+                    'state': final_state,
+                    'cov': final_covariance,
+                    'volatility': final_volatility,
+                    'inflation_factor': final_inflation_factor,
+                    'remaining_steps': final_remaining_steps,
+                    'high_inflation_steps': final_high_inflation_steps,
+                    'last_anomaly_time': final_last_anom_time,
+                    'innov_window': final_innov_window,
+                    'anomaly_buffer': updated_anomaly_buffer,
+                    'buffer_index': updated_buffer_index,
                 }
                 
                 t_last = tf.shape(ukf_params["q_base"])[1] - 1
@@ -3286,44 +3249,27 @@ class LSTMIMMUKF(tf.Module):
                 wprog = tf.cast(self._step_counter, tf.float32) / width_warmup_steps
                 wprog = tf.clip_by_value(wprog, 0.0, 1.0)
                 lambda_width_base = tf.constant(0.25, tf.float32)
-                lambda_width = lambda_width_base * (1.0 - tf.exp(-5.0 * wprog))
-
-                high_regime_penalty_loss = tf.constant(0.0, dtype=tf.float32)
-                if regime_assignment is not None:
-                    is_high_regime = tf.cast(tf.equal(regime_assignment, 2), tf.float32)
-                    wide_high_penalty = is_high_regime * tf.nn.relu(width_ratio - 4.0)
-                    narrow_threshold_high = 0.7
-                    narrow_high_penalty = is_high_regime * tf.nn.relu(narrow_threshold_high - width_ratio) * 2.0
-                    high_width_penalty = wide_high_penalty + narrow_high_penalty
-                    high_regime_penalty_loss = 0.1 * high_width_penalty
-
-                # ✅ Только high_regime_penalty, width_error уже в raw_calibration_loss
-                width_loss = high_regime_penalty_loss  
-                
+               
                 # Calibration loss clipping
                 # ✅ ИСПРАВЛЕНО: soft minimum для избежания точек nondifferentiability
                 def soft_minimum(x, threshold, temperature=0.1):
                     return threshold - tf.nn.softplus((threshold - x) / temperature) * temperature
                 
                 # Calibration loss clipping
-                calibration_loss_normalized = raw_calibration_loss
                 max_calib_weight = 0.5 * mse_loss_for_normalization
-                x = current_weight * calibration_loss_normalized
+                x = current_weight * raw_calibration_loss
                 calibration_loss_clipped = soft_minimum(x, max_calib_weight, temperature=0.05)
                 
                 # Train/val gap penalty — ✅ ИСПРАВЛЕНО: используем EMA от train coverage
                 gap_penalty = tf.constant(0.0, tf.float32)
                 train_val_gap = tf.constant(0.0, tf.float32)
                 
-                # ✅ Используем EMA от train coverage вместо val
-                if not hasattr(self, '_train_coverage_ema'):
-                    self._train_coverage_ema = tf.Variable(0.89, trainable=False, dtype=tf.float32)
-                
+                # ✅ Используем EMA от train coverage вместо val (переменная инициализирована в __init__)
                 train_coverage_ema = 0.9 * self._train_coverage_ema + 0.1 * actual_coverage
                 self._train_coverage_ema.assign(train_coverage_ema)
-                
                 train_val_gap = tf.abs(actual_coverage - train_coverage_ema)
                 gap_penalty = tf.constant(0.1, tf.float32) * tf.square(train_val_gap)
+                
                 calibration_loss_clipped = calibration_loss_clipped + gap_penalty
                 
                 # 9) TOTAL LOSS
@@ -3353,7 +3299,7 @@ class LSTMIMMUKF(tf.Module):
                     l2_width_reg = 1e-4 * tf.reduce_sum(tf.square(self.max_width_factors_logits))
                 
                 # ✅ Все компоненты потерь добавляются здесь
-                loss = loss + regime_loss + scale_reg + l2_width_reg + width_loss  # ← ✅ ДОБАВЛЕНО: + width_loss
+                loss = loss + regime_loss + scale_reg + l2_width_reg
                 
                 # 10) TRAINABLE VARS
                 trainable_vars = []
@@ -3401,8 +3347,6 @@ class LSTMIMMUKF(tf.Module):
                         bias_pairs.append((grad, var))
                     else:
                         main_pairs.append((grad, var))
-                
-                global_norm = tf.constant(0.0, dtype=tf.float32)
                 
                 if main_pairs:
                     main_grads, main_vars_filtered = zip(*main_pairs)
@@ -3462,42 +3406,50 @@ class LSTMIMMUKF(tf.Module):
                 r_current = tf.reduce_mean(tf.gather(ukf_params["r_base"], t_last, axis=1))
                 qr_ratio = q_current / (r_current + 1e-8)
                 avg_inflation = tf.reduce_mean(inflation_factors[:, -1, :])
-                inflation_anomaly_ratio = tf.constant(0.0, tf.float32)
+                
+                # ✅ ИСПРАВЛЕНО: вычисляем inflation_anomaly_ratio
+                inflation_anomaly_ratio = tf.reduce_mean(
+                tf.cast(final_inflation_factor > 2.0, tf.float32)
+                )
+                
                 spectrum_info = self.diff_ukf_component.get_spectrum_info()
                 min_eigenvalue = spectrum_info["min_eigenvalue"]
                 
+                # ✅ ИСПРАВЛЕНО: global_norm из clip_by_global_norm
+                global_norm = main_global_norm  # из предыдущего блока
+                
                 metrics = {
-                    "total_loss": tf.reduce_mean(loss),
-                    "mse_loss": tf.reduce_mean(mse_loss),
-                    "entropy_loss": tf.reduce_mean(entropy_loss) if entropy_loss.shape.rank > 0 else entropy_loss,
-                    "avg_volatility": tf.reduce_mean(avg_volatility),
-                    "avg_inflation": tf.reduce_mean(avg_inflation),
-                    "global_norm": tf.reduce_mean(global_norm) if hasattr(global_norm, 'shape') and global_norm.shape.rank > 0 else global_norm,
-                    "qr_ratio": tf.reduce_mean(qr_ratio),
-                    "q_value": tf.reduce_mean(q_current),
-                    "r_value": tf.reduce_mean(r_current),
-                    "regime_low_weight": regime_soft_weights[0],
-                    "regime_mid_weight": regime_soft_weights[1],
-                    "regime_high_weight": regime_soft_weights[2],
-                    "regime_entropy": tf.reduce_mean(regime_entropy),
-                    "inflation_anomaly_ratio": tf.reduce_mean(inflation_anomaly_ratio),
-                    "ukf_min_eigenvalue": tf.reduce_mean(min_eigenvalue),
-                    "coverage_ratio": tf.reduce_mean(actual_coverage),
-                    "train_val_coverage_gap": tf.reduce_mean(train_val_gap),
-                    "gap_penalty": tf.reduce_mean(gap_penalty),
-                    "target_coverage": tf.reduce_mean(target_coverage_mean),
-                    "ci_width_vs_stddev": tf.reduce_mean(width_ratio),
-                    "calibration_error": tf.reduce_mean(tf.abs(actual_coverage - target_coverage_mean)),
-                    "calib_weight": tf.reduce_mean(current_weight),
-                    "calib_clipped": tf.reduce_mean(calibration_loss_clipped),
-                    "calib_raw": tf.reduce_mean(raw_calibration_loss),
-                    "calib_norm": tf.reduce_mean(calibration_loss_normalized),
-                    "target_width_ratio": tf.reduce_mean(target_width_ratio),
-                    "width_error": tf.reduce_mean(width_error),
-                    "width_loss": tf.reduce_mean(width_loss),
-                    "lambda_width": tf.reduce_mean(lambda_width),
-                    "width_loss_base": tf.constant(0.0),
-                    "width_loss_high_regime": tf.reduce_mean(high_regime_penalty_loss),
+                "total_loss": tf.reduce_mean(loss),
+                "mse_loss": tf.reduce_mean(mse_loss),
+                "entropy_loss": tf.reduce_mean(entropy_loss) if entropy_loss.shape.rank > 0 else entropy_loss,
+                "avg_volatility": tf.reduce_mean(avg_volatility),
+                "avg_inflation": tf.reduce_mean(avg_inflation),
+                "global_norm": global_norm,  # ← ИСПРАВЛЕНО
+                "qr_ratio": tf.reduce_mean(qr_ratio),
+                "q_value": tf.reduce_mean(q_current),
+                "r_value": tf.reduce_mean(r_current),
+                "regime_low_weight": regime_soft_weights[0],
+                "regime_mid_weight": regime_soft_weights[1],
+                "regime_high_weight": regime_soft_weights[2],
+                "regime_entropy": tf.reduce_mean(regime_entropy),
+                "inflation_anomaly_ratio": inflation_anomaly_ratio,  # ← ИСПРАВЛЕНО
+                "ukf_min_eigenvalue": tf.reduce_mean(min_eigenvalue),
+                "coverage_ratio": tf.reduce_mean(actual_coverage),
+                "train_val_coverage_gap": tf.reduce_mean(train_val_gap),
+                "gap_penalty": tf.reduce_mean(gap_penalty),
+                "target_coverage": tf.reduce_mean(target_coverage_mean),
+                "ci_width_vs_stddev": tf.reduce_mean(width_ratio),
+                "calibration_error": tf.reduce_mean(tf.abs(actual_coverage - target_coverage_mean)),
+                "calib_weight": tf.reduce_mean(current_weight),
+                "calib_clipped": tf.reduce_mean(calibration_loss_clipped),
+                "calib_raw": tf.reduce_mean(raw_calibration_loss),
+                "calib_norm": tf.reduce_mean(raw_calibration_loss),  # ← ИСПРАВЛЕНО (алиас)
+                "target_width_ratio": tf.reduce_mean(target_width_ratio),
+                "width_error": tf.reduce_mean(width_error),
+                "width_loss": tf.constant(0.0),  # ← ИСПРАВЛЕНО (удалён)
+                "lambda_width": tf.constant(0.0),  # ← ИСПРАВЛЕНО (не используется)
+                "width_loss_base": tf.constant(0.0),
+                "width_loss_high_regime": tf.constant(0.0),  # ← ИСПРАВЛЕНО (удалён)
                 }
                 
                 entropy_stats = self.entropy_regularizer.get_entropy_stats(h_lstm2)
@@ -3883,9 +3835,9 @@ class LSTMIMMUKF(tf.Module):
             
             ci_lower, ci_upper, _, _ = self._calibrate_confidence_interval(
                 forecast, std_dev, final_volatility, student_t_config,
-                innovations=innovations[:, -10:, :] if innovations is not None else None,
+                innovations=innovations[:, -10:, :],
                 regime_assignment=regime_info.get("regime_assignment", None),
-                soft_weights=regime_info['soft_weights']  # ← КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ
+                soft_weights=regime_info['soft_weights']
             )
             ci_min = tf.minimum(ci_lower, ci_upper)
             ci_max = tf.maximum(ci_lower, ci_upper)
@@ -3903,12 +3855,17 @@ class LSTMIMMUKF(tf.Module):
             
             base_calibration_weight = 0.7
             warmup_steps = 400
-            progress = tf.cast(self._step_counter, tf.float32) / tf.cast(warmup_steps, tf.float32)
+            progress = tf.cast(self._step_counter, tf.float32) / tf.cast(warmup_steps, tf.float32)  # ← ИСПРАВЛЕНО
             progress = tf.clip_by_value(progress, 0.0, 1.0)
             current_weight = base_calibration_weight * (1.0 - tf.exp(-2.0 * progress))
             
+            def soft_minimum(x, threshold, temperature=0.1):
+                return threshold - tf.nn.softplus((threshold - x) / temperature) * temperature
+            
+            # используем soft_minimum для дифференцируемости
             max_calib_weight = 0.5 * mse_loss_for_normalization
-            calibration_loss_clipped = tf.minimum(current_weight * raw_calibration_loss, max_calib_weight)
+            x = current_weight * raw_calibration_loss
+            calibration_loss_clipped = soft_minimum(x, max_calib_weight, temperature=0.05)
             calibration_loss = calibration_loss_clipped
             
             # 8) Total loss
@@ -3933,7 +3890,6 @@ class LSTMIMMUKF(tf.Module):
             q_val = tf.reduce_mean(q_base_final)
             r_val = tf.reduce_mean(r_base_final)
             qr_ratio_val = q_val / (r_val + 1e-8)
-            inflation_anomaly_ratio = tf.constant(0.0, tf.float32)
             spectrum_info_val = self.diff_ukf_component.get_spectrum_info()
             min_eigenvalue_val = spectrum_info_val['min_eigenvalue']
             
@@ -3957,7 +3913,6 @@ class LSTMIMMUKF(tf.Module):
                 'regime_mid_weight': regime_soft_weights[1],
                 'regime_high_weight': regime_soft_weights[2],
                 'regime_entropy': tf.reduce_mean(regime_entropy),
-                'inflation_anomaly_ratio': inflation_anomaly_ratio,
                 'ukf_min_eigenvalue': tf.reduce_mean(min_eigenvalue_val),
                 'calib_weight': tf.reduce_mean(current_weight),
                 'calib_clipped': tf.reduce_mean(calibration_loss),
@@ -6320,6 +6275,7 @@ class LSTMIMMUKF(tf.Module):
 
         # === 3. СБРОС СОСТОЯНИЯ ДЛЯ ЧИСТОЙ ОЦЕНКИ ===
         self._state_initialized.assign(False)
+        self._reset_anomaly_detector_state()  # ✅ ДОБАВЛЕНО: сброс детектора аномалий
         print(f"🔄 Состояние фильтра сброшено перед оценкой (чистый старт)")
 
         # === 4. ИНИЦИАЛИЗАЦИЯ МАССИВОВ ===
