@@ -6253,10 +6253,7 @@ class LSTMIMMUKF(tf.Module):
                     level_t_true = features_gt.iloc[-1]['level']
 
                     # Масштабируем для точного сравнения
-                    if self.feature_scalers is not None and 'Y' in self.feature_scalers:
-                        level_t_true_scaled = self.feature_scalers['Y'].transform([[level_t_true]])[0, 0]
-                    else:
-                        level_t_true_scaled = level_t_true
+                    level_t_true_scaled = self.feature_scalers['Y'].transform([[level_t_true]])[0, 0]
 
                     # Сохранение результатов
                     timestamp = df.index[t] if hasattr(df.index, '__iter__') and len(df.index) > t else t
