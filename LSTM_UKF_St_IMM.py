@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 from Decomposition import get_emd_components
 from volatility import yang_zhang, rogers_satchell, hodges_tompkins, garman_klass, parkinson
 
+from feature_utils import FeatureConfig, compute_features, _process_window
+from joblib import Parallel, delayed
+
 # =================================================================
 # КЛАССЫ ДИФФЕРЕНЦИРУЕМОГО UKF
 # =================================================================
@@ -2013,6 +2016,17 @@ class LSTMIMMUKF(tf.Module):
                 tf.reshape(volatility_level, [B_batch, 1])  # ← volatility_level ∈ [0, 1]!
             )
 
+            tf.cond(
+                tf.logical_and(tf.equal(t, 0), tf.equal(self._step_counter % 10, 0)),
+                lambda: tf.print(
+                    "Q_t debug:",
+                    "Q_t:", tf.squeeze(Q_t),
+                    "R_t:", tf.squeeze(R_t),
+                    "vol_adaptive:", tf.squeeze(vol_adaptive)
+                ),
+                lambda: tf.no_op()
+            )            
+
             # ════════════════════════════════════════════════════════════════
             # ЭТАП 6: АДАПТИВНЫЕ ПАРАМЕТРЫ UKF
             # ════════════════════════════════════════════════════════════════
@@ -2336,6 +2350,18 @@ class LSTMIMMUKF(tf.Module):
                 asymmetry_neg   # [B, 1]
             )  # → x_upd: [B, 1], P_upd: [B, 1, 1], innov: [B, 1, 1]
 
+            tf.cond(
+                tf.logical_and(tf.equal(t, 0), tf.equal(self._step_counter % 10, 0)),
+                lambda: tf.print(
+                    "Update debug:",
+                    "x_upd:", tf.squeeze(x_upd),
+                    "P_upd:", tf.squeeze(P_upd),
+                    "innov:", tf.squeeze(innov),
+                    "K:", tf.squeeze(K)
+                ),
+                lambda: tf.no_op()
+            )
+            
             # ===== АДАПТИВНОЕ ОГРАНИЧЕНИЕ НА P_pred =====
             P_diag = tf.linalg.diag_part(P_pred)  # [B]
             # Используем адаптивное ограничение в зависимости от текущей волатильности
@@ -3550,6 +3576,19 @@ class LSTMIMMUKF(tf.Module):
             "Q_unclipped_mean": Q_unclipped_mean,
             "Q_unclipped_p95": Q_unclipped_p95,
         }
+
+        # DEBUG
+        if self.debug_mode and self._step_counter < 20:
+            tf.print("--- _explicit_predict_next_step ---")
+            tf.print("  final_state:", tf.squeeze(final_state))
+            tf.print("  final_covariance diag:", tf.squeeze(final_covariance))
+            tf.print("  q_val:", tf.reduce_mean(q_val))
+            tf.print("  inf_factor:", tf.reduce_mean(inf_factor))
+            tf.print("  Q_t:", tf.reduce_mean(Q_t))
+            tf.print("  relax_factor:", relax_factor)
+            tf.print("  x_pred:", tf.squeeze(x_pred))
+            tf.print("  forecast_value:", forecast_value)
+            tf.print("  std_dev_value:", std_dev_value)        
 
         return forecast_value, std_dev_value, pred_dbg
 
@@ -5904,6 +5943,14 @@ class LSTMIMMUKF(tf.Module):
             "high_inflation_steps": high_infl_val
         }
 
+        # DEBUG После получения lstm_outputs
+        if tf.reduce_any(tf.equal(self._step_counter, tf.range(5, dtype=tf.int64))):  # первые 5 шагов
+            tf.print("LSTM outputs stats:")
+            tf.print("  params mean:", tf.reduce_mean(params_output))
+            tf.print("  params std:", tf.math.reduce_std(params_output))
+            # Также можно посмотреть первые несколько значений params
+            tf.print("  params sample:", params_output[0, 0, :5])  # первые 5 параметров
+        
         results = self.adaptive_ukf_filter(
             X_scaled,
             y_level_batch,
@@ -6145,6 +6192,25 @@ class LSTMIMMUKF(tf.Module):
             last_innov_window=self._last_innov_window if hasattr(self, '_last_innov_window') else None
         )
 
+        # DEBUG После вызова _online_predict_step
+        if self._step_counter.numpy() < 5:  # только первые 5 шагов
+            tf.print("=== online_predict debug ===")
+            tf.print("step_counter:", self._step_counter)
+            tf.print("forecast_scaled:", forecast_scaled)
+            tf.print("std_dev_scaled:", std_dev_scaled)
+            tf.print("final_state:", final_state)
+            tf.print("final_volatility:", final_volatility)
+            tf.print("final_inflation:", final_inflation)
+            tf.print("target_coverage:", target_coverage)
+            tf.print("regime_assignment:", regime_info['regime_assignment'])
+            # Также полезно посмотреть входные данные
+            tf.print("X_scaled_tensor mean:", tf.reduce_mean(X_scaled_tensor))
+            tf.print("X_scaled_tensor std:", tf.math.reduce_std(X_scaled_tensor))
+            # Особенно интересен признак 'level'
+            level_idx = self.feature_indices["level"]
+            level_vals = X_scaled_tensor[0, :, level_idx]
+            tf.print("level values in window:", level_vals)        
+
         self._last_inflation_factor.assign(tf.reshape(final_inflation_factor, [1]))
         self._last_remaining_steps.assign(tf.reshape(final_remaining_steps, [1]))
         self._last_high_inflation_steps.assign(tf.reshape(final_high_inflation_steps, [1]))
@@ -6304,6 +6370,13 @@ class LSTMIMMUKF(tf.Module):
                     # Масштабируем для точного сравнения
                     level_t_true_scaled = self.feature_scalers['Y'].transform([[level_t_true]])[0, 0]
 
+                    # DEBUG: вывод для первых 5 шагов
+                    if t - window_size < 5:
+                        print(f"Step {t}: forecast_original = {result['level_forecast'][0]:.6f}, "
+                              f"true_original = {level_t_true:.6f}, "
+                              f"forecast_scaled = {result['level_forecast_scaled'][0]:.6f}, "
+                              f"true_scaled = {level_t_true_scaled:.6f}")                    
+                    
                     # Сохранение результатов
                     timestamp = df.index[t] if hasattr(df.index, '__iter__') and len(df.index) > t else t
                     timestamps.append(timestamp)
@@ -6640,3 +6713,297 @@ class LSTMIMMUKF(tf.Module):
         plt.savefig(filename, dpi=300, bbox_inches='tight')
         print(f"\nГрафик результатов оценки сохранен: {filename}")
         plt.show()
+
+    def prepare_simple_datasets(
+        self,
+        full_df: pd.DataFrame,
+        train_ratio: float = 0.70,
+        val_ratio: float = 0.20,
+        cache_path: Optional[str] = None,
+        n_jobs: int = 1
+    ) -> Tuple[Dict, Dict, Dict]:
+        """
+        ПРОСТОЕ разделение данных 70/20/10 с поддержкой параллелизма (joblib) и кэширования.
+        """
+        print("=" * 80)
+        print("📊 ПРОСТОЕ РАЗДЕЛЕНИЕ ДАННЫХ (70/20/10) — С JOBLIB И КЭШЕМ")
+        print("=" * 80)
+    
+        # 1. ПРОВЕРКА КЭША
+        if cache_path:
+            cache_file = f"{cache_path}.pkl" if not cache_path.endswith('.pkl') else cache_path
+            if os.path.exists(cache_file):
+                print(f"📥 Кэш найден: {cache_file}")
+                try:
+                    with open(cache_file, 'rb') as f:
+                        cached = pickle.load(f)
+    
+                    # Восстановление скейлеров
+                    if 'scalers' in cached and cached['scalers'] is not None:
+                        self.feature_scalers = cached['scalers']
+                        print("✅ Скейлеры восстановлены из кэша")
+    
+                    print(f"✅ Данные загружены из кэша:")
+                    print(f"   Train: {cached['train_data']['n_samples']} | "
+                          f"Val: {cached['val_data']['n_samples']} | "
+                          f"Test: {cached['test_data']['n_samples']}")
+    
+                    self._honest_preparation = {
+                        'train_data': cached['train_data'],
+                        'val_data': cached['val_data'],
+                        'test_data': cached['test_data'],
+                        'preparator': None,
+                        'cache_path': cache_path,
+                        'simple_split': True
+                    }
+    
+                    return cached['train_data'], cached['val_data'], cached['test_data']
+    
+                except Exception as e:
+                    print(f"⚠️  Ошибка загрузки кэша: {str(e)}")
+                    print("   Продолжаем с полной подготовкой данных...")
+    
+        # 2. ХРОНОЛОГИЧЕСКОЕ РАЗДЕЛЕНИЕ
+        n = len(full_df)
+        train_end = int(n * train_ratio)
+        val_end = int(n * (train_ratio + val_ratio))
+    
+        train_df = full_df.iloc[:train_end].copy()
+        val_df = full_df.iloc[train_end:val_end].copy()
+        test_df = full_df.iloc[val_end:].copy()
+    
+        print(f"   Train: {len(train_df)} точек ({train_ratio*100:.0f}%)")
+        print(f"   Val:   {len(val_df)} точек ({val_ratio*100:.0f}%)")
+        print(f"   Test:  {len(test_df)} точек ({(1-train_ratio-val_ratio)*100:.0f}%)")
+    
+        # 3. СОЗДАНИЕ КОНФИГА ДЛЯ ВЫЧИСЛЕНИЯ ПРИЗНАКОВ
+        config = FeatureConfig(
+            vol_window_short=self.vol_window_short,
+            vol_window_long=self.vol_window_long,
+            rolling_window_percentile=self.rolling_window_percentile,
+            emd_window=self.emd_window,
+            min_history_for_features=self.min_history_for_features,
+            seq_len=self.seq_len,
+            feature_columns=self.feature_columns
+        )
+    
+        # 4. ФУНКЦИЯ ДЛЯ ОБРАБОТКИ ЦЕЛОГО СПЛИТА (использует внешнюю _process_window)
+        def prepare_split(df_split: pd.DataFrame, split_name: str) -> Dict:
+            min_start_idx = config.min_history_for_features
+            indices = list(range(min_start_idx, len(df_split)))
+            total = len(indices)
+    
+            print(f"\n⚡ Обработка {split_name}: {total} окон (n_jobs={n_jobs})...")
+    
+            if n_jobs > 1:
+                # Параллельная обработка с joblib (теперь функция определена вне класса)
+                results = Parallel(n_jobs=n_jobs, verbose=10, backend='loky')(
+                    delayed(_process_window)(t, df_split, config, self.debug_mode) for t in indices
+                )
+            else:
+                # Последовательная обработка с tqdm
+                from tqdm import tqdm
+                results = []
+                for t in tqdm(indices, desc=f"Обработка {split_name}"):
+                    res = _process_window(t, df_split, config, self.debug_mode)
+                    if res is not None:
+                        results.append(res)
+    
+            results = [r for r in results if r is not None]
+            if len(results) == 0:
+                raise ValueError(f"Не удалось сформировать ни одного окна для {split_name}!")
+    
+            # Распаковка результатов (как и ранее)
+            X_list = [r['X_df'] for r in results]
+            y_filter_list = [r['y_filter'] for r in results]
+            y_target_list = [r['y_target'] for r in results]
+            timestamps_list = [r['timestamp'] for r in results]
+    
+            X_seq = np.array([
+                df[self.feature_columns].values.astype(np.float32)
+                for df in X_list
+            ])
+            y_filter = np.array(y_filter_list)
+            y_target = np.array(y_target_list)
+            timestamps = np.array(timestamps_list)
+    
+            # Простая классификация режимов
+            vol = np.std(y_target) + 1e-8
+            regimes = np.zeros(len(y_target), dtype=np.int32)
+            for i in range(len(y_target)):
+                if y_target[i] < vol * 0.5:
+                    regimes[i] = 0
+                elif y_target[i] < vol * 1.5:
+                    regimes[i] = 1
+                else:
+                    regimes[i] = 2
+    
+            return {
+                'X_seq': X_seq,
+                'X_seq_dfs': X_list,
+                'y_filter': y_filter,
+                'y_target': y_target,
+                'timestamps': timestamps,
+                'regime_labels': regimes,
+                'n_samples': len(y_target)
+            }
+    
+        print("\n📏 Формирование окон...")
+        train_raw = prepare_split(train_df, "Train")
+        val_raw = prepare_split(val_df, "Val")
+        test_raw = prepare_split(test_df, "Test")
+    
+        print(f"   Train: {train_raw['n_samples']} | Val: {val_raw['n_samples']} | Test: {test_raw['n_samples']}")
+    
+        # 6. ОБУЧЕНИЕ СКЕЙЛЕРОВ
+        print("\n🔧 Обучение скейлеров на тренировочном множестве...")
+    
+        all_train_features = pd.concat(train_raw['X_seq_dfs'], axis=0, ignore_index=True)
+    
+        if not hasattr(self, 'feature_scalers') or self.feature_scalers is None:
+            self.feature_scalers = {}
+    
+        for group_name, feature_list in self.scale_groups.items():
+            if group_name == 'none':
+                continue
+    
+            valid_features = [f for f in feature_list if f in all_train_features.columns]
+            if not valid_features:
+                continue
+    
+            if group_name == 'robust':
+                from sklearn.preprocessing import RobustScaler
+                scaler = RobustScaler(quantile_range=(5.0, 95.0))
+            elif group_name == 'standard':
+                from sklearn.preprocessing import StandardScaler
+                scaler = StandardScaler()
+            elif group_name == 'minmax':
+                from sklearn.preprocessing import MinMaxScaler
+                scaler = MinMaxScaler(feature_range=(-1, 1))
+            else:
+                from sklearn.preprocessing import RobustScaler
+                scaler = RobustScaler()
+    
+            X_group = all_train_features[valid_features].values.astype(np.float32)
+            scaler.fit(X_group)
+            self.feature_scalers[group_name] = scaler
+            print(f"   ✅ {group_name}: {len(valid_features)} признаков")
+    
+        from sklearn.preprocessing import PowerTransformer
+        y_scaler = PowerTransformer(method='yeo-johnson', standardize=True)
+        y_scaler.fit(train_raw['y_target'].reshape(-1, 1))
+        self.feature_scalers['Y'] = y_scaler
+        print(f"   ✅ Y скейлер обучен")
+    
+        # 7. МАСШТАБИРОВАНИЕ
+        print("\n📐 Масштабирование данных...")
+    
+        def scale_split(raw_data: Dict) -> Dict:
+            X_seq_scaled = np.zeros_like(raw_data['X_seq'], dtype=np.float32)
+            for i, df in enumerate(raw_data['X_seq_dfs']):
+                scaled_df = self._scale_features(df)
+                X_seq_scaled[i] = scaled_df[self.feature_columns].values.astype(np.float32)
+    
+            y_scaler = self.feature_scalers['Y']
+            y_target_scaled = y_scaler.transform(raw_data['y_target'].reshape(-1, 1)).flatten()
+            y_filter_scaled = y_scaler.transform(raw_data['y_filter'].reshape(-1, 1)).reshape(raw_data['y_filter'].shape)
+    
+            return {
+                'X_seq_scaled': X_seq_scaled,
+                'y_filter_scaled': y_filter_scaled,
+                'y_target_scaled': y_target_scaled,
+                'timestamps': raw_data['timestamps'],
+                'regime_labels': raw_data['regime_labels'],
+                'n_samples': raw_data['n_samples']
+            }
+    
+        train_scaled = scale_split(train_raw)
+        val_scaled = scale_split(val_raw)
+        test_scaled = scale_split(test_raw)
+    
+        # Очистка памяти
+        del train_raw, val_raw, test_raw
+    
+        print(f"   ✅ Готово")
+    
+        # 8. СОХРАНЕНИЕ В КЭШ
+        if cache_path:
+            cache_file = f"{cache_path}.pkl" if not cache_path.endswith('.pkl') else cache_path
+            print(f"\n💾 Сохранение кэша: {cache_file}")
+            try:
+                cache_data = {
+                    'train_data': train_scaled,
+                    'val_data': val_scaled,
+                    'test_data': test_scaled,
+                    'scalers': self.feature_scalers.copy() if self.feature_scalers else None,
+                    'metadata': {
+                        'train_ratio': train_ratio,
+                        'val_ratio': val_ratio,
+                        'seq_len': self.seq_len,
+                        'min_history_for_features': self.min_history_for_features,
+                        'feature_columns': self.feature_columns.copy() if hasattr(self, 'feature_columns') else None,
+                        'scale_groups': self.scale_groups.copy() if hasattr(self, 'scale_groups') else None,
+                        'timestamp': str(datetime.datetime.now()),
+                        'n_jobs': n_jobs
+                    }
+                }
+    
+                os.makedirs(os.path.dirname(cache_file) if os.path.dirname(cache_file) else '.', exist_ok=True)
+    
+                with open(cache_file, 'wb') as f:
+                    pickle.dump(cache_data, f)
+    
+                print(f"✅ Кэш сохранён: {cache_file}")
+                print(f"   • Train: {train_scaled['n_samples']} образцов")
+                print(f"   • Val:   {val_scaled['n_samples']} образцов")
+                print(f"   • Test:  {test_scaled['n_samples']} образцов")
+    
+            except Exception as e:
+                print(f"⚠️  Ошибка сохранения кэша: {str(e)}")
+    
+        # 9. SimplePreparator для совместимости с fit()
+        class SimplePreparator:
+            def __init__(self):
+                pass
+    
+            def create_tf_datasets(self, train_data, val_data, batch_size=64):
+                import tensorflow as tf
+    
+                train_ds = tf.data.Dataset.from_tensor_slices((
+                    train_data['X_seq_scaled'],
+                    train_data['y_filter_scaled'],
+                    train_data['y_target_scaled'],
+                    train_data['regime_labels'],
+                ))
+    
+                val_ds = tf.data.Dataset.from_tensor_slices((
+                    val_data['X_seq_scaled'],
+                    val_data['y_filter_scaled'],
+                    val_data['y_target_scaled'],
+                    val_data['regime_labels'],
+                ))
+    
+                train_ds = train_ds.batch(batch_size, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
+                val_ds = val_ds.batch(batch_size, drop_remainder=False).prefetch(tf.data.AUTOTUNE)
+    
+                return train_ds, val_ds
+    
+        preparator = SimplePreparator()
+    
+        self._honest_preparation = {
+            'train_data': train_scaled,
+            'val_data': val_scaled,
+            'test_data': test_scaled,
+            'preparator': preparator,
+            'cache_path': cache_path,
+            'adaptive_blocks': False,
+            'simple_split': True,
+            'train_ratio': train_ratio,
+            'val_ratio': val_ratio
+        }
+    
+        print("\n✅ ПРОСТОЕ РАЗДЕЛЕНИЕ ЗАВЕРШЕНО")
+        print("=" * 80)
+    
+        return train_scaled, val_scaled, test_scaled
+        
